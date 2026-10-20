@@ -22,14 +22,12 @@ before activation.
 
 ## Traffic path
 
-```mermaid
-flowchart LR
-    U[Bridge uplink] --> B[Linux bridge forward hook]
-    B --> Q[NFQUEUE]
-    Q --> S[Suricata]
-    S --> V[Virtual router or guest tap]
-    S --> M[Metrics and EVE alerts]
-```
+![Traffic path: Linux bridge forwarding queues IPv4 packets in NFQUEUE; Suricata analyzes a copy and returns a verdict. The health monitor exports Prometheus metrics, and Suricata writes EVE logs.](docs/assets/traffic-path.svg)
+
+[Open full-size diagram](docs/assets/traffic-path.svg)
+
+Suricata receives a packet copy and returns a verdict. The kernel keeps the
+queued packet and resumes forwarding after the verdict.
 
 The selector matches IPv4 with the same configured incoming and outgoing bridge.
 Host input/output, IPv6 and traffic on other bridges remain outside this scope.

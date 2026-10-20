@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="880" viewBox="0 0 1400 880" role="img" aria-labelledby="title desc">
+<title id="title">cs-public0 traffic path</title>
+<desc id="desc">IPv4 traffic is forwarded in both directions through a Linux bridge. The forward hook queues packets in kernel NFQUEUE. Suricata receives a packet copy and returns a verdict; the kernel resumes forwarding. A health monitor exports Prometheus metrics and Suricata writes EVE logs. IPv6 and host input/output are outside this scope.</desc>
+<rect width="1400" height="880" fill="#ffffff"/>
+<text x="48" y="66.56" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="34" font-weight="600" fill="#172c46">cs-public0</text>
+<text x="48" y="107.82" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="23" font-weight="400" fill="#53647a">IPv4 inspection on a Linux bridge</text>
+<text x="48" y="156.44" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="16" font-weight="600" fill="#315e9e">TRAFFIC PATH  /  BOTH DIRECTIONS</text>
+<rect x="48" y="184" width="245" height="108" rx="14" fill="#f5f8fc" stroke="#cbd5e1" stroke-width="2"/>
+<text x="170.5" y="246.16" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="600" fill="#172c46">Bridge uplink</text>
+<rect x="465" y="184" width="470" height="108" rx="14" fill="#edf4ff" stroke="#9cb7dd" stroke-width="2"/>
+<text x="700" y="230.18" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="27" font-weight="600" fill="#172c46">Linux bridge</text>
+<text x="700" y="268.48" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="400" fill="#53647a">forward hook</text>
+<rect x="1107" y="184" width="245" height="108" rx="14" fill="#f5f8fc" stroke="#cbd5e1" stroke-width="2"/>
+<text x="1229.5" y="229.82" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="23" font-weight="600" fill="#172c46">Virtual router</text>
+<text x="1229.5" y="267.14" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="21" font-weight="400" fill="#53647a">or guest TAP</text>
+<line x1="304" y1="238" x2="454" y2="238" stroke="#315e9e" stroke-width="3"/>
+<polygon points="454,238 441,232 441,244" fill="#315e9e"/>
+<polygon points="304,238 317,244 317,232" fill="#315e9e"/>
+<line x1="946" y1="238" x2="1096" y2="238" stroke="#315e9e" stroke-width="3"/>
+<polygon points="1096,238 1083,232 1083,244" fill="#315e9e"/>
+<polygon points="946,238 959,244 959,232" fill="#315e9e"/>
+<rect x="465" y="392" width="470" height="96" rx="14" fill="#edf4ff" stroke="#9cb7dd" stroke-width="2"/>
+<text x="700" y="436.18" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="27" font-weight="600" fill="#172c46">NFQUEUE</text>
+<text x="700" y="469.8" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="400" fill="#53647a">Kernel keeps the queued packet</text>
+<line x1="585" y1="303" x2="585" y2="381" stroke="#315e9e" stroke-width="3"/>
+<polygon points="585,381 591,368 579,368" fill="#315e9e"/>
+<text x="570" y="349.46" text-anchor="end" font-family="Segoe UI, Arial, sans-serif" font-size="19" font-weight="400" fill="#53647a">Queue packet</text>
+<line x1="815" y1="381" x2="815" y2="303" stroke="#315e9e" stroke-width="3"/>
+<polygon points="815,303 809,316 821,316" fill="#315e9e"/>
+<text x="830" y="349.46" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="19" font-weight="400" fill="#53647a">Resume forwarding</text>
+<rect x="465" y="600" width="470" height="112" rx="14" fill="#eaf7f5" stroke="#86c4bb" stroke-width="2"/>
+<text x="700" y="648.86" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="29" font-weight="600" fill="#172c46">Suricata</text>
+<text x="700" y="686.14" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="21" font-weight="400" fill="#53647a">Userspace / alert-only rules</text>
+<line x1="585" y1="499" x2="585" y2="589" stroke="#315e9e" stroke-width="3"/>
+<polygon points="585,589 591,576 579,576" fill="#315e9e"/>
+<text x="570" y="551.46" text-anchor="end" font-family="Segoe UI, Arial, sans-serif" font-size="19" font-weight="400" fill="#53647a">Packet copy</text>
+<line x1="815" y1="589" x2="815" y2="499" stroke="#315e9e" stroke-width="3"/>
+<polygon points="815,499 809,512 821,512" fill="#315e9e"/>
+<text x="830" y="551.46" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="19" font-weight="400" fill="#53647a">Verdict</text>
+<rect x="48" y="600" width="275" height="112" rx="14" fill="#f0f9f8" stroke="#a8d5cf" stroke-width="2"/>
+<text x="185.5" y="647.16" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="600" fill="#172c46">Health monitor</text>
+<text x="185.5" y="685.8" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="400" fill="#53647a">Prometheus metrics</text>
+<line x1="454" y1="656" x2="334" y2="656" stroke="#087f82" stroke-width="3" stroke-dasharray="7 7"/>
+<polygon points="334,656 347,662 347,650" fill="#087f82"/>
+<text x="394" y="635.12" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="18" font-weight="400" fill="#087f82">Status</text>
+<text x="48" y="753.12" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="18" font-weight="400" fill="#53647a">Reads Suricata, NFQUEUE,</text>
+<text x="48" y="780.12" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="18" font-weight="400" fill="#53647a">nftables and systemd</text>
+<rect x="1077" y="600" width="275" height="112" rx="14" fill="#f0f9f8" stroke="#a8d5cf" stroke-width="2"/>
+<text x="1214.5" y="647.16" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="600" fill="#172c46">EVE logs</text>
+<text x="1214.5" y="685.8" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="400" fill="#53647a">Alerts and events</text>
+<line x1="946" y1="656" x2="1066" y2="656" stroke="#087f82" stroke-width="3" stroke-dasharray="7 7"/>
+<polygon points="1066,656 1053,650 1053,662" fill="#087f82"/>
+<text x="1006" y="635.12" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="18" font-weight="400" fill="#087f82">Events</text>
+<line x1="48" y1="808" x2="1352" y2="808" stroke="#cbd5e1" stroke-width="1"/>
+<text x="48" y="849.8" text-anchor="start" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="400" fill="#53647a">Scope: forwarded IPv4 on the configured bridge. IPv6 and host input/output are excluded.</text>
+</svg>
