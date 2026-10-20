@@ -1,0 +1,22 @@
+---
+# Installation does not activate packet interception unless explicitly requested.
+cs_public0_enabled: false
+cs_public0_bridge: public0
+cs_public0_table: cs_public0
+cs_public0_queue: 100
+cs_public0_priority: -240
+cs_public0_binary: /usr/bin/suricata
+cs_public0_classification_file: /etc/suricata/classification.config
+cs_public0_reference_file: /etc/suricata/reference.config
+cs_public0_home_net: any
+cs_public0_flow_memcap: 128mb
+cs_public0_stream_memcap: 128mb
+cs_public0_reassembly_memcap: 256mb
+cs_public0_memory_max: 2G
+cs_public0_runtime_dir: /run/cs-public0
+cs_public0_state_dir: /var/lib/cs-public0
+cs_public0_log_dir: /var/log/cs-public0
+cs_public0_rules_dir: /etc/cs-public0/rules
+cs_public0_metrics_file: /var/lib/node_exporter/textfile_collector/cs_public0.prom
+cs_public0_project_root: "{{ role_path }}/../../.."
+cs_public0_rules_source: "{{ cs_public0_project_root }}/config/local.rules"

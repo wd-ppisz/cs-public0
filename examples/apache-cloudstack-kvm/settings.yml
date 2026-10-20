@@ -1,0 +1,8 @@
+---
+cs_public0_enabled: false
+cs_public0_bridge: public0
+cs_public0_queue: 100
+cs_public0_table: cs_public0
+cs_public0_home_net: '[192.0.2.0/24,198.51.100.0/24]'
+# Point to your own reviewed ruleset. The bundled rule is a connectivity example.
+# cs_public0_rules_source: /path/on/controller/alert-only.rules

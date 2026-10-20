@@ -1,0 +1,37 @@
+# Scrape with node_exporter's textfile collector.
+# Define expectations in your own recording rules, one series per selected target:
+# - record: cs_public0_expected
+#   expr: vector(1)
+#   labels: {job: node, instance: 'hypervisor.example.invalid:9100', bridge: public0, queue: '100'}
+groups:
+  - name: cs-public0
+    interval: 15s
+    rules:
+      - alert: CsPublic0TelemetryMissing
+        expr: cs_public0_expected == 1 unless on(job, instance, bridge, queue) cs_public0_telemetry_known
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Bridge inspection telemetry is missing on {{ $labels.instance }}'
+          description: 'The expected sensor has no telemetry series. Check scrape health, the textfile path and the monitor timer.'
+      - alert: CsPublic0TelemetryUnknown
+        expr: cs_public0_telemetry_known == 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Bridge inspection state is unknown on {{ $labels.instance }}'
+          description: 'At least one required sensor, queue, selector or counter observation is unavailable.'
+      - alert: CsPublic0TelemetryStale
+        expr: time() - cs_public0_last_publish_unix_seconds > 60
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Bridge inspection telemetry is stale on {{ $labels.instance }}'
+          description: 'The last successful textfile publication is older than one minute.'
+      - alert: CsPublic0InspectionDegraded
+        expr: cs_public0_degraded_latched == 1
+        for: 0s
+        labels: {severity: warning}
+        annotations:
+          summary: 'Bridge inspection degradation latched on {{ $labels.instance }}'
+          description: 'Inspect queue drops, engine exceptions, resource pressure and restart history before acknowledging the latch.'

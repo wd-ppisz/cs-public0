@@ -1,0 +1,337 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "title": "cs-public0",
+  "uid": "cs-public0",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "timezone": "browser",
+  "tags": [
+    "network",
+    "suricata"
+  ],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "query": "label_values(cs_public0_telemetry_known, instance)",
+        "refresh": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Known telemetry",
+      "description": "Expected observations are available. This does not prove complete inspection; NFQUEUE fail-open bypass is not measured.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cs_public0_telemetry_known{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 2,
+      "title": "Sensor running",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cs_public0_sensor_up{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 3,
+      "title": "Queue listener",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cs_public0_queue_listener{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 4,
+      "title": "Selector installed",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cs_public0_nft_rule{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 5,
+      "title": "Degraded latch",
+      "description": "Latches observed counter increases, resets and sensor restarts. A clear latch does not rule out unmeasured fail-open bypass.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 8,
+        "y": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cs_public0_degraded_latched{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 6,
+      "title": "Publication age",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - cs_public0_last_publish_unix_seconds{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 7,
+      "title": "Queue pending",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cs_public0_queue_pending{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 8,
+      "title": "Queued packets per second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(cs_public0_nft_packets_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 9,
+      "title": "Engine decoded packets per second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(cs_public0_decoder_packets_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 10,
+      "title": "Queue drops",
+      "description": "Reported kernel/user queue drops. Linux 6.8/6.11 fail-open bypass on saturation or failed userspace delivery does not increment these fields. Zero is not proof of complete inspection.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cs_public0_queue_kernel_dropped{instance=~\"$instance\"} + cs_public0_queue_user_dropped{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown"
+        },
+        "overrides": []
+      },
+      "options": {}
+    }
+  ]
+}

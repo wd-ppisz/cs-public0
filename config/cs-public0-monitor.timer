@@ -1,0 +1,11 @@
+[Unit]
+Description=Sample bridge inspection telemetry
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=cs-public0-monitor.service
+
+[Install]
+WantedBy=timers.target

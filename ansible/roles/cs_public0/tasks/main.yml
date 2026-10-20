@@ -1,0 +1,227 @@
+---
+- name: Validate platform and configurable identifiers
+  ansible.builtin.assert:
+    that:
+      - ansible_system == 'Linux'
+      - ansible_service_mgr == 'systemd'
+      - cs_public0_enabled is boolean
+      - cs_public0_bridge is match('^[A-Za-z_][A-Za-z0-9_.-]{0,14}$')
+      - cs_public0_table is match('^[A-Za-z_][A-Za-z0-9_.-]{0,14}$')
+      - cs_public0_queue is integer
+      - cs_public0_queue >= 0 and cs_public0_queue <= 65535
+      - cs_public0_priority is integer
+      - cs_public0_priority >= -300 and cs_public0_priority <= 300
+      - cs_public0_binary is match('^/(usr/bin|usr/local/bin|opt)/[A-Za-z0-9_./-]+[A-Za-z0-9_-]$')
+      - "'..' not in cs_public0_binary.split('/')"
+      - "'//' not in cs_public0_binary"
+      - cs_public0_memory_max is match('^[1-9][0-9]*[MG]$')
+      - cs_public0_runtime_dir is match('^/run/cs-public0(?:[-_][A-Za-z0-9_-]+)?$')
+      - cs_public0_state_dir is match('^/var/lib/cs-public0(?:[-_][A-Za-z0-9_-]+)?$')
+      - cs_public0_log_dir is match('^/var/log/cs-public0(?:[-_][A-Za-z0-9_-]+)?$')
+      - cs_public0_rules_dir is match('^/etc/cs-public0(?:[-_][A-Za-z0-9_-]+)?/rules$')
+      - cs_public0_metrics_file is match('^/var/lib/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*/cs_public0\.prom$')
+      - cs_public0_flow_memcap is match('^[1-9][0-9]*(?:kb|mb|gb)$')
+      - cs_public0_stream_memcap is match('^[1-9][0-9]*(?:kb|mb|gb)$')
+      - cs_public0_reassembly_memcap is match('^[1-9][0-9]*(?:kb|mb|gb)$')
+    fail_msg: Invalid platform or configuration; no service has been changed.
+
+- name: Reject unsafe existing directories before changing services or permissions
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -c
+      - |
+        import pathlib, stat, sys
+        for name in sys.argv[1:]:
+            for path in (p := pathlib.Path(name), *p.parents):
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    continue
+                system_log_parent = path == pathlib.Path('/var/log') and p.parent == path
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                        or info.st_mode & 0o002
+                        or (info.st_mode & 0o020 and not system_log_parent)):
+                    raise SystemExit('Unsafe existing directory: ' + str(path))
+      - /etc/cs-public0
+      - /usr/local/libexec
+      - "{{ cs_public0_rules_dir }}"
+      - "{{ cs_public0_runtime_dir }}"
+      - "{{ cs_public0_state_dir }}"
+      - "{{ cs_public0_log_dir }}"
+      - "{{ cs_public0_metrics_file | dirname }}"
+  changed_when: false
+  check_mode: false
+
+- name: Inspect installed Suricata build
+  ansible.builtin.command:
+    argv: ["{{ cs_public0_binary }}", --build-info]
+  register: cs_public0_build
+  changed_when: false
+  check_mode: false
+
+- name: Verify external Suricata classification and reference assets
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: ["{{ cs_public0_classification_file }}", "{{ cs_public0_reference_file }}"]
+  register: cs_public0_external_assets
+
+- name: Require readable regular classification and reference files
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg | default(false)
+      - item.stat.uid == 0
+      - not item.stat.wgrp
+      - not item.stat.woth
+    fail_msg: Install the Suricata configuration assets or configure their paths first.
+  loop: "{{ cs_public0_external_assets.results }}"
+
+- name: Require Suricata 8 with NFQUEUE support
+  ansible.builtin.assert:
+    that:
+      - cs_public0_build.stdout is search('Suricata version 8\.')
+      - cs_public0_build.stdout is search('NFQueue support:\s+yes')
+    fail_msg: Install a Suricata 8.x build with NFQUEUE before using this role.
+
+- name: Inspect the distribution sensor without changing it
+  ansible.builtin.service_facts:
+
+- name: Refuse simultaneous distribution sensor
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.services.get('suricata.service', {}).get('state', '') != 'running'
+      - ansible_facts.services.get('suricata.service', {}).get('status', '') != 'enabled'
+    fail_msg: Stop and disable the distribution suricata.service and review its updater first.
+
+- name: Inspect managed services and timer independently of service facts
+  ansible.builtin.command:
+    argv: [/usr/bin/systemctl, show, --property=LoadState, --value, "{{ item }}"]
+  loop: [cs-public0-monitor.timer, cs-public0-monitor.service, cs-public0.service]
+  register: cs_public0_installed_units
+  changed_when: false
+  failed_when: cs_public0_installed_units.stdout not in ['loaded', 'masked', 'not-found']
+  check_mode: false
+
+- name: Stop the timer and monitor before stopping the sensor and replacing artifacts
+  ansible.builtin.systemd_service:
+    name: "{{ item.item }}"
+    state: stopped
+  loop: "{{ cs_public0_installed_units.results }}"
+  when: item.stdout in ['loaded', 'masked']
+
+- name: Create configuration and runtime directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - {path: /etc/cs-public0, mode: '0750'}
+    - {path: "{{ cs_public0_rules_dir }}", mode: '0750'}
+    - {path: "{{ cs_public0_state_dir }}", mode: '0700'}
+    - {path: "{{ cs_public0_runtime_dir }}", mode: '0700'}
+    - {path: "{{ cs_public0_log_dir }}", mode: '0750'}
+
+- name: Inspect shared installation directories without changing their permissions
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop: [/usr/local/libexec, "{{ cs_public0_metrics_file | dirname }}"]
+  register: cs_public0_shared_directories
+
+- name: Create missing shared directories without chmod of existing directories
+  ansible.builtin.file:
+    path: "{{ item.item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  loop: "{{ cs_public0_shared_directories.results }}"
+  when: not item.stat.exists
+
+- name: Install the controller and local alert rules
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - {src: "{{ cs_public0_project_root }}/runtime/cs_public0.py", dest: /usr/local/libexec/cs-public0, mode: '0755'}
+    - {src: "{{ cs_public0_rules_source }}", dest: "{{ cs_public0_rules_dir }}/local.rules", mode: '0640'}
+
+- name: Write runtime settings
+  ansible.builtin.copy:
+    content: "{{ cs_public0_settings | to_nice_json }}\n"
+    dest: /etc/cs-public0/config.json
+    owner: root
+    group: root
+    mode: '0640'
+  vars:
+    cs_public0_settings:
+      bridge: "{{ cs_public0_bridge }}"
+      table: "{{ cs_public0_table }}"
+      queue: "{{ cs_public0_queue }}"
+      priority: "{{ cs_public0_priority }}"
+      binary: "{{ cs_public0_binary }}"
+      runtime_dir: "{{ cs_public0_runtime_dir }}"
+      state_dir: "{{ cs_public0_state_dir }}"
+      metrics_file: "{{ cs_public0_metrics_file }}"
+      socket: "{{ cs_public0_runtime_dir }}/suricata.socket"
+      service: cs-public0.service
+      rules_file: "{{ cs_public0_rules_dir }}/local.rules"
+
+- name: Render the Suricata configuration
+  ansible.builtin.template:
+    src: "{{ cs_public0_project_root }}/config/suricata.yaml.j2"
+    dest: /etc/cs-public0/suricata.yaml
+    owner: root
+    group: root
+    mode: '0640'
+
+- name: Validate the alert-only rule file
+  ansible.builtin.command: /usr/local/libexec/cs-public0 validate-rules
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Validate the complete Suricata configuration
+  ansible.builtin.command:
+    argv:
+      - "{{ cs_public0_binary }}"
+      - -T
+      - -c
+      - /etc/cs-public0/suricata.yaml
+      - -S
+      - "{{ cs_public0_rules_dir }}/local.rules"
+      - --init-errors-fatal
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Install service units and log retention
+  ansible.builtin.template:
+    src: "{{ cs_public0_project_root }}/config/{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - {src: cs-public0.service.j2, dest: /etc/systemd/system/cs-public0.service}
+    - {src: cs-public0-monitor.service.j2, dest: /etc/systemd/system/cs-public0-monitor.service}
+    - {src: cs-public0-monitor.timer, dest: /etc/systemd/system/cs-public0-monitor.timer}
+    - {src: logrotate.j2, dest: /etc/logrotate.d/cs-public0}
+
+- name: Apply the explicit activation choice
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    daemon_reload: true
+    enabled: "{{ cs_public0_enabled }}"
+    state: "{{ 'started' if cs_public0_enabled else 'stopped' }}"
+  loop: [cs-public0.service, cs-public0-monitor.timer]
+  when: not ansible_check_mode
+
+- name: Report the planned activation choice in check mode
+  ansible.builtin.debug:
+    msg: "Planned activation: {{ 'enabled and started' if cs_public0_enabled else 'disabled and stopped' }}. Service changes require a normal run."
+  when: ansible_check_mode

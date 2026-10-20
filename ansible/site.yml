@@ -1,0 +1,7 @@
+---
+- name: Configure bridge traffic inspection
+  hosts: sensors
+  become: true
+  serial: 1
+  roles:
+    - cs_public0

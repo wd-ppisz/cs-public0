@@ -1,0 +1,7 @@
+cs-public0
+Copyright 2026 cs-public0 contributors
+
+This distribution contains original automation, configuration templates, tests
+and documentation. It does not include the Suricata engine or third-party rule
+feeds. Apache CloudStack, Suricata, Ansible, Prometheus and Grafana names identify
+external projects; no affiliation or endorsement is implied.

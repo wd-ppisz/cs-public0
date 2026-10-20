@@ -1,0 +1,2 @@
+# Demonstration signature. Supply a reviewed alert-only ruleset for real coverage.
+alert http any any -> any any (msg:"cs-public0 connectivity test"; flow:established,to_server; http.uri; content:"/cs-public0-test"; sid:9900001; rev:1;)

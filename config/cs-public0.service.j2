@@ -1,0 +1,37 @@
+[Unit]
+Description=Suricata inspection on a Linux bridge
+Wants=network-online.target
+After=network-online.target suricata.service
+Conflicts=suricata.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/libexec/cs-public0 check
+ExecStart={{ cs_public0_binary }} -c /etc/cs-public0/suricata.yaml -S {{ cs_public0_rules_dir }}/local.rules -l {{ cs_public0_log_dir }} --runmode=workers --init-errors-fatal -q {{ cs_public0_queue }}
+ExecStartPost=/usr/local/libexec/cs-public0 arm
+ExecStopPost=/usr/local/libexec/cs-public0 disarm
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=480s
+TimeoutStopSec=20s
+KillMode=control-group
+MemoryMax={{ cs_public0_memory_max }}
+MemorySwapMax=0
+TasksMax=128
+RuntimeDirectory={{ cs_public0_runtime_dir | basename }}
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory={{ cs_public0_state_dir | basename }}
+StateDirectoryMode=0700
+LogsDirectory={{ cs_public0_log_dir | basename }}
+LogsDirectoryMode=0750
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths={{ cs_public0_runtime_dir }} {{ cs_public0_state_dir }} {{ cs_public0_log_dir }}
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

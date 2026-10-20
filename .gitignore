@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.retry
+inventory.local.*
+group_vars/
+host_vars/
+*.pcap
+*.pcapng
+*.prom
+*.log
+test-results/

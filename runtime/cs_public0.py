@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""Manage one IPv4 bridge NFQUEUE selector and report inspection health."""
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+DEFAULTS = {
+    "bridge": "public0", "table": "cs_public0", "queue": 100, "priority": -240,
+    "runtime_dir": "/run/cs-public0", "state_dir": "/var/lib/cs-public0",
+    "metrics_file": "/var/lib/node_exporter/textfile_collector/cs_public0.prom",
+    "socket": "/run/cs-public0/suricata.socket", "service": "cs-public0.service",
+    "rules_file": "/etc/cs-public0/rules/local.rules", "binary": "/usr/bin/suricata",
+    "suricata_config": "/etc/cs-public0/suricata.yaml",
+}
+LOSS_COUNTERS = ("flow.memcap", "tcp.ssn_memcap_drop", "tcp.segment_memcap_drop")
+MAX_MESSAGE = 4 * 1024 * 1024
+MAX_STATE = 65536
+MAX_RULES_BYTES = 64 * 1024 * 1024
+MAX_RULE_LINE_BYTES = 4096
+ENGINE_TEST_TIMEOUT_SECONDS = 180
+SENSOR_READY_TIMEOUT_SECONDS = 240
+
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+
+def unique(pairs):
+    value = {}
+    for key, item in pairs:
+        require(key not in value, "duplicate JSON key: " + key)
+        value[key] = item
+    return value
+
+
+def validate_config(value):
+    require(isinstance(value, dict) and not set(value) - set(DEFAULTS), "unknown configuration keys")
+    cfg = {**DEFAULTS, **value}
+    for key in ("bridge", "table"):
+        require(isinstance(cfg[key], str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,14}", cfg[key]),
+                "invalid " + key)
+    require(isinstance(cfg["service"], str) and
+            re.fullmatch(r"[A-Za-z0-9_-]{1,80}\.service", cfg["service"]), "invalid service")
+    require(type(cfg["queue"]) is int and 0 <= cfg["queue"] <= 65535, "invalid queue")
+    require(type(cfg["priority"]) is int and -300 <= cfg["priority"] <= 300, "invalid priority")
+    for key in ("runtime_dir", "state_dir", "metrics_file", "socket", "rules_file", "binary", "suricata_config"):
+        path = cfg[key]
+        require(isinstance(path, str) and re.fullmatch(r"/[A-Za-z0-9_./-]+", path)
+                and str(PurePosixPath(path)) == path and ".." not in PurePosixPath(path).parts,
+                "invalid path: " + key)
+    require(re.fullmatch(r"/run/[A-Za-z0-9_-]+", cfg["runtime_dir"]), "unsafe runtime directory")
+    require(re.fullmatch(r"/var/lib/[A-Za-z0-9_-]+", cfg["state_dir"]), "unsafe state directory")
+    require(cfg["socket"].startswith(cfg["runtime_dir"] + "/") and cfg["socket"].endswith(".socket"),
+            "socket must be inside runtime directory")
+    for key, prefix, suffix in (("rules_file", "/etc/", ".rules"),
+                                ("suricata_config", "/etc/", ".yaml"),
+                                ("metrics_file", "/var/lib/", ".prom")):
+        require(cfg[key].startswith(prefix) and cfg[key].endswith(suffix)
+                and len(PurePosixPath(cfg[key]).parts) >= 4, "unsafe " + key)
+    require(cfg["binary"].startswith(("/usr/bin/", "/usr/local/bin/", "/opt/")), "unsafe binary")
+    require(len(set(cfg[key] for key in ("runtime_dir", "state_dir", "metrics_file", "socket",
+                                        "rules_file", "binary", "suricata_config"))) == 7,
+            "configuration paths must be distinct")
+    return cfg
+
+
+def secure_path(path, directory=False):
+    path = Path(path)
+    for parent in reversed((path, *path.parents)):
+        info = parent.lstat()
+        require(not stat.S_ISLNK(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
+                "unsafe ownership or permissions: " + str(parent))
+    info = path.stat()
+    require(stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode),
+            "unexpected file type: " + str(path))
+    return path
+
+
+def load_config(path):
+    path = secure_path(path)
+    require(path.stat().st_size <= 16384, "configuration too large")
+    return validate_config(json.loads(path.read_text(), object_pairs_hook=unique))
+
+
+def run(argv, data=None, check=True, timeout=15):
+    result = subprocess.run(argv, input=data, text=True, capture_output=True, timeout=timeout,
+                            env={**os.environ, "LC_ALL": "C"})
+    if check:
+        require(result.returncode == 0, "command failed: " + argv[0] + ": " + result.stderr[:500])
+    return result
+
+
+def ruleset(cfg):
+    return ('table bridge {table} {{\n counter queued {{}}\n chain forward_ipv4 {{\n'
+            ' type filter hook forward priority {priority}; policy accept;\n'
+            ' meta ibrname "{bridge}" meta obrname "{bridge}" ether type ip '
+            'counter name queued queue num {queue} bypass\n }}\n}}\n').format(**cfg)
+
+
+def expected_expressions(cfg):
+    return [{"match": {"op": "==", "left": {"meta": {"key": name}}, "right": cfg["bridge"]}}
+            for name in ("ibrname", "obrname")] + [
+        {"match": {"op": "==", "left": {"payload": {"protocol": "ether", "field": "type"}}, "right": "ip"}},
+        {"counter": "queued"}, {"queue": {"num": cfg["queue"], "flags": ["bypass"]}}]
+
+
+def exact_table(document, cfg):
+    try:
+        typed = {}
+        for item in document["nftables"]:
+            if "metainfo" in item:
+                continue
+            require(len(item) == 1, "nft object")
+            kind, body = next(iter(item.items()))
+            typed.setdefault(kind, []).append(body)
+        if set(typed) != {"table", "counter", "chain", "rule"} or any(len(v) != 1 for v in typed.values()):
+            return False
+        table, counter, chain, rule = (typed[k][0] for k in ("table", "counter", "chain", "rule"))
+        expr = json.loads(json.dumps(rule["expr"]))
+        if isinstance(expr[-1].get("queue", {}).get("flags"), str):
+            expr[-1]["queue"]["flags"] = [expr[-1]["queue"]["flags"]]
+        return (all(obj.get("family") == "bridge" for obj in (table, counter, chain, rule))
+                and table.get("name") == cfg["table"]
+                and all(obj.get("table") == cfg["table"] for obj in (counter, chain, rule))
+                and counter.get("name") == "queued" and chain.get("name") == "forward_ipv4"
+                and chain.get("type") == "filter" and chain.get("hook") == "forward"
+                and chain.get("prio") == cfg["priority"] and chain.get("policy") == "accept"
+                and rule.get("chain") == "forward_ipv4" and expr == expected_expressions(cfg))
+    except (KeyError, TypeError, IndexError, RuntimeError, AttributeError):
+        return False
+
+
+def table(cfg):
+    result = run(["/usr/sbin/nft", "-j", "list", "table", "bridge", cfg["table"]], check=False)
+    if result.returncode:
+        require("No such file or directory" in result.stderr, "cannot inspect nft table: " + result.stderr[:300])
+        return None
+    return json.loads(result.stdout)
+
+
+def identity(cfg):
+    return {"project": "cs-public0", **{k: cfg[k] for k in ("bridge", "table", "queue", "priority")}}
+
+
+def owned(cfg):
+    marker = secure_path(Path(cfg["runtime_dir"]) / "owner.json")
+    require(marker.stat().st_size <= 4096 and not marker.stat().st_mode & 0o077, "unsafe owner marker")
+    require(json.loads(marker.read_text()) == identity(cfg), "foreign owner marker")
+
+
+def atomic(path, value, mode=0o600):
+    path = Path(path)
+    secure_path(path.parent, directory=True)
+    if path.exists() or path.is_symlink():
+        secure_path(path)
+    temporary = path.with_name(path.name + ".tmp-" + str(os.getpid()))
+    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, mode)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(value.encode())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def validate_rules(cfg):
+    path = secure_path(cfg["rules_file"])
+    require(path.stat().st_size <= MAX_RULES_BYTES, "rules file too large")
+    raw = path.read_bytes()
+    require(len(raw) <= MAX_RULES_BYTES, "rules file too large")
+    try:
+        source = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("rules file must be valid UTF-8") from error
+    require(all(char in "\t\n" or char.isprintable() for char in source),
+            "rules contain unsupported control or non-printable characters; use LF line endings")
+    count = 0
+    for raw_line in source.split("\n"):
+        require(len(raw_line.encode("utf-8")) <= MAX_RULE_LINE_BYTES, "physical rule-file line too long")
+        line = raw_line.strip(" \t")
+        if line and not line.startswith("#"):
+            require(raw_line[0] not in " \t", "active rules must start in column one")
+            require(not line.endswith("\\"), "rule continuations are not accepted")
+            require(re.match(r"^alert[ \t]+[^\n]+\([^\n]*\)[ \t]*$", line),
+                    "only single-line alert rules are accepted")
+            options = line.split("(", 1)[1].rsplit(")", 1)[0]
+            # Suricata 8 SigParseOptions splits at a semicolon unless its previous
+            # byte is a backslash, including inside quoted option values.
+            names = [option.partition(":")[0].strip(" \t").lower()
+                     for option in re.split(r"(?<!\\);", options)]
+            require("bypass" not in names, "bypass rule options are not accepted")
+            count += 1
+    require(count > 0, "rules file has no active alert rules")
+    return count
+
+
+def preflight(cfg, test_engine=True):
+    require(Path("/sys/class/net", cfg["bridge"], "bridge").is_dir(), "configured interface is not a bridge")
+    validate_rules(cfg)
+    secure_path(cfg["suricata_config"])
+    binary = Path(cfg["binary"]).resolve(strict=True)
+    secure_path(binary)
+    require("NFQueue support:" in (info := run([str(binary), "--build-info"]).stdout)
+            and re.search(r"Suricata version 8\.", info)
+            and re.search(r"NFQueue support:\s+yes", info), "Suricata 8.x with NFQUEUE support is required")
+    current = table(cfg)
+    if current is not None:
+        owned(cfg)
+        require(exact_table(current, cfg), "foreign or modified nft table")
+    run(["/usr/sbin/nft", "-c", "-f", "-"], ruleset(cfg))
+    if test_engine:
+        run([str(binary), "-T", "-c", cfg["suricata_config"], "-S", cfg["rules_file"],
+             "--init-errors-fatal", "--set", "unix-command.enabled=no"], timeout=ENGINE_TEST_TIMEOUT_SECONDS)
+
+
+def sensor(cfg):
+    pid = int(run(["/usr/bin/systemctl", "show", cfg["service"], "-p", "MainPID", "--value"]).stdout.strip())
+    require(pid > 1, "service has no MainPID")
+    require(Path("/proc", str(pid), "exe").resolve() == Path(cfg["binary"]).resolve(), "unexpected sensor executable")
+    fields = Path("/proc", str(pid), "stat").read_text().rsplit(")", 1)[1].split()
+    require(fields[0] != "Z", "sensor is a zombie")
+    return {"pid": pid, "start_ticks": int(fields[19]),
+            "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+
+
+def queue(cfg, pid):
+    rows = [line.split() for line in Path("/proc/net/netfilter/nfnetlink_queue").read_text().splitlines()]
+    rows = [row for row in rows if row and row[0] == str(cfg["queue"])]
+    require(len(rows) == 1 and len(rows[0]) >= 7, "queue has no unique listener")
+    row = rows[0]
+    portid = int(row[1])
+    # Netlink port IDs are not necessarily process IDs. Authenticate the socket inode
+    # through /proc instead of assuming the kernel's portid belongs to the MainPID.
+    sockets = {os.readlink(fd)[8:-1] for fd in Path("/proc", str(pid), "fd").iterdir()
+               if os.readlink(fd).startswith("socket:[")}
+    matches = [line.split() for line in Path("/proc/net/netlink").read_text().splitlines()[1:]]
+    require(any(len(r) >= 10 and r[1] == "12" and int(r[2]) == portid and r[-1] in sockets
+                for r in matches), "NFQUEUE listener is not owned by the sensor")
+    return {"pending": int(row[2]), "kernel_dropped": int(row[5]), "user_dropped": int(row[6])}
+
+
+def flatten(value, prefix=""):
+    result = {}
+    if isinstance(value, dict):
+        for name, item in value.items():
+            if name != "threads":
+                result.update(flatten(item, prefix + "." + name if prefix else name))
+    elif type(value) is int and value >= 0:
+        result[prefix] = value
+    return result
+
+
+def receive(stream):
+    raw = bytearray()
+    while len(raw) < MAX_MESSAGE:
+        chunk = stream.recv(min(65536, MAX_MESSAGE - len(raw)))
+        require(chunk, "sensor socket EOF")
+        raw.extend(chunk)
+        try:
+            return json.loads(raw)
+        except (ValueError, UnicodeError):
+            pass
+    raise RuntimeError("sensor response too large")
+
+
+def counters(cfg, pid):
+    require(not Path(cfg["socket"]).is_symlink(), "socket must not be a symlink")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(3)
+        stream.connect(cfg["socket"])
+        peer = struct.unpack("3i", stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        require(peer[0] == pid and peer[1] == 0, "foreign sensor socket peer")
+        stream.sendall(b'{"version":"0.2"}\n')
+        require(receive(stream).get("return") == "OK", "socket handshake failed")
+        stream.sendall(b'{"command":"dump-counters"}\n')
+        response = receive(stream)
+    require(response.get("return") == "OK" and isinstance(response.get("message"), dict), "invalid counters")
+    return flatten(response["message"])
+
+
+def arm(cfg):
+    preflight(cfg, test_engine=False)
+    deadline = time.monotonic() + SENSOR_READY_TIMEOUT_SECONDS
+    while True:
+        try:
+            current_sensor = sensor(cfg)
+            queue(cfg, current_sensor["pid"])
+            counters(cfg, current_sensor["pid"])
+            break
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, IndexError):
+            require(time.monotonic() < deadline, "sensor listener did not become ready")
+            time.sleep(0.25)
+    current = table(cfg)
+    if current is not None:
+        owned(cfg)
+        require(exact_table(current, cfg), "foreign or modified nft table after sensor readiness")
+        return
+    atomic(Path(cfg["runtime_dir"]) / "owner.json", json.dumps(identity(cfg)))
+    transaction = "create table bridge " + cfg["table"] + "\n" + ruleset(cfg)
+    result = run(["/usr/sbin/nft", "-f", "-"], transaction, check=False)
+    if result.returncode > 0:
+        # The atomic transaction was rejected; the marker must not claim a racing table.
+        (Path(cfg["runtime_dir"]) / "owner.json").unlink(missing_ok=True)
+    require(result.returncode == 0, "nft transaction failed: " + result.stderr[:500])
+    require(exact_table(table(cfg), cfg), "installed nft table does not match")
+
+
+def disarm(cfg):
+    current = table(cfg)
+    if current is not None:
+        owned(cfg)
+        require(exact_table(current, cfg), "refusing to delete a foreign or modified table")
+        run(["/usr/sbin/nft", "delete", "table", "bridge", cfg["table"]])
+        require(table(cfg) is None, "nft table still exists")
+    marker = Path(cfg["runtime_dir"]) / "owner.json"
+    if marker.exists():
+        owned(cfg)
+        marker.unlink()
+
+
+def midstream_counter(name):
+    return name.startswith(("tcp.midstream_exception_policy.", "exception_policy.tcp.midstream."))
+
+
+def observe(cfg, previous=None):
+    previous = previous or {"latched": False, "sensor": None}
+    metrics = {"telemetry_known": 0, "sensor_up": 0, "queue_listener": 0, "nft_rule": 0,
+               "degraded_latched": int(previous["latched"]), "last_publish_unix_seconds": time.time()}
+    state = dict(previous)
+    try:
+        current = sensor(cfg)
+        metrics["sensor_up"] = 1
+        q = queue(cfg, current["pid"])
+        metrics["queue_listener"] = 1
+        document = table(cfg)
+        owned(cfg)
+        require(exact_table(document, cfg), "selector is absent or modified")
+        metrics["nft_rule"] = 1
+        packets = next(item["counter"]["packets"] for item in document["nftables"] if "counter" in item)
+        require(type(packets) is int and packets >= 0, "invalid nft packet counter")
+        data = counters(cfg, current["pid"])
+        require(all(name in data for name in (*LOSS_COUNTERS, "decoder.pkts", "uptime"))
+                and data["uptime"] > 0, "incomplete counters")
+        watched = {name: value for name, value in data.items() if not midstream_counter(name) and
+                   (name in LOSS_COUNTERS or any("exception_policy" in segment for segment in name.split(".")) or
+                    name.startswith("capture.nfq.copy_") or name in ("defrag.max_frags_reached",
+                    "defrag.max_trackers_reached", "defrag.tracker_hard_reuse"))}
+        watched.update({"nfqueue.kernel_dropped": q["kernel_dropped"], "nfqueue.user_dropped": q["user_dropped"]})
+        same_sensor = previous.get("sensor") == current
+        prior_counters = previous.get("counters", {}) if same_sensor else {}
+        require(isinstance(prior_counters, dict) and all(type(v) is int and v >= 0 for v in prior_counters.values()),
+                "invalid previous counters")
+        require(set(prior_counters).issubset(watched), "previously observed counter is missing")
+        reasons = [name for name, value in watched.items() if value > prior_counters.get(name, 0)]
+        if any(value < prior_counters.get(name, 0) for name, value in watched.items()):
+            reasons.append("counter_reset")
+        if previous.get("sensor") not in (None, current):
+            reasons.append("sensor_restarted")
+        candidate = {"sensor": current, "latched": bool(previous["latched"] or reasons), "reasons": reasons,
+                     "counters": watched}
+        require(len(json.dumps(candidate).encode()) <= MAX_STATE, "observed state too large")
+        state = candidate
+        midstream = [value for name, value in data.items() if midstream_counter(name)]
+        if midstream:
+            metrics["midstream_policy_events_total"] = sum(midstream)
+        metrics.update({"telemetry_known": 1, "degraded_latched": int(state["latched"]),
+                        "nft_packets_total": packets,
+                        "decoder_packets_total": data["decoder.pkts"], "sensor_uptime_seconds": data["uptime"],
+                        **{"queue_" + key: value for key, value in q.items()}})
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        state["error"] = str(error)[:240]
+    return {"metrics": metrics, "state": state}
+
+
+@contextlib.contextmanager
+def locked(cfg):
+    import fcntl
+    secure_path(cfg["runtime_dir"], directory=True)
+    fd = os.open(Path(cfg["runtime_dir"]) / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o077, "unsafe lock")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def previous_state(cfg):
+    path = Path(cfg["state_dir"]) / "monitor.json"
+    previous = None
+    if path.exists() or path.is_symlink():
+        try:
+            secure_path(path)
+            require(path.stat().st_size <= MAX_STATE, "state too large")
+            previous = json.loads(path.read_text(), object_pairs_hook=unique)
+            require(isinstance(previous, dict) and type(previous["latched"]) is bool, "invalid latch")
+            saved_counters = previous.get("counters", {})
+            require(isinstance(saved_counters, dict) and all(isinstance(k, str) and type(v) is int and v >= 0
+                    for k, v in saved_counters.items()), "invalid saved counters")
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+            previous = {"latched": True, "sensor": None}
+    return previous
+
+
+def monitor(cfg, acknowledge=False):
+    path = Path(cfg["state_dir"]) / "monitor.json"
+    result = observe(cfg, previous_state(cfg))
+    if acknowledge:
+        require(result["metrics"]["telemetry_known"] == 1, "cannot acknowledge unknown telemetry")
+        result["state"].update({"latched": False, "reasons": []})
+        result["metrics"]["degraded_latched"] = 0
+    state_json = json.dumps(result["state"], sort_keys=True)
+    require(len(state_json.encode()) <= MAX_STATE, "state publication too large")
+    atomic(path, state_json)
+    labels = '{bridge="' + cfg["bridge"] + '",queue="' + str(cfg["queue"]) + '"}'
+    output = "# cs-public0 runtime telemetry\n" + "".join(
+        "cs_public0_" + name + labels + " " + format(value, ".17g") + "\n"
+        for name, value in sorted(result["metrics"].items()))
+    atomic(cfg["metrics_file"], output, 0o644)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="/etc/cs-public0/config.json")
+    parser.add_argument("command", choices=("check", "arm", "disarm", "status", "monitor", "acknowledge", "validate-rules"))
+    args = parser.parse_args()
+    require(os.geteuid() == 0, "root required")
+    cfg = load_config(args.config)
+    with locked(cfg):
+        if args.command == "validate-rules":
+            result = {"alert_rules": validate_rules(cfg)}
+        elif args.command == "status":
+            result = observe(cfg, previous_state(cfg))
+        elif args.command in ("monitor", "acknowledge"):
+            result = monitor(cfg, acknowledge=args.command == "acknowledge")
+        else:
+            {"check": preflight, "arm": arm, "disarm": disarm}[args.command](cfg)
+            result = {"command": args.command, "ok": True}
+        print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)

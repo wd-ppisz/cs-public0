@@ -1,0 +1,91 @@
+%YAML 1.1
+---
+vars:
+  address-groups:
+    HOME_NET: {{ cs_public0_home_net | to_json }}
+    EXTERNAL_NET: any
+    HTTP_SERVERS: "$HOME_NET"
+    SMTP_SERVERS: "$HOME_NET"
+    SQL_SERVERS: "$HOME_NET"
+    DNS_SERVERS: "$HOME_NET"
+    TELNET_SERVERS: "$HOME_NET"
+    AIM_SERVERS: "$EXTERNAL_NET"
+    DC_SERVERS: "$HOME_NET"
+    DNP3_SERVER: "$HOME_NET"
+    DNP3_CLIENT: "$HOME_NET"
+    MODBUS_CLIENT: "$HOME_NET"
+    MODBUS_SERVER: "$HOME_NET"
+    ENIP_CLIENT: "$HOME_NET"
+    ENIP_SERVER: "$HOME_NET"
+  port-groups:
+    HTTP_PORTS: "[80,8080]"
+    SHELLCODE_PORTS: "!80"
+    ORACLE_PORTS: 1521
+    SSH_PORTS: 22
+    DNP3_PORTS: 20000
+    MODBUS_PORTS: 502
+    FILE_DATA_PORTS: "[$HTTP_PORTS,110,143]"
+    FTP_PORTS: 21
+    GENEVE_PORTS: 6081
+    VXLAN_PORTS: 4789
+    TEREDO_PORTS: 3544
+default-log-dir: {{ cs_public0_log_dir | to_json }}
+default-rule-path: {{ cs_public0_rules_dir | to_json }}
+classification-file: {{ cs_public0_classification_file | to_json }}
+reference-config-file: {{ cs_public0_reference_file | to_json }}
+threshold-file: /dev/null
+rule-files: [local.rules]
+runmode: workers
+max-pending-packets: 128
+nfq:
+  mode: accept
+  fail-open: yes
+  batchcount: 1
+unix-command:
+  enabled: yes
+  filename: {{ (cs_public0_runtime_dir ~ '/suricata.socket') | to_json }}
+stats:
+  enabled: yes
+  interval: 5
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert
+        - stats:
+            totals: yes
+            threads: no
+            deltas: no
+logging:
+  default-log-level: notice
+  outputs:
+    - console: {enabled: yes}
+flow:
+  hash-size: 65536
+  prealloc: 10000
+  memcap: {{ cs_public0_flow_memcap | to_json }}
+  memcap-policy: pass-packet
+stream:
+  inline: yes
+  checksum-validation: yes
+  memcap: {{ cs_public0_stream_memcap | to_json }}
+  memcap-policy: pass-flow
+  midstream-policy: pass-flow
+  drop-invalid: no
+  reassembly:
+    memcap: {{ cs_public0_reassembly_memcap | to_json }}
+    memcap-policy: pass-flow
+defrag:
+  memcap: 64mb
+  memcap-policy: pass-packet
+app-layer:
+  error-policy: pass-flow
+  protocols:
+    http:
+      enabled: yes
+    tls:
+      enabled: yes
+    dns:
+      enabled: yes
