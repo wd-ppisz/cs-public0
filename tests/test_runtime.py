@@ -15,12 +15,23 @@ def nft_document(cfg):
     common = {"family": "bridge", "table": cfg["table"]}
     return {"nftables": [
         {"metainfo": {"version": "test"}},
-        {"table": {"family": "bridge", "name": cfg["table"]}},
-        {"counter": {**common, "name": "queued", "packets": 5, "bytes": 100}},
-        {"chain": {**common, "name": "forward_ipv4", "type": "filter", "hook": "forward",
+        {"table": {"family": "bridge", "name": cfg["table"], "handle": 1}},
+        {"counter": {"handle": 2, **common, "name": "queued", "packets": 5, "bytes": 100}},
+        {"chain": {"handle": 3, **common, "name": "forward_ipv4", "type": "filter", "hook": "forward",
                    "prio": cfg["priority"], "policy": "accept"}},
-        {"rule": {**common, "chain": "forward_ipv4", "expr": runtime.expected_expressions(cfg)}},
+        {"rule": {"handle": 4, **common, "chain": "forward_ipv4", "expr": runtime.expected_expressions(cfg)}},
     ]}
+
+
+def queue_fixture(**changes):
+    return {"pending": 0, "kernel_dropped": 0, "user_dropped": 0,
+            "id_sequence": 5, "portid": 200, "inode": 300, "netlink_dropped": 0, **changes}
+
+
+def sample_fixture(packets, sequence, started=10000000000, **changes):
+    q = queue_fixture(id_sequence=sequence)
+    return {"before": dict(q), "after": dict(q), "nft": {"packets": packets, "handles": [1, 2, 3, 4]},
+            "started_ns": started, "finished_ns": started + 1000000, "boot_id": "test", **changes}
 
 
 class RuntimeTests(unittest.TestCase):
@@ -184,7 +195,7 @@ class RuntimeTests(unittest.TestCase):
         data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
         epoch = {"pid": 101, "start_ticks": 50, "boot_id": "test"}
         with patch.object(runtime, "sensor", return_value=epoch), \
-             patch.object(runtime, "queue", return_value={"pending": 0, "kernel_dropped": 0, "user_dropped": 0}), \
+             patch.object(runtime, "queue", return_value=queue_fixture()), \
              patch.object(runtime, "table", return_value=nft_document(self.cfg)), \
              patch.object(runtime, "owned"), patch.object(runtime, "counters", return_value=data):
             result = runtime.observe(self.cfg)
@@ -234,8 +245,8 @@ class RuntimeTests(unittest.TestCase):
         data = {"decoder.pkts": 1000, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
         if name:
             data[name] = value
-        with patch.object(runtime, "sensor", return_value={"pid": 101, "start_ticks": 50}), \
-             patch.object(runtime, "queue", return_value={"pending": 0, "kernel_dropped": 0, "user_dropped": 0}), \
+        with patch.object(runtime, "sensor", return_value={"pid": 101, "start_ticks": 50, "boot_id": "test"}), \
+             patch.object(runtime, "queue", return_value=queue_fixture()), \
              patch.object(runtime, "table", return_value=nft_document(self.cfg)), \
              patch.object(runtime, "owned"), patch.object(runtime, "counters", return_value=data):
             return runtime.observe(self.cfg)
@@ -266,12 +277,14 @@ class RuntimeTests(unittest.TestCase):
         data = {"decoder.pkts": 1000, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
         document = nft_document(self.cfg)
         previous = None
-        with patch.object(runtime, "sensor", return_value={"pid": 101, "start_ticks": 50}), \
-             patch.object(runtime, "queue", return_value={"pending": 0, "kernel_dropped": 0, "user_dropped": 0}), \
+        q = queue_fixture()
+        with patch.object(runtime, "sensor", return_value={"pid": 101, "start_ticks": 50, "boot_id": "test"}), \
+             patch.object(runtime, "queue", return_value=q), \
              patch.object(runtime, "table", return_value=document), \
              patch.object(runtime, "owned"), patch.object(runtime, "counters", return_value=data):
             for sample in range(5):
                 document["nftables"][2]["counter"]["packets"] = 1000 + sample * 1200
+                q["id_sequence"] = 1000 + sample * 1200
                 data["decoder.pkts"] = 1000 + sample * 1000
                 result = runtime.observe(self.cfg, previous)
                 self.assertEqual(result["metrics"]["telemetry_known"], 1)
@@ -283,9 +296,9 @@ class RuntimeTests(unittest.TestCase):
     def observation_patches(self, data, queue_data=None, epoch=None):
         from contextlib import ExitStack
         stack = ExitStack()
-        stack.enter_context(patch.object(runtime, "sensor", return_value=epoch or {"pid": 101, "start_ticks": 50}))
+        stack.enter_context(patch.object(runtime, "sensor", return_value=epoch or {"pid": 101, "start_ticks": 50, "boot_id": "test"}))
         stack.enter_context(patch.object(runtime, "queue", return_value=queue_data or
-                                        {"pending": 0, "kernel_dropped": 0, "user_dropped": 0}))
+                                        queue_fixture()))
         stack.enter_context(patch.object(runtime, "table", return_value=nft_document(self.cfg)))
         stack.enter_context(patch.object(runtime, "owned"))
         stack.enter_context(patch.object(runtime, "counters", return_value=data))
@@ -316,7 +329,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_queue_drop_acknowledgement_preserves_baseline(self):
         data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
-        queue_data = {"pending": 0, "kernel_dropped": 2, "user_dropped": 1}
+        queue_data = queue_fixture(kernel_dropped=2, user_dropped=1)
         with self.observation_patches(data, queue_data), patch.object(runtime, "previous_state", return_value=None), \
              patch.object(runtime, "atomic"):
             self.assertEqual(runtime.observe(self.cfg)["metrics"]["degraded_latched"], 1)
@@ -341,7 +354,7 @@ class RuntimeTests(unittest.TestCase):
         data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
         with self.observation_patches(data):
             previous = runtime.observe(self.cfg)["state"]
-        with self.observation_patches(data, epoch={"pid": 102, "start_ticks": 55}):
+        with self.observation_patches(data, epoch={"pid": 102, "start_ticks": 55, "boot_id": "test"}):
             result = runtime.observe(self.cfg, previous)
             self.assertEqual(result["metrics"]["degraded_latched"], 1)
             self.assertIn("sensor_restarted", result["state"]["reasons"])
@@ -383,6 +396,94 @@ class RuntimeTests(unittest.TestCase):
                 runtime.monitor(self.cfg, acknowledge=True)
             publish.assert_not_called()
 
+
+    def account(self, previous, sample):
+        current = {"pid": 101, "start_ticks": 50, "boot_id": "test"}
+        accounting, gap, reason = runtime.account_kernel(previous or {}, sample, current)
+        return {"sensor": current, "kernel_accounting": accounting}, gap, reason
+
+    def test_single_burst_gap_stays_unknown_without_fabricating_a_bypass(self):
+        previous, _, _ = self.account(None, sample_fixture(100, 100))
+        for n in range(1, 5):
+            previous, gap, reason = self.account(previous, sample_fixture(1100, 100, (10+n)*1000000000))
+            self.assertEqual(gap, 1000)
+            self.assertIsNone(reason)
+
+    def test_inflight_interval_can_converge_and_gso_surplus_is_not_a_loss(self):
+        previous, _, _ = self.account(None, sample_fixture(100, 100))
+        previous, gap, _ = self.account(previous, sample_fixture(1100, 100, 11000000000))
+        self.assertEqual(gap, 1000)
+        previous, gap, _ = self.account(previous, sample_fixture(1100, 1100, 12000000000))
+        self.assertEqual(gap, 0)
+        _, gap, _ = self.account(previous, sample_fixture(1200, 1300, 13000000000))
+        self.assertEqual(gap, 0)
+
+    def test_unsigned_wrap_and_observation_discontinuities(self):
+        previous, _, _ = self.account(None, sample_fixture(100, (1<<32)-5))
+        _, gap, reason = self.account(previous, sample_fixture(110, 5, 11000000000))
+        self.assertEqual((gap, reason), (0, None))
+        for change in ("boot", "socket", "nft", "time_gap", "clock_reversal", "reset"):
+            sample = sample_fixture(110, 5, 11000000000)
+            if change == "boot": sample["boot_id"] = "changed"
+            if change == "socket": sample["after"]["inode"] += 1
+            if change == "nft": sample["nft"]["handles"][0] += 1
+            if change == "time_gap": sample["started_ns"] += runtime.MAX_OBSERVATION_GAP_NS
+            if change == "clock_reversal": sample["started_ns"] = 0
+            if change == "reset": sample["nft"]["packets"] = 0
+            with self.subTest(change=change):
+                self.assertEqual(self.account(previous, sample)[2], "nfqueue.observation_discontinuity")
+
+    def test_gap_is_unknown_and_acknowledge_is_refused(self):
+        data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
+        first = sample_fixture(100, 100)
+        later = sample_fixture(1100, 100, 11000000000)
+        with self.observation_patches(data), patch.object(runtime, "kernel_sample", return_value=first):
+            prior = runtime.observe(self.cfg)["state"]
+        with self.observation_patches(data), patch.object(runtime, "kernel_sample", return_value=later), \
+             patch.object(runtime, "previous_state", return_value=prior), patch.object(runtime, "atomic") as write:
+            result = runtime.observe(self.cfg, prior)
+            self.assertEqual(result["metrics"]["telemetry_known"], 0)
+            self.assertEqual(result["metrics"]["degraded_latched"], 0)
+            self.assertEqual(result["metrics"]["full_inspection_verified"], 0)
+            with self.assertRaisesRegex(RuntimeError, "cannot acknowledge unknown"):
+                runtime.monitor(self.cfg, acknowledge=True)
+            write.assert_not_called()
+
+    def test_netlink_loss_latches_with_equal_nft_and_sequence_counts(self):
+        data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
+        q = queue_fixture()
+        with self.observation_patches(data, q):
+            prior = runtime.observe(self.cfg)["state"]
+            q["netlink_dropped"] = 1
+            result = runtime.observe(self.cfg, prior)
+            self.assertEqual(result["metrics"]["degraded_latched"], 1)
+            self.assertIn("nfqueue.netlink_dropped", result["state"]["reasons"])
+
+    def test_kernel_sample_rejects_sensor_socket_and_clock_changes(self):
+        current = {"pid": 101, "start_ticks": 50, "boot_id": "test"}
+        for change in ("sensor", "socket", "slow"):
+            after = queue_fixture()
+            if change == "socket": after["inode"] += 1
+            with self.subTest(change=change), \
+                 patch.object(runtime, "queue", side_effect=[queue_fixture(), after]), \
+                 patch.object(runtime, "table", return_value=nft_document(self.cfg)), \
+                 patch.object(runtime, "owned"), \
+                 patch.object(runtime, "sensor", return_value={**current, "start_ticks": 51}
+                              if change == "sensor" else current), \
+                 patch.object(runtime.time, "monotonic_ns", side_effect=[0, 1000000001 if change == "slow" else 1]):
+                with self.assertRaises(RuntimeError):
+                    runtime.kernel_sample(self.cfg, current)
+
+    def test_queue_authenticates_netlink_inode_instead_of_assuming_portid_is_pid(self):
+        def read(path, *args, **kwargs):
+            if str(path).endswith("nfnetlink_queue"):
+                return "100 200 0 2 65531 0 0 42 1\n"
+            return "sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n0 12 200 0 0 0 0 0 7 300\n"
+        with patch.object(runtime.Path, "read_text", read), \
+             patch.object(runtime.Path, "iterdir", return_value=iter([Path("/proc/101/fd/3")])), \
+             patch.object(runtime.os, "readlink", return_value="socket:[300]"):
+            q = runtime.queue(self.cfg, 101)
+            self.assertEqual((q["portid"], q["netlink_dropped"], q["id_sequence"]), (200, 7, 42))
 
     @unittest.skipUnless(hasattr(runtime.os, "fchmod"), "POSIX atomic file permissions required")
     def test_monitor_unknown_writes_actual_state_and_string_metric_path(self):

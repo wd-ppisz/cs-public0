@@ -41,8 +41,9 @@ infer inspection loss or latch degradation.
 
 On the inspected Linux 6.8 and 6.11 kernels, NFQUEUE fail-open accepts packets on
 queue saturation or failed userspace delivery without incrementing the exported
-queue drop fields. This monitor has no direct counter for these bypass events and
-cannot latch them. `telemetry_known=1` describes observation availability only;
+queue drop fields. The monitor supplements these with bracketed queue IDs,
+socket loss counters and object identity; see [kernel accounting](kernel-accounting.md).
+There is still no complete direct bypass counter. `telemetry_known=1` describes observation availability only;
 a clear latch and zero reported drops do not establish complete inspection.
 
 There is no traffic generator or automatic recovery action in the monitor.

@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 560" role="img" aria-labelledby="title desc">
+  <title id="title">public0 2.0 proposed protection layers</title>
+  <desc id="desc">Upstream mitigation, optional XDP, scoped nftables guard, Suricata NFQUEUE, CloudStack virtual router and customer services. A policy controller supplies versioned service policies. The proposal is not implemented.</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#64748b"/></marker></defs>
+  <rect width="1080" height="560" rx="18" fill="#f8fafc"/>
+  <g font-family="Arial,sans-serif" text-anchor="middle" fill="#0f172a">
+    <text x="540" y="42" font-size="24" font-weight="bold">public0 2.0 · proposed anti-DDoS layer</text>
+    <text x="540" y="69" font-size="15" fill="#475569">Not implemented · no enforcement enabled by this proposal</text>
+    <g fill="white" stroke="#94a3b8" stroke-width="2">
+      <rect x="30" y="150" width="155" height="100" rx="12"/>
+      <rect x="220" y="150" width="170" height="100" rx="12" stroke-dasharray="6 4"/>
+      <rect x="425" y="150" width="180" height="100" rx="12" stroke="#2563eb"/>
+      <rect x="640" y="150" width="175" height="100" rx="12"/>
+      <rect x="850" y="150" width="200" height="100" rx="12"/>
+      <rect x="310" y="360" width="460" height="95" rx="12" stroke="#2563eb"/>
+    </g>
+    <g font-size="18" font-weight="bold">
+      <text x="108" y="187">Upstream</text><text x="108" y="213">mitigation</text>
+      <text x="305" y="187">Optional XDP</text><text x="305" y="213">early guard</text>
+      <text x="515" y="187">nftables guard</text><text x="515" y="213">IP / service budget</text>
+      <text x="728" y="187">Suricata</text><text x="728" y="213">NFQUEUE</text>
+      <text x="950" y="187">CloudStack VR</text><text x="950" y="213">customer services</text>
+      <text x="540" y="394">Policy controller + read-only inventory</text>
+    </g>
+    <text x="540" y="425" font-size="16">Versioned policy · expiry · bounded telemetry</text>
+    <text x="540" y="310" font-size="17" fill="#475569">Enforce only inside the explicitly owned public protection domain</text>
+    <text x="540" y="502" font-size="16" fill="#475569">Shared management/storage VLANs and foreign firewall objects stay outside the policy</text>
+    <text x="540" y="530" font-size="16" fill="#475569">Host filtering cannot recover an already saturated uplink</text>
+  </g>
+  <g stroke="#64748b" stroke-width="2" marker-end="url(#arrow)" fill="none">
+    <path d="M185 200H215"/><path d="M390 200H420"/><path d="M605 200H635"/><path d="M815 200H845"/>
+    <path d="M420 360V335H305V255" stroke-dasharray="6 4"/>
+    <path d="M540 360V325H515V255" stroke-dasharray="6 4"/>
+  </g>
+</svg>

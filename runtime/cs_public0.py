@@ -29,6 +29,8 @@ MAX_RULES_BYTES = 64 * 1024 * 1024
 MAX_RULE_LINE_BYTES = 4096
 ENGINE_TEST_TIMEOUT_SECONDS = 180
 SENSOR_READY_TIMEOUT_SECONDS = 240
+SEQUENCE_MODULUS = 1 << 32
+MAX_OBSERVATION_GAP_NS = 60 * 1000000000
 
 
 def require(value, message):
@@ -240,17 +242,92 @@ def sensor(cfg):
 def queue(cfg, pid):
     rows = [line.split() for line in Path("/proc/net/netfilter/nfnetlink_queue").read_text().splitlines()]
     rows = [row for row in rows if row and row[0] == str(cfg["queue"])]
-    require(len(rows) == 1 and len(rows[0]) >= 7, "queue has no unique listener")
-    row = rows[0]
-    portid = int(row[1])
-    # Netlink port IDs are not necessarily process IDs. Authenticate the socket inode
-    # through /proc instead of assuming the kernel's portid belongs to the MainPID.
-    sockets = {os.readlink(fd)[8:-1] for fd in Path("/proc", str(pid), "fd").iterdir()
-               if os.readlink(fd).startswith("socket:[")}
-    matches = [line.split() for line in Path("/proc/net/netlink").read_text().splitlines()[1:]]
-    require(any(len(r) >= 10 and r[1] == "12" and int(r[2]) == portid and r[-1] in sockets
-                for r in matches), "NFQUEUE listener is not owned by the sensor")
-    return {"pending": int(row[2]), "kernel_dropped": int(row[5]), "user_dropped": int(row[6])}
+    require(len(rows) == 1 and len(rows[0]) == 9, "queue has no unique listener")
+    values = [int(item) for item in rows[0]]
+    require(all(item >= 0 for item in values) and values[3] == 2
+            and 0 < values[4] <= 65535 and values[7] < SEQUENCE_MODULUS, "invalid queue schema")
+    # A portid is not a process identity. Bind the unique NETLINK_NETFILTER
+    # socket inode to a descriptor of the current sensor.
+    sockets = [line.split() for line in Path("/proc/net/netlink").read_text().splitlines()[1:]]
+    sockets = [row for row in sockets if len(row) == 10 and row[1] == "12"
+               and row[2] == str(values[1])]
+    require(len(sockets) == 1, "no unique NFQUEUE netlink socket")
+    inode, drops = int(sockets[0][9]), int(sockets[0][8])
+    require(inode > 0 and drops >= 0, "invalid netlink socket schema")
+    wanted = "socket:[" + str(inode) + "]"
+    require(any(os.readlink(fd) == wanted for fd in Path("/proc", str(pid), "fd").iterdir()),
+            "NFQUEUE listener is not owned by the sensor")
+    return {"pending": values[2], "kernel_dropped": values[5], "user_dropped": values[6],
+            "id_sequence": values[7], "portid": values[1], "inode": inode, "netlink_dropped": drops}
+
+
+def kernel_sample(cfg, current):
+    started = time.monotonic_ns()
+    before = dict(queue(cfg, current["pid"]))
+    document = table(cfg)
+    owned(cfg)
+    require(exact_table(document, cfg), "selector is absent or modified")
+    objects = {kind: body for item in document["nftables"] for kind, body in item.items()
+               if kind != "metainfo"}
+    handles = [objects[kind].get("handle") for kind in ("table", "counter", "chain", "rule")]
+    require(all(type(item) is int and item > 0 for item in handles), "missing nft object identity")
+    packets = objects["counter"]["packets"]
+    require(type(packets) is int and packets >= 0, "invalid nft packet counter")
+    after = dict(queue(cfg, current["pid"]))
+    finished = time.monotonic_ns()
+    require((before["portid"], before["inode"]) == (after["portid"], after["inode"]),
+            "socket changed during sample")
+    require(sensor(cfg) == current, "sensor changed during sample")
+    require(0 <= finished - started <= 1000000000, "kernel sample exceeded timing bound")
+    return {"before": before, "after": after, "nft": {"packets": packets, "handles": handles},
+            "started_ns": started, "finished_ns": finished, "boot_id": current["boot_id"]}
+
+
+def sequence_delta(new, old):
+    delta = (new - old) % SEQUENCE_MODULUS
+    require(delta < SEQUENCE_MODULUS // 2, "queue sequence reset or ambiguous wrap")
+    return delta
+
+
+def account_kernel(previous, sample, current):
+    """Bracket the nft counter with kernel sequence reads, not decoder stats.
+
+    A positive gap is UNKNOWN: an in-flight packet and a loss cannot be
+    distinguished by this observation. GSO may hide a gap. No gap is never
+    proof of full inspection.
+    """
+    before, after = sample["before"], sample["after"]
+    width = sequence_delta(after["id_sequence"], before["id_sequence"])
+    prior = previous.get("kernel_accounting")
+    reason = None
+    total_before = 0
+    ceiling = sample["nft"]["packets"]
+    if isinstance(prior, dict):
+        try:
+            old = prior["sample"]
+            same = (previous.get("sensor") == current and old["boot_id"] == sample["boot_id"]
+                    and old["nft"]["handles"] == sample["nft"]["handles"]
+                    and (old["after"]["portid"], old["after"]["inode"])
+                    == (after["portid"], after["inode"]))
+            elapsed = sample["started_ns"] - old["finished_ns"]
+            require(same and 0 <= elapsed <= MAX_OBSERVATION_GAP_NS, "observation continuity")
+            growth = sample["nft"]["packets"] - old["nft"]["packets"]
+            require(0 <= growth < SEQUENCE_MODULUS // 2, "counter reset or ambiguous number of wraps")
+            total_before = prior["total_after"] + sequence_delta(
+                before["id_sequence"], old["after"]["id_sequence"])
+            ceiling = prior["offset_ceiling"]
+        except (KeyError, TypeError, RuntimeError):
+            reason = "nfqueue.observation_discontinuity"
+            total_before = 0
+            ceiling = sample["nft"]["packets"]
+    elif previous.get("sensor") not in (None, current):
+        reason = "nfqueue.observation_discontinuity"
+    total_after = total_before + width
+    low, high = sample["nft"]["packets"] - total_after, sample["nft"]["packets"] - total_before
+    gap = max(0, low - ceiling)
+    state = {"sample": sample, "total_after": total_after,
+             "offset_ceiling": min(ceiling, high), "unexplained_gap": gap}
+    return state, gap, reason
 
 
 def flatten(value, prefix=""):
@@ -339,19 +416,16 @@ def midstream_counter(name):
 def observe(cfg, previous=None):
     previous = previous or {"latched": False, "sensor": None}
     metrics = {"telemetry_known": 0, "sensor_up": 0, "queue_listener": 0, "nft_rule": 0,
-               "degraded_latched": int(previous["latched"]), "last_publish_unix_seconds": time.time()}
+               "degraded_latched": int(previous["latched"]), "full_inspection_verified": 0,
+               "last_publish_unix_seconds": time.time()}
     state = dict(previous)
     try:
         current = sensor(cfg)
         metrics["sensor_up"] = 1
-        q = queue(cfg, current["pid"])
-        metrics["queue_listener"] = 1
-        document = table(cfg)
-        owned(cfg)
-        require(exact_table(document, cfg), "selector is absent or modified")
-        metrics["nft_rule"] = 1
-        packets = next(item["counter"]["packets"] for item in document["nftables"] if "counter" in item)
-        require(type(packets) is int and packets >= 0, "invalid nft packet counter")
+        sample = kernel_sample(cfg, current)
+        q = sample["after"]
+        packets = sample["nft"]["packets"]
+        metrics.update({"queue_listener": 1, "nft_rule": 1})
         data = counters(cfg, current["pid"])
         require(all(name in data for name in (*LOSS_COUNTERS, "decoder.pkts", "uptime"))
                 and data["uptime"] > 0, "incomplete counters")
@@ -359,7 +433,8 @@ def observe(cfg, previous=None):
                    (name in LOSS_COUNTERS or any("exception_policy" in segment for segment in name.split(".")) or
                     name.startswith("capture.nfq.copy_") or name in ("defrag.max_frags_reached",
                     "defrag.max_trackers_reached", "defrag.tracker_hard_reuse"))}
-        watched.update({"nfqueue.kernel_dropped": q["kernel_dropped"], "nfqueue.user_dropped": q["user_dropped"]})
+        watched.update({"nfqueue." + name: max(sample["before"][name], q[name])
+                        for name in ("kernel_dropped", "user_dropped", "netlink_dropped")})
         same_sensor = previous.get("sensor") == current
         prior_counters = previous.get("counters", {}) if same_sensor else {}
         require(isinstance(prior_counters, dict) and all(type(v) is int and v >= 0 for v in prior_counters.values()),
@@ -370,17 +445,25 @@ def observe(cfg, previous=None):
             reasons.append("counter_reset")
         if previous.get("sensor") not in (None, current):
             reasons.append("sensor_restarted")
-        candidate = {"sensor": current, "latched": bool(previous["latched"] or reasons), "reasons": reasons,
+        accounting, gap, continuity_reason = account_kernel(previous, sample, current)
+        if continuity_reason:
+            reasons.append(continuity_reason)
+        candidate = {"kernel_accounting": accounting,
+                     "accounting_status": "UNKNOWN_GAP" if gap else
+                        ("UNKNOWN_DISCONTINUITY" if continuity_reason else "OBSERVED_NO_GAP"),
+                     "sensor": current, "latched": bool(previous["latched"] or reasons), "reasons": reasons,
                      "counters": watched}
         require(len(json.dumps(candidate).encode()) <= MAX_STATE, "observed state too large")
         state = candidate
         midstream = [value for name, value in data.items() if midstream_counter(name)]
         if midstream:
             metrics["midstream_policy_events_total"] = sum(midstream)
-        metrics.update({"telemetry_known": 1, "degraded_latched": int(state["latched"]),
+        metrics.update({"telemetry_known": int(not gap and not continuity_reason),
+                        "accounting_unexplained_gap": gap, "degraded_latched": int(state["latched"]),
                         "nft_packets_total": packets,
                         "decoder_packets_total": data["decoder.pkts"], "sensor_uptime_seconds": data["uptime"],
-                        **{"queue_" + key: value for key, value in q.items()}})
+                        **{"queue_" + key: q[key] for key in
+                           ("pending", "kernel_dropped", "user_dropped", "netlink_dropped", "id_sequence")}})
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError) as error:
         state["error"] = str(error)[:240]
     return {"metrics": metrics, "state": state}
