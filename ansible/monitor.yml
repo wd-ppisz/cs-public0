@@ -1,0 +1,102 @@
+---
+# Day-2 update of the controller/monitor only. Does not reload the sensor.
+- name: Update an existing cs-public0 monitor on one explicitly selected host
+  hosts: "{{ target | default('cs_public0_no_target') }}"
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Require one explicit target and the expected installed controller hash
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - target == inventory_hostname
+          - ansible_play_hosts_all | length == 1
+          - cs_public0_expected_runtime_sha256 is match('^[0-9a-f]{64}$')
+
+    - name: Inspect the existing controller without following symlinks
+      ansible.builtin.stat:
+        path: /usr/local/libexec/cs-public0
+        follow: false
+        checksum_algorithm: sha256
+      register: cs_public0_runtime_before
+
+    - name: Reject an unexpected installed controller
+      ansible.builtin.assert:
+        that:
+          - cs_public0_runtime_before.stat.isreg | default(false)
+          - not (cs_public0_runtime_before.stat.islnk | default(false))
+          - cs_public0_runtime_before.stat.uid == 0
+          - not cs_public0_runtime_before.stat.wgrp
+          - not cs_public0_runtime_before.stat.woth
+          - cs_public0_runtime_before.stat.checksum == cs_public0_expected_runtime_sha256
+
+    - name: Verify the existing service and preserve its process identity and latch
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import json, runpy, subprocess
+            r = runpy.run_path('/usr/local/libexec/cs-public0', run_name='update_preflight')
+            cfg = r['load_config']('/etc/cs-public0/config.json')
+            for unit in (cfg['service'], 'cs-public0-monitor.timer'):
+                subprocess.run(['systemctl', 'is-active', '--quiet', unit], check=True)
+            assert subprocess.check_output(['systemctl', 'is-enabled', 'cs-public0-monitor.timer'], text=True).strip() == 'enabled'
+            prior = r['previous_state'](cfg) or {'latched': False}
+            print(json.dumps({'sensor': r['sensor'](cfg), 'latched': prior['latched']}))
+      register: cs_public0_monitor_before
+      changed_when: false
+
+    - name: Replace only the controller while preserving observation state
+      block:
+        - name: Stop the monitor timer and any current monitor sample
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            state: stopped
+          loop: [cs-public0-monitor.timer, cs-public0-monitor.service]
+
+        - name: Install the reviewed controller with Python syntax validation
+          ansible.builtin.copy:
+            src: ../runtime/cs_public0.py
+            dest: /usr/local/libexec/cs-public0
+            owner: root
+            group: root
+            mode: '0755'
+            validate: >-
+              /usr/bin/python3 -c "import sys; compile(open(sys.argv[1], 'rb').read(), sys.argv[1], 'exec')" %s
+
+        - name: Publish the first observation with the updated monitor
+          ansible.builtin.systemd_service:
+            name: cs-public0-monitor.service
+            state: started
+      always:
+        - name: Restore the active monitor timer even after an update error
+          ansible.builtin.systemd_service:
+            name: cs-public0-monitor.timer
+            state: started
+
+    - name: Verify the sensor epoch, current observation and preserved latch
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import json, pathlib, runpy, subprocess, sys, time
+            before = json.loads(sys.argv[1])
+            r = runpy.run_path('/usr/local/libexec/cs-public0', run_name='update_readback')
+            cfg = r['load_config']('/etc/cs-public0/config.json')
+            assert r['sensor'](cfg) == before['sensor'], 'sensor process changed'
+            state = r['previous_state'](cfg)
+            assert state and 'kernel_accounting' in state, 'missing kernel accounting'
+            assert not before['latched'] or state['latched'], 'latch was erased'
+            assert r['observe'](cfg, state)['metrics']['telemetry_known'] == 1, 'unknown telemetry'
+            metrics = pathlib.Path(cfg['metrics_file'])
+            assert 0 <= time.time() - metrics.stat().st_mtime < 30, 'stale publication'
+            assert 'cs_public0_queue_id_sequence{' in metrics.read_text(), 'old metric schema'
+            subprocess.run(['systemctl', 'is-active', '--quiet', 'cs-public0-monitor.timer'], check=True)
+            print(json.dumps({'sensor': before['sensor'], 'latched': state['latched'],
+                              'accounting_status': state['accounting_status']}))
+          - "{{ cs_public0_monitor_before.stdout }}"
+      changed_when: false
