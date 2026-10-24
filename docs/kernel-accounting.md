@@ -9,9 +9,9 @@ userspace delivery, so matching ID counts do not rule out socket loss.
 The observation interval accounts for packets arriving while counters are read.
 The 32-bit queue sequence is unrolled modulo 2^32 only when the inferred increment
 is below half the range. A changed socket, sensor, boot or nft object handle, a
-counter reset, reversed clock or observation gap over 60 seconds is an explicit
-discontinuity. It sets telemetry unknown and latches degradation. Existing latches
-survive upgrades; old states start a new kernel accounting baseline.
+counter reset or reversed clock is an explicit discontinuity. It sets telemetry
+unknown and latches degradation. Existing latches survive upgrades; old states
+start a new kernel accounting baseline.
 
 The supplied [monitor timer](../config/cs-public0-monitor.timer) uses
 `OnUnitActiveSec=10s` and `AccuracySec=1s`. The 60-second continuity limit is a
@@ -23,10 +23,19 @@ bounds do not qualify arbitrary traffic rates or eliminate all wrap ambiguity.
 Do not use a timer interval of 60 seconds or more with this profile; changing
 the cadence or continuity bound requires separate qualification.
 
+An observation gap over 60 seconds with otherwise unchanged identities and
+monotonic counters sets `nfqueue.observation_gap`, telemetry unknown and a separate
+`accounting_observation_gap_history_latched`. This is missing coverage, not a
+reported loss. It keeps the aggregate `degraded_latched=1` after current telemetry
+recovers, without setting the physical-loss latch. Removing the time bound would
+hide potential whole sequence wraps, so the bound remains in force.
+
 After a discontinuity, the unknown sample becomes a fresh accounting baseline.
 A subsequent complete, continuous sample without an unexplained gap can become
 known again; the degraded latch remains set until an explicit `acknowledge`
-succeeds on a known observation. If every sample exceeds the continuity bound,
+succeeds on a known observation. The separate observation-gap history instead
+requires the audited `acknowledge-accounting-gap` decision described below.
+If every sample exceeds the continuity bound,
 fix the sampling cadence or its execution failure first. Acknowledge does not
 waive the observation requirements.
 
@@ -50,7 +59,8 @@ sudo /usr/local/libexec/cs-public0 acknowledge-accounting-gap \
   --evidence-sha256 SHA256_OF_THE_RETAINED_REPORT
 ```
 
-This requires a known current observation without a current gap. It records
+This accepts either retained accounting-gap or observation-gap history and
+requires a known current observation without a current gap. It records
 the previous accounting sample, evidence reference and actual integer wall /
 monotonic timestamps in `gap_acknowledgements`, in the same atomic state write
 as the new baseline. The historical peak and other degradation latches remain.

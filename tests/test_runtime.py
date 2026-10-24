@@ -495,7 +495,28 @@ class RuntimeTests(unittest.TestCase):
             if change == "clock_reversal": sample["started_ns"] = 0
             if change == "reset": sample["nft"]["packets"] = 0
             with self.subTest(change=change):
-                self.assertEqual(self.account(previous, sample)[2], "nfqueue.observation_discontinuity")
+                self.assertEqual(self.account(previous, sample)[2],
+                                 "nfqueue.observation_gap" if change == "time_gap" else "nfqueue.observation_discontinuity")
+
+    def test_long_observation_pause_has_audited_exit_without_clearing_loss_latches(self):
+        data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
+        prior = None
+        for index, sample in enumerate((sample_fixture(100, 100),
+                sample_fixture(200, 200, 130000000000), sample_fixture(300, 300, 140000000000))):
+            with self.observation_patches(data), patch.object(runtime, "kernel_sample", return_value=sample):
+                result = runtime.observe(self.cfg, prior)
+                prior = result["state"]
+            self.assertFalse(prior["latched"])
+            if index == 1:
+                self.assertEqual(result["metrics"]["telemetry_known"], 0)
+                self.assertEqual(result["metrics"]["accounting_observation_gap_history_latched"], 1)
+        self.assertEqual(result["metrics"]["telemetry_known"], 1)
+        self.assertEqual(result["metrics"]["degraded_latched"], 1)
+        self.assertEqual(prior["kernel_accounting"]["gap_history_peak"], 0)
+        runtime.acknowledge_accounting_gap(prior, result["metrics"], "c" * 64)
+        self.assertEqual(result["metrics"]["degraded_latched"], 0)
+        self.assertFalse(prior["kernel_accounting"]["observation_gap_history_latched"])
+        self.assertTrue(prior["gap_acknowledgements"][0]["before"]["observation_gap_history_latched"])
 
     def test_gap_is_unknown_and_acknowledge_is_refused(self):
         data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}

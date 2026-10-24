@@ -346,12 +346,17 @@ def account_kernel(previous, sample, current):
                     and (old["after"]["portid"], old["after"]["inode"])
                     == (after["portid"], after["inode"]))
             elapsed = sample["started_ns"] - old["finished_ns"]
-            require(same and 0 <= elapsed <= MAX_OBSERVATION_GAP_NS, "observation continuity")
+            require(same and elapsed >= 0, "observation continuity")
             growth = sample["nft"]["packets"] - old["nft"]["packets"]
             require(0 <= growth < SEQUENCE_MODULUS // 2, "counter reset or ambiguous number of wraps")
-            total_before = prior["total_after"] + sequence_delta(
-                before["id_sequence"], old["after"]["id_sequence"])
-            ceiling = prior["offset_ceiling"]
+            if elapsed > MAX_OBSERVATION_GAP_NS:
+                # A whole number of uint32 wraps cannot be ruled out by a
+                # small modulo delta. Keep this coverage gap separate from loss.
+                reason = "nfqueue.observation_gap"
+            else:
+                total_before = prior["total_after"] + sequence_delta(
+                    before["id_sequence"], old["after"]["id_sequence"])
+                ceiling = prior["offset_ceiling"]
         except (KeyError, TypeError, RuntimeError):
             reason = "nfqueue.observation_discontinuity"
             total_before = 0
@@ -367,10 +372,13 @@ def account_kernel(previous, sample, current):
     require(all(type(value) is int and value >= 0 for value in history),
             "invalid accounting gap history")
     history_latched = prior.get("gap_history_latched", max(history) > 0) if isinstance(prior, dict) else False
-    require(type(history_latched) is bool, "invalid accounting history latch")
+    observation_latched = prior.get("observation_gap_history_latched", False) if isinstance(prior, dict) else False
+    require(type(history_latched) is bool and type(observation_latched) is bool,
+            "invalid accounting history latch")
     state = {"sample": sample, "total_after": total_after,
              "offset_ceiling": min(ceiling, high), "unexplained_gap": gap,
-             "gap_history_peak": max(history), "gap_history_latched": bool(history_latched or gap)}
+             "gap_history_peak": max(history), "gap_history_latched": bool(history_latched or gap),
+             "observation_gap_history_latched": bool(observation_latched or reason == "nfqueue.observation_gap")}
     return state, gap, reason
 
 
@@ -460,7 +468,8 @@ def midstream_counter(name):
 def observe(cfg, previous=None):
     previous = previous or {"latched": False, "sensor": None}
     prior_accounting = previous.get("kernel_accounting")
-    prior_history = isinstance(prior_accounting, dict) and prior_accounting.get("gap_history_latched") is True
+    prior_history = isinstance(prior_accounting, dict) and any(prior_accounting.get(name) is True for name in
+        ("gap_history_latched", "observation_gap_history_latched"))
     metrics = {"telemetry_known": 0, "sensor_up": 0, "queue_listener": 0, "nft_rule": 0,
                "degraded_latched": int(previous["latched"] or prior_history), "full_inspection_verified": 0,
                "last_publish_unix_seconds": time.time()}
@@ -493,7 +502,7 @@ def observe(cfg, previous=None):
             reasons.append("sensor_restarted")
         accounting, gap, continuity_reason = account_kernel(previous, sample, current)
         history_gap = accounting["gap_history_peak"]
-        if continuity_reason:
+        if continuity_reason and continuity_reason != "nfqueue.observation_gap":
             reasons.append(continuity_reason)
         candidate = {"kernel_accounting": accounting,
                      "accounting_status": "UNKNOWN_GAP" if gap else
@@ -509,8 +518,10 @@ def observe(cfg, previous=None):
         metrics.update({"telemetry_known": int(not gap and not continuity_reason),
                         "accounting_gap_history_peak": history_gap,
                         "accounting_gap_history_latched": int(accounting["gap_history_latched"]),
+                        "accounting_observation_gap_history_latched": int(accounting["observation_gap_history_latched"]),
                         "accounting_unexplained_gap": gap,
-                        "degraded_latched": int(state["latched"] or accounting["gap_history_latched"]),
+                        "degraded_latched": int(state["latched"] or accounting["gap_history_latched"]
+                                                or accounting["observation_gap_history_latched"]),
                         "nft_packets_total": packets,
                         "decoder_packets_total": data["decoder.pkts"], "sensor_uptime_seconds": data["uptime"],
                         **{"queue_" + key: q[key] for key in
@@ -560,7 +571,8 @@ def acknowledge_accounting_gap(state, metrics, evidence):
     require(isinstance(evidence, str) and re.fullmatch(r"[0-9a-f]{64}", evidence), "evidence SHA256 required")
     require(metrics["telemetry_known"] == 1, "cannot acknowledge unknown current observation")
     accounting = state["kernel_accounting"]
-    require(accounting["gap_history_latched"] and accounting["unexplained_gap"] == 0,
+    require((accounting["gap_history_latched"] or accounting.get("observation_gap_history_latched", False))
+            and accounting["unexplained_gap"] == 0,
             "no historical gap to acknowledge or current gap remains")
     log = state.get("gap_acknowledgements", [])
     require(isinstance(log, list) and len(log) < 32, "accounting acknowledgement audit bound reached")
@@ -570,9 +582,11 @@ def acknowledge_accounting_gap(state, metrics, evidence):
         "other_latch_preserved": state["latched"]}]
     sample = accounting["sample"]
     accounting.update(total_after=sequence_delta(sample["after"]["id_sequence"], sample["before"]["id_sequence"]),
-                      offset_ceiling=sample["nft"]["packets"], gap_history_latched=False)
+                      offset_ceiling=sample["nft"]["packets"], gap_history_latched=False,
+                      observation_gap_history_latched=False)
     state["accounting_status"] = "ACKNOWLEDGED_GAP_HISTORY"
-    metrics.update(accounting_gap_history_latched=0, degraded_latched=int(state["latched"]))
+    metrics.update(accounting_gap_history_latched=0, accounting_observation_gap_history_latched=0,
+                   degraded_latched=int(state["latched"]))
 
 
 def monitor(cfg, acknowledge=False, accounting_gap_evidence=None):
@@ -581,7 +595,9 @@ def monitor(cfg, acknowledge=False, accounting_gap_evidence=None):
     if acknowledge:
         require(result["metrics"]["telemetry_known"] == 1, "cannot acknowledge unknown telemetry")
         result["state"].update({"latched": False, "reasons": []})
-        result["metrics"]["degraded_latched"] = int(result["state"]["kernel_accounting"]["gap_history_latched"])
+        accounting = result["state"]["kernel_accounting"]
+        result["metrics"]["degraded_latched"] = int(accounting["gap_history_latched"]
+            or accounting.get("observation_gap_history_latched", False))
     if accounting_gap_evidence is not None:
         acknowledge_accounting_gap(result["state"], result["metrics"], accounting_gap_evidence)
     state_json = json.dumps(result["state"], sort_keys=True)
