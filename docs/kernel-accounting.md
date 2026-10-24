@@ -29,6 +29,9 @@ monotonic counters sets `nfqueue.observation_gap`, telemetry unknown and a separ
 reported loss. It keeps the aggregate `degraded_latched=1` after current telemetry
 recovers, without setting the physical-loss latch. Removing the time bound would
 hide potential whole sequence wraps, so the bound remains in force.
+When continuity is already missing because of time, even an nft increment of
+2^31 or more belongs to that auditable coverage gap. The half-range check only
+applies to a continuous interval; an actual counter decrease is still rejected.
 
 After a discontinuity, the unknown sample becomes a fresh accounting baseline.
 A subsequent complete, continuous sample without an unexplained gap can become
@@ -56,19 +59,52 @@ An explicit operator decision can start a fresh accounting baseline:
 
 ```sh
 sudo /usr/local/libexec/cs-public0 acknowledge-accounting-gap \
-  --evidence-sha256 SHA256_OF_THE_RETAINED_REPORT
+  --evidence-sha256 SHA256_OF_THE_RETAINED_REPORT \
+  --expected-history-sha256 ACCOUNTING_CLAIM_FROM_REVIEWED_STATUS
 ```
 
-This accepts either retained accounting-gap or observation-gap history and
-requires a known current observation without a current gap. It records
+This accepts retained accounting-gap or observation-gap history, including a
+persistent current gap after a burst. It requires a complete current source
+observation with continuous identities and clocks (`current_sample_valid=true`),
+not an unavailable, reset or discontinuous sample. A numeric gap still leaves
+`telemetry_known=0`. The operator decision records
 the previous accounting sample, evidence reference and actual integer wall /
 monotonic timestamps in `gap_acknowledgements`, in the same atomic state write
 as the new baseline. The historical peak and other degradation latches remain.
+The full gap remains in the audit, while the new baseline starts with zero gap.
+The acknowledgement does not change an UNKNOWN historical sample to known;
+only a subsequent complete observation can become known on the new baseline.
 The SHA is an operator-supplied reference, not evidence attestation. The monitor
+also compares the required expected-history SHA with the fresh observation's
+claim. Obtain `state.accounting_claim_sha256` from the reviewed `status` result.
+It covers source identities, current gap, historical peak, both history flags
+and acknowledgement count, excluding timestamps and ordinary packet progress.
+A larger or otherwise changed gap, changed source or replay after another
+acknowledgement refuses the operation. This claim is a concurrency guard, not a
+signature or proof that the operator reviewed the referenced report. The monitor
 timer never acknowledges automatically. Its existing lock serializes state
 updates. The audit is bounded to 32 decisions and the existing 64 KiB state cap;
 overflow refuses the operation and requires separately controlled archiving,
 without automatic history deletion.
+
+For an internal failure in the timer's `monitor` command, its command boundary
+publishes UNKNOWN under the same state lock and preserves the actual retained
+degradation flags. Operator validation refusals in `acknowledge*` do not publish
+metrics. If retained state cannot be read or has invalid structure, the fallback
+publishes conservative degradation uncertainty without changing that state. A
+failure to publish the fallback is logged, and the original error is preserved.
+A failure to acquire the lock never writes outside it: the command fails
+and the old publish timestamp remains for the freshness alert. This deliberately
+rejects an unlocked fallback publisher, which could overwrite the lock holder's
+fresh result. If the metrics destination itself is unavailable, publication also
+fails and freshness monitoring remains necessary.
+
+Administrative `check`/`arm` can hold the shared lock beyond 60 seconds. Such a
+controlled pause still lacks observation coverage and requires the explicit
+audited acknowledgement after continuity returns; it is not silently treated as
+lossless. The long-pause regression covers the resulting history and its exit.
+Listener and nft selector indicators record independent successful reads; an nft
+failure can leave `queue_listener=1` while overall telemetry remains UNKNOWN.
 
 `decoder.pkts` remains independent telemetry. Its asynchronous aggregation cannot
 create a kernel-accounting loss. GSO can generate multiple queue IDs for one nft
@@ -102,3 +138,16 @@ operation. Neither this path nor a passing unit test qualifies all live kernels.
 
 See the [kernel references](references.md) for ID assignment, fail-open and netlink
 overrun semantics. Validate the source and effective behavior of your own kernel.
+
+The managed alert-only preflight rejects secondary rule-source keys and enabled
+firewall/multi-detect profiles in the engine's effective dump, including sources
+introduced by YAML includes. Only its exact single `rule-files.0` is accepted.
+Rule-source matching uses path segments (`rule-files`, `rule-path`,
+`default-rule-path` and their named prefixes), not a substring search for
+`rules`. Diagnostic `engine-analysis.rules`, `profiling.rules.*` and Lua
+permission keys do not select another rule file and are not rejected merely
+because of their names. Their presence is not a qualification of those features.
+This intentionally conservative profile is not a general Suricata configuration
+validator. See the upstream [8.0.7 configuration](https://github.com/OISF/suricata/blob/suricata-8.0.7/suricata.yaml.in)
+and [firewall design](https://docs.suricata.io/en/suricata-8.0.7/firewall/firewall-design.html)
+for the separate firewall rule sources and policies.
