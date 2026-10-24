@@ -204,7 +204,8 @@ def validate_rules(cfg):
             # byte is a backslash, including inside quoted option values.
             names = [option.partition(":")[0].strip(" \t").lower()
                      for option in re.split(r"(?<!\\);", options)]
-            require("bypass" not in names, "bypass rule options are not accepted")
+            for forbidden in ("bypass", "replace"):
+                require(forbidden not in names, f"{forbidden} rule options are not accepted")
             count += 1
     require(count > 0, "rules file has no active alert rules")
     return count

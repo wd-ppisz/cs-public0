@@ -178,6 +178,23 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "too large"):
                     runtime.validate_rules(self.cfg)
 
+    def test_alert_rules_reject_packet_replacement_without_rejecting_literal_text(self):
+        content = b""
+        path = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=len(content)), read_bytes=lambda: content)
+        with patch.object(runtime, "secure_path", return_value=path):
+            for options in ('content:"abc"; replace:"xyz"; sid:1;',
+                            'content:"abc"; RePlAcE : "xyz"; sid:1;',
+                            'replace:"xyz"; content:"abc"; sid:1;'):
+                content = ('alert tcp any any -> any any (' + options + ')').encode()
+                with self.subTest(options=options), self.assertRaisesRegex(RuntimeError, "replace"):
+                    runtime.validate_rules(self.cfg)
+            for options in ('msg:"literal replace:xyz"; sid:1;',
+                            r'msg:"literal \; replace:xyz\;"; sid:1;',
+                            'content:"replace"; sid:1;'):
+                content = ('alert tcp any any -> any any (' + options + ')').encode()
+                with self.subTest(options=options):
+                    self.assertEqual(runtime.validate_rules(self.cfg), 1)
+
     def test_flatten_nested_counters_ignores_threads_boolean_and_invalid_values(self):
         data = runtime.flatten({"decoder": {"pkts": 7}, "uptime": 9,
                                 "threads": {"W#1": {"decoder": {"pkts": 7}}},
