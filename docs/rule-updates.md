@@ -27,6 +27,15 @@ błędów składni, SID/GID, zależności i semantyki silnika wymaga jego testu.
 
 ## Bramka przed aktywacją
 
+**Warunek reloadu:** Suricata 8.0.7 odrzuca komendę reloadu, jeśli proces
+uruchomiono z `-S` albo `-s`. Jednostka projektu używa teraz wyłącznie
+przypiętej listy `rule-files: [local.rules]` i katalogu reguł w wygenerowanym
+YAML; walidacja `-T --simulate-ips` korzysta z tego samego wyboru. Usunięcie
+`-S` z już uruchomionej instalacji wymaga kontrolowanego restartu. Najpierw
+trzeba sprawdzić YAML: stary profil sdc wskazuje inne, współdzielone pliki,
+które były dotąd przesłonięte przez `-S`. Nie wolno po prostu usunąć flagi.
+Zmiana źródła reguł w projekcie nie migruje automatycznie istniejącego sdc.
+
 1. Zachowaj przypięte źródło, jego pochodzenie/licencję i manifest kandydata.
    Sprawdź różnice SID/revision i nieoczekiwane usunięcia względem aktywnego zbioru.
 2. W oddzielnej ograniczonej jednostce wykonaj `Suricata -T` z tym samym binarium,
@@ -52,11 +61,14 @@ błędów składni, SID/GID, zależności i semantyki silnika wymaga jego testu.
 6. Timeout lub utrata odpowiedzi oznacza stan nieznany: reload może nadal trwać.
    Nie uruchamiaj wtedy równolegle rollbacku ani kolejnego reloadu. Najpierw
    rozlicz rzeczywisty stan. Awaria kontrolera po podmianie wymaga odzyskiwania
-   z trwałego dziennika. Taki wykonawczy kontroler transakcji i jego failure
-   fixtures pozostają do implementacji; obecne narzędzie go nie zastępuje.
+   z trwałego dziennika. Pełny kontroler z bramkami systemd, startu i monitoringu
+   pozostaje do integracji. [Transport komend i połączenie z dziennikiem](suricata-commands.md)
+   dostarczają osobny etap; preparer nie zastępuje tych mechanizmów.
 
 Przygotowanie, poprawny `-T`, aktywny proces i brak dropów nie dowodzą pełnej
 inspekcji ani G6. Nie włączaj automatycznej aktywacji z dziennego feedu.
 
 Źródła: [przeładowanie reguł w Suricata 8.0.7](https://docs.suricata.io/en/suricata-8.0.7/rule-management/rule-reload.html),
 [socket poleceń](https://docs.suricata.io/en/suricata-8.0.7/unix-socket.html).
+Warunek `-S`/`-s` jest jawny w
+[UnixManagerReloadRulesWrapper, tag 8.0.7](https://github.com/OISF/suricata/blob/suricata-8.0.7/src/unix-manager.c#L734).

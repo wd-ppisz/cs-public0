@@ -22,6 +22,10 @@ import tempfile
 import time
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "runtime"))
+from rule_update_journal import RuleFileJournal, digest
+from suricata_commands import SuricataCommands, CommandRejected, process_binding, reload_installed
+
 
 CLIENT, SERVER, QUEUE = "192.0.2.1", "192.0.2.2", 100
 TABLE, SENTINEL, SID = "cs_public0_test", "cs_public0_sentinel", 9100001
@@ -212,7 +216,8 @@ app-layer:
         default-config:
           personality: IDS
 unix-command:
-  enabled: no
+  enabled: yes
+  filename: {json.dumps(str(self.directory / 'suricata.socket'))}
 stats:
   enabled: yes
   interval: 1
@@ -228,11 +233,35 @@ logging:
     - console:
         enabled: yes
 ''', encoding="utf-8")
-        self.inside("bridge", ["suricata", "-T", "-c", str(config), "--init-errors-fatal"], timeout=40)
+        self.inside("bridge", ["suricata", "-T", "--simulate-ips", "-c", str(config),
+            "--init-errors-fatal", "--set", "unix-command.enabled=no"], timeout=40)
         return config
 
     def exercise(self):
         config = self.configure()
+        command_socket = self.directory / "suricata.socket"
+        cli_sensor = self.spawn("bridge", ["suricata", "-c", str(config), "-S",
+            str(self.directory / "local.rules"), "--init-errors-fatal", "-q", str(QUEUE)],
+            "suricata-cli-rule.log")
+        self.wait(lambda: cli_sensor.poll() is not None or (self.queue_present() and
+            "Engine started" in (self.directory / "suricata-cli-rule.log").read_text()),
+            "CLI-rule negative-control sensor did not start")
+        require(cli_sensor.poll() is None and command_socket.exists(), "CLI-rule sensor terminated")
+        with SuricataCommands(command_socket, process_binding(cli_sensor.pid)) as session:
+            require(session.binding["cli_rule_file"], "CLI rule option was not observed")
+            try:
+                # Deliberate negative command in this disposable lab only.
+                session._exchange({"command": "ruleset-reload-rules"}, 3_000_000_000)
+            except CommandRejected as exc:
+                cli_reload_refusal = exc.response
+                require("not possible" in exc.response.get("message", ""), "unexpected reload refusal")
+            else:
+                raise RuntimeError("CLI-rule sensor unexpectedly accepted reload")
+        os.killpg(cli_sensor.pid, signal.SIGTERM)
+        cli_sensor.wait(timeout=10)
+        require(not self.queue_present(), "CLI-rule listener survived termination")
+        if command_socket.exists():
+            command_socket.unlink()
         sensor = self.spawn("bridge", ["suricata", "-c", str(config), "--init-errors-fatal",
                                        "-q", str(QUEUE)], "suricata.log")
         self.wait(lambda: sensor.poll() is not None or (self.queue_present() and
@@ -242,15 +271,15 @@ logging:
         before = self.counters()
         marker = "/cs-public0-smoke-" + uuid.uuid4().hex
         require(self.http(marker), "HTTP through live sensor did not return its complete body")
-        def correlated_alert():
+        def correlated_alert(sid=SID, url=marker):
             eve = self.directory / "eve.json"
             for line in eve.read_text().splitlines() if eve.exists() else []:
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue  # Last line may still be in progress.
-                if (row.get("alert", {}).get("signature_id") == SID
-                        and row.get("http", {}).get("url") == marker
+                if (row.get("alert", {}).get("signature_id") == sid
+                        and row.get("http", {}).get("url") == url
                         and row.get("src_ip") == CLIENT and row.get("dest_ip") == SERVER
                         and row.get("alert", {}).get("action") == "allowed"):
                     return True
@@ -260,6 +289,29 @@ logging:
         require(all(counters.get(name, 0) > before.get(name, 0)
                     for name in ("client_queued", "server_queued")),
                 "Both traffic directions must reach NFQUEUE")
+        rules = self.directory / "local.rules"
+        old = rules.read_bytes()
+        new = old + ('alert http any any -> any 8080 (msg:"cs-public0 reload"; '
+            'flow:established,to_server; http.uri; content:"/cs-public0-reload-"; '
+            f'sid:{SID+1}; rev:1;)\n').encode()
+        store = self.directory / "journal"
+        store.mkdir(mode=0o700)
+        journal = RuleFileJournal(self.directory, store)
+        transaction = "d" * 64
+        journal.prepare(transaction, {rules.name: new}, {rules.name: digest(old)}, {rules.name: digest(new)})
+        journal.install(transaction)
+        binding = process_binding(sensor.pid)
+        with SuricataCommands(command_socket, binding) as session:
+            require(not binding["cli_rule_file"], "YAML-rule sensor still uses -S/-s")
+            reload_state = reload_installed(journal, transaction, session, 1, 2)
+            reload_events = session.events
+        require(reload_state["phase"] == "COMMITTED" and not (store / "active.json").exists(),
+                "reload transaction did not commit")
+        require(sensor.poll() is None and process_binding(sensor.pid) == binding,
+                "reload changed sensor process identity")
+        reload_marker = "/cs-public0-reload-" + uuid.uuid4().hex
+        require(self.http(reload_marker), "HTTP after reload did not return its complete body")
+        self.wait(lambda: correlated_alert(SID+1, reload_marker), "New rule did not produce a correlated alert")
         os.killpg(sensor.pid, signal.SIGKILL)
         sensor.wait(timeout=5)
         self.wait(lambda: not self.queue_present(), "NFQUEUE listener survived SIGKILL")
@@ -270,6 +322,9 @@ logging:
         require(self.http("/after-table-remove"), "HTTP failed after own-table removal")
         return {"result": "PASS", "scope": "isolated-IPv4-dataplane", "alert_sid": SID,
                 "direction_counters": counters, "listener_death_bypass": True,
+                "cli_rule_reload_refusal": cli_reload_refusal, "reload_new_alert_sid": SID+1,
+                "reload_same_process": True, "reload_phase": reload_state["phase"],
+                "reload_events": reload_events,
                 "foreign_table_preserved": True}
 
     def cleanup(self):
