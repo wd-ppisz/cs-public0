@@ -52,3 +52,6 @@ Metrics describe observations, not proof that every packet was inspected.
 The explicit `acknowledge` command clears the latch and records current counters
 as the new baseline only after a complete, known observation. New counter
 increases can latch degradation again. It does not restart or modify the sensor.
+
+Przygotowanie nowych reguł opisuje [procedura alert-only](rule-updates.md).
+Warunki rozszerzenia wdrożenia i brakujące pomiary zawiera [plan odbioru G6](g6-acceptance.md).

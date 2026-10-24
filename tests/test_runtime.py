@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import subprocess
 from pathlib import Path
@@ -135,7 +136,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_rules_allow_alert_only_and_reject_empty(self):
         content = b""
-        path = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=len(content)), read_bytes=lambda: content)
+        path = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=len(content)), open=lambda mode: io.BytesIO(content))
         with patch.object(runtime, "secure_path", return_value=path):
             for action in ("drop", "reject", "pass", "", "# no active rules"):
                 content = (action + (' tcp any any -> any any (sid:1;)' if action and not action.startswith("#") else "")).encode()
@@ -180,7 +181,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_alert_rules_reject_packet_replacement_without_rejecting_literal_text(self):
         content = b""
-        path = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=len(content)), read_bytes=lambda: content)
+        path = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=len(content)), open=lambda mode: io.BytesIO(content))
         with patch.object(runtime, "secure_path", return_value=path):
             for options in ('content:"abc"; replace:"xyz"; sid:1;',
                             'content:"abc"; RePlAcE : "xyz"; sid:1;',
