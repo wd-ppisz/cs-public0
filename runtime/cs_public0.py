@@ -179,10 +179,8 @@ def atomic(path, value, mode=0o600):
         temporary.unlink(missing_ok=True)
 
 
-def validate_rules(cfg):
-    path = secure_path(cfg["rules_file"])
-    require(path.stat().st_size <= MAX_RULES_BYTES, "rules file too large")
-    raw = path.read_bytes()
+def validate_rules_bytes(raw):
+    """Validate an already bounded snapshot without performing I/O."""
     require(len(raw) <= MAX_RULES_BYTES, "rules file too large")
     try:
         source = raw.decode("utf-8")
@@ -209,6 +207,13 @@ def validate_rules(cfg):
             count += 1
     require(count > 0, "rules file has no active alert rules")
     return count
+
+
+def validate_rules(cfg):
+    path = secure_path(cfg["rules_file"])
+    require(path.stat().st_size <= MAX_RULES_BYTES, "rules file too large")
+    with path.open("rb") as stream:
+        return validate_rules_bytes(stream.read(MAX_RULES_BYTES + 1))
 
 
 def preflight(cfg, test_engine=True):
