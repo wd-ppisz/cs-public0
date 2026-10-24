@@ -226,8 +226,16 @@ def selected_rules(cfg, binary):
     require(len(raw.encode("utf-8")) <= MAX_MESSAGE, "configuration dump exceeds bound")
     rows = {}
     for line in raw.splitlines():
-        if line.startswith(("default-rule-path", "rule-files")):
-            key, sep, value = line.partition(" = ")
+        key, sep, value = line.partition(" = ")
+        if key in ("firewall.enabled", "multi-detect.enabled"):
+            require(sep and value.lower() in ("no", "false"), "unsupported firewall or multi-detect mode")
+        elif key in ("firewall", "multi-detect"):
+            require(sep and value in ("(null)", ""), "unsupported engine mode")
+        else:
+            require(not key.startswith(("firewall", "multi-detect")), "unsupported secondary rules profile")
+        if any(part in ("rule-files", "rule-path", "default-rule-path")
+               or part.endswith(("-rule-files", "-rule-path")) for part in key.split(".")):
+            require(key in ("default-rule-path", "rule-files", "rule-files.0"), "unsupported rule source")
             require(sep and key not in rows, "ambiguous rule selection in configuration dump")
             rows[key] = value
     path = Path(cfg["rules_file"])
@@ -297,12 +305,16 @@ def queue(cfg, pid):
             "id_sequence": values[7], "portid": values[1], "inode": inode, "netlink_dropped": drops}
 
 
-def kernel_sample(cfg, current):
+def kernel_sample(cfg, current, observed=None):
     started = time.monotonic_ns()
     before = dict(queue(cfg, current["pid"]))
+    if observed is not None:
+        observed["queue_listener"] = 1
     document = table(cfg)
     owned(cfg)
     require(exact_table(document, cfg), "selector is absent or modified")
+    if observed is not None:
+        observed["nft_rule"] = 1
     objects = {kind: body for item in document["nftables"] for kind, body in item.items()
                if kind != "metainfo"}
     handles = [objects[kind].get("handle") for kind in ("table", "counter", "chain", "rule")]
@@ -348,12 +360,13 @@ def account_kernel(previous, sample, current):
             elapsed = sample["started_ns"] - old["finished_ns"]
             require(same and elapsed >= 0, "observation continuity")
             growth = sample["nft"]["packets"] - old["nft"]["packets"]
-            require(0 <= growth < SEQUENCE_MODULUS // 2, "counter reset or ambiguous number of wraps")
+            require(growth >= 0, "counter reset")
             if elapsed > MAX_OBSERVATION_GAP_NS:
                 # A whole number of uint32 wraps cannot be ruled out by a
                 # small modulo delta. Keep this coverage gap separate from loss.
                 reason = "nfqueue.observation_gap"
             else:
+                require(growth < SEQUENCE_MODULUS // 2, "ambiguous number of wraps")
                 total_before = prior["total_after"] + sequence_delta(
                     before["id_sequence"], old["after"]["id_sequence"])
                 ceiling = prior["offset_ceiling"]
@@ -473,11 +486,11 @@ def observe(cfg, previous=None):
     metrics = {"telemetry_known": 0, "sensor_up": 0, "queue_listener": 0, "nft_rule": 0,
                "degraded_latched": int(previous["latched"] or prior_history), "full_inspection_verified": 0,
                "last_publish_unix_seconds": time.time()}
-    state = dict(previous)
+    state = {**previous, "current_sample_valid": False}
     try:
         current = sensor(cfg)
         metrics["sensor_up"] = 1
-        sample = kernel_sample(cfg, current)
+        sample = kernel_sample(cfg, current, metrics)
         q = sample["after"]
         packets = sample["nft"]["packets"]
         metrics.update({"queue_listener": 1, "nft_rule": 1})
@@ -504,12 +517,13 @@ def observe(cfg, previous=None):
         history_gap = accounting["gap_history_peak"]
         if continuity_reason and continuity_reason != "nfqueue.observation_gap":
             reasons.append(continuity_reason)
-        candidate = {"kernel_accounting": accounting,
+        candidate = {"kernel_accounting": accounting, "current_sample_valid": not continuity_reason,
                      "accounting_status": "UNKNOWN_GAP" if gap else
                         ("UNKNOWN_DISCONTINUITY" if continuity_reason else "OBSERVED_NO_GAP"),
                      "gap_acknowledgements": previous.get("gap_acknowledgements", []),
                      "sensor": current, "latched": bool(previous["latched"] or reasons), "reasons": reasons,
                      "counters": watched}
+        candidate["accounting_claim_sha256"] = accounting_claim(candidate)
         require(len(json.dumps(candidate).encode()) <= MAX_STATE, "observed state too large")
         state = candidate
         midstream = [value for name, value in data.items() if midstream_counter(name)]
@@ -562,34 +576,49 @@ def previous_state(cfg):
     return previous
 
 
-def acknowledge_accounting_gap(state, metrics, evidence):
+def accounting_claim(state):
+    accounting = state["kernel_accounting"]
+    sample = accounting["sample"]
+    claim = {"schema": "public0-accounting-claim-v1", "sensor": state.get("sensor"),
+        "boot_id": sample["boot_id"], "socket": [sample["after"]["portid"], sample["after"]["inode"]],
+        "nft_handles": sample["nft"]["handles"], "gap": accounting["unexplained_gap"],
+        "peak": accounting["gap_history_peak"], "gap_history": accounting["gap_history_latched"],
+        "observation_history": accounting.get("observation_gap_history_latched", False),
+        "ack_count": len(state.get("gap_acknowledgements", []))}
+    return hashlib.sha256(json.dumps(claim, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def acknowledge_accounting_gap(state, metrics, evidence, expected_history=None):
     """Record an explicit operator decision and fresh baseline in the same state write.
 
     The supplied SHA references evidence; its format does not attest that evidence.
     Other degradation latches and the historical peak are never cleared here.
     """
     require(isinstance(evidence, str) and re.fullmatch(r"[0-9a-f]{64}", evidence), "evidence SHA256 required")
-    require(metrics["telemetry_known"] == 1, "cannot acknowledge unknown current observation")
+    require(state.get("current_sample_valid") is True, "cannot acknowledge incomplete current observation")
+    require(isinstance(expected_history, str) and re.fullmatch(r"[0-9a-f]{64}", expected_history)
+            and expected_history == accounting_claim(state), "accounting history changed or expected claim missing")
     accounting = state["kernel_accounting"]
-    require((accounting["gap_history_latched"] or accounting.get("observation_gap_history_latched", False))
-            and accounting["unexplained_gap"] == 0,
-            "no historical gap to acknowledge or current gap remains")
+    require(accounting["gap_history_latched"] or accounting.get("observation_gap_history_latched", False),
+            "no historical gap to acknowledge")
     log = state.get("gap_acknowledgements", [])
     require(isinstance(log, list) and len(log) < 32, "accounting acknowledgement audit bound reached")
     before = json.loads(json.dumps(accounting))
-    state["gap_acknowledgements"] = log + [{"evidence_sha256": evidence, "before": before,
+    state["gap_acknowledgements"] = log + [{"evidence_sha256": evidence, "expected_history_sha256": expected_history,
+        "before": before,
         "monotonic_ns": time.monotonic_ns(), "unix_ns": time.time_ns(),
         "other_latch_preserved": state["latched"]}]
     sample = accounting["sample"]
     accounting.update(total_after=sequence_delta(sample["after"]["id_sequence"], sample["before"]["id_sequence"]),
                       offset_ceiling=sample["nft"]["packets"], gap_history_latched=False,
-                      observation_gap_history_latched=False)
+                      observation_gap_history_latched=False, unexplained_gap=0)
     state["accounting_status"] = "ACKNOWLEDGED_GAP_HISTORY"
+    state["accounting_claim_sha256"] = accounting_claim(state)
     metrics.update(accounting_gap_history_latched=0, accounting_observation_gap_history_latched=0,
-                   degraded_latched=int(state["latched"]))
+                   accounting_unexplained_gap=0, degraded_latched=int(state["latched"]))
 
 
-def monitor(cfg, acknowledge=False, accounting_gap_evidence=None):
+def monitor(cfg, acknowledge=False, accounting_gap_evidence=None, accounting_gap_expected=None):
     path = Path(cfg["state_dir"]) / "monitor.json"
     result = observe(cfg, previous_state(cfg))
     if acknowledge:
@@ -599,16 +628,48 @@ def monitor(cfg, acknowledge=False, accounting_gap_evidence=None):
         result["metrics"]["degraded_latched"] = int(accounting["gap_history_latched"]
             or accounting.get("observation_gap_history_latched", False))
     if accounting_gap_evidence is not None:
-        acknowledge_accounting_gap(result["state"], result["metrics"], accounting_gap_evidence)
+        acknowledge_accounting_gap(result["state"], result["metrics"], accounting_gap_evidence,
+                                   accounting_gap_expected)
     state_json = json.dumps(result["state"], sort_keys=True)
     require(len(state_json.encode()) <= MAX_STATE, "state publication too large")
     atomic(path, state_json)
+    publish_metrics(cfg, result["metrics"])
+    return result
+
+
+def publish_metrics(cfg, metrics):
     labels = '{bridge="' + cfg["bridge"] + '",queue="' + str(cfg["queue"]) + '"}'
     output = "# cs-public0 runtime telemetry\n" + "".join(
         "cs_public0_" + name + labels + " " + format(value, ".17g") + "\n"
-        for name, value in sorted(result["metrics"].items()))
+        for name, value in sorted(metrics.items()))
     atomic(cfg["metrics_file"], output, 0o644)
-    return result
+
+
+@contextlib.contextmanager
+def monitored_lock(cfg, monitored):
+    with locked(cfg):
+        if not monitored:
+            yield
+            return
+        try:
+            yield
+        except Exception:
+            # All publishers retain the state lock. A lock acquisition failure
+            # leaves the old timestamp for freshness monitoring instead.
+            try:
+                prior = previous_state(cfg) or {"latched": False}
+                accounting = prior.get("kernel_accounting", {})
+                require(type(prior["latched"]) is bool and isinstance(accounting, dict), "invalid fallback state")
+                retained = prior["latched"] or any(accounting.get(name) is True for name in
+                    ("gap_history_latched", "observation_gap_history_latched"))
+            except Exception:
+                retained = True
+            try:
+                publish_metrics(cfg, {"telemetry_known": 0, "degraded_latched": int(retained),
+                    "full_inspection_verified": 0, "last_publish_unix_seconds": time.time()})
+            except Exception as publication_error:
+                print("UNKNOWN publication failed: " + type(publication_error).__name__, file=sys.stderr)
+            raise
 
 
 def main():
@@ -616,19 +677,22 @@ def main():
     parser.add_argument("--config", default="/etc/cs-public0/config.json")
     parser.add_argument("command", choices=("check", "arm", "disarm", "status", "monitor", "acknowledge", "validate-rules", "acknowledge-accounting-gap"))
     parser.add_argument("--evidence-sha256")
+    parser.add_argument("--expected-history-sha256")
     args = parser.parse_args()
-    require((args.command == "acknowledge-accounting-gap") == (args.evidence_sha256 is not None),
-            "evidence is required only for acknowledge-accounting-gap")
+    require((args.command == "acknowledge-accounting-gap") == (args.evidence_sha256 is not None)
+            and (args.command == "acknowledge-accounting-gap") == (args.expected_history_sha256 is not None),
+            "evidence and expected history are required only for acknowledge-accounting-gap")
     require(os.geteuid() == 0, "root required")
     cfg = load_config(args.config)
-    with locked(cfg):
+    with monitored_lock(cfg, args.command == "monitor"):
         if args.command == "validate-rules":
             result = {"alert_rules": validate_rules(cfg)}
         elif args.command == "status":
             result = observe(cfg, previous_state(cfg))
         elif args.command in ("monitor", "acknowledge", "acknowledge-accounting-gap"):
             result = monitor(cfg, acknowledge=args.command == "acknowledge",
-                             accounting_gap_evidence=args.evidence_sha256)
+                             accounting_gap_evidence=args.evidence_sha256,
+                             accounting_gap_expected=args.expected_history_sha256)
         else:
             {"check": preflight, "arm": arm, "disarm": disarm}[args.command](cfg)
             result = {"command": args.command, "ok": True}

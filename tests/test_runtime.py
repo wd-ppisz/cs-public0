@@ -65,11 +65,22 @@ class RuntimeTests(unittest.TestCase):
                  good.replace("local.rules", "*.rules"),
                  good.replace("local.rules", "../rules/local.rules"),
                  good.replace("rule-files = (null)", "rule-files = unexpected"),
+                 good + "firewall.enabled = yes\n",
+                 good + "firewall.rule-files.0 = foreign.rules\n",
+                 good + "firewall-rule-files.0 = foreign.rules\n",
+                 good + "multi-detect.enabled = yes\n",
+                 good + "multi-detect.tenants.0.filename = foreign.yaml\n",
+                 good + "extra.rule-files.0 = foreign.rules\n",
                  "", "x" * (runtime.MAX_MESSAGE + 1)]
         with patch.object(runtime, "run", return_value=SimpleNamespace(stdout=good)) as execute:
             runtime.selected_rules(self.cfg, Path("/usr/bin/suricata"))
             self.assertEqual(execute.call_args.args[0],
                 ["/usr/bin/suricata", "--dump-config", "-c", self.cfg["suricata_config"]])
+        with patch.object(runtime, "run", return_value=SimpleNamespace(
+                stdout=good + "firewall.enabled = no\nmulti-detect.enabled = false\n"
+                    "engine-analysis.rules = yes\nprofiling.rules.enabled = yes\n"
+                    "profiling.rules.filename = rule_perf.log\nsecurity.lua.allow-rules = false\n")):
+            runtime.selected_rules(self.cfg, Path("/usr/bin/suricata"))
         for raw in cases:
             with self.subTest(raw=raw[:120]), \
                  patch.object(runtime, "run", return_value=SimpleNamespace(stdout=raw)), \
@@ -502,7 +513,8 @@ class RuntimeTests(unittest.TestCase):
         data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
         prior = None
         for index, sample in enumerate((sample_fixture(100, 100),
-                sample_fixture(200, 200, 130000000000), sample_fixture(300, 300, 140000000000))):
+                sample_fixture((1 << 31) + 200, 200, 130000000000),
+                sample_fixture((1 << 31) + 300, 300, 140000000000))):
             with self.observation_patches(data), patch.object(runtime, "kernel_sample", return_value=sample):
                 result = runtime.observe(self.cfg, prior)
                 prior = result["state"]
@@ -513,10 +525,46 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result["metrics"]["telemetry_known"], 1)
         self.assertEqual(result["metrics"]["degraded_latched"], 1)
         self.assertEqual(prior["kernel_accounting"]["gap_history_peak"], 0)
-        runtime.acknowledge_accounting_gap(prior, result["metrics"], "c" * 64)
+        runtime.acknowledge_accounting_gap(prior, result["metrics"], "c" * 64, runtime.accounting_claim(prior))
         self.assertEqual(result["metrics"]["degraded_latched"], 0)
         self.assertFalse(prior["kernel_accounting"]["observation_gap_history_latched"])
         self.assertTrue(prior["gap_acknowledgements"][0]["before"]["observation_gap_history_latched"])
+
+    def test_monitor_lock_failure_never_publishes_without_the_state_lock(self):
+        for error in (BlockingIOError("busy"), RuntimeError("unsafe lock"), PermissionError("denied")):
+            with self.subTest(error=type(error).__name__), \
+                 patch.object(runtime, "locked", side_effect=error), \
+                 patch.object(runtime, "publish_metrics") as publish, \
+                 patch.object(runtime, "previous_state") as read:
+                with self.assertRaises(type(error)):
+                    with runtime.monitored_lock(self.cfg, True):
+                        self.fail("lock failure admitted monitor")
+                read.assert_not_called()
+                publish.assert_not_called()
+
+    def test_monitor_body_failure_publishes_unknown_under_lock_without_false_degraded(self):
+        from contextlib import nullcontext
+        with patch.object(runtime, "locked", return_value=nullcontext()), \
+             patch.object(runtime, "previous_state", return_value={"latched": False}), \
+             patch.object(runtime, "publish_metrics") as publish:
+            with self.assertRaises(RuntimeError):
+                with runtime.monitored_lock(self.cfg, True):
+                    raise RuntimeError("state write failed")
+            self.assertEqual(publish.call_args.args[1]["telemetry_known"], 0)
+            self.assertEqual(publish.call_args.args[1]["degraded_latched"], 0)
+            publish.reset_mock()
+            with self.assertRaises(RuntimeError):
+                with runtime.monitored_lock(self.cfg, False):
+                    raise RuntimeError("operator request refused")
+            publish.assert_not_called()
+
+    def test_listener_observation_survives_nft_read_failure(self):
+        with self.observation_patches({}), patch.object(runtime, "table", side_effect=RuntimeError("nft")):
+            result = runtime.observe(self.cfg)
+        self.assertEqual(result["metrics"]["queue_listener"], 1)
+        self.assertEqual(result["metrics"]["nft_rule"], 0)
+        self.assertEqual(result["metrics"]["telemetry_known"], 0)
+        self.assertFalse(result["state"]["current_sample_valid"])
 
     def test_gap_is_unknown_and_acknowledge_is_refused(self):
         data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
@@ -538,13 +586,14 @@ class RuntimeTests(unittest.TestCase):
         previous, _, _ = self.account(None, sample_fixture(100, 100))
         previous, _, _ = self.account(previous, sample_fixture(5100, 100, 11000000000))
         previous, _, _ = self.account(previous, sample_fixture(5200, 10300, 12000000000))
-        previous.update(latched=True, reasons=["nfqueue.netlink_dropped"], accounting_status="OBSERVED_NO_GAP")
+        previous.update(latched=True, reasons=["nfqueue.netlink_dropped"],
+                        accounting_status="OBSERVED_NO_GAP", current_sample_valid=True)
         return previous, {"telemetry_known": 1, "degraded_latched": 1, "accounting_gap_history_latched": 1}
 
     def test_gap_ack_is_audited_without_erasing_peak_or_other_latches(self):
         state, metrics = self.gap_ack_fixture()
         before = json.loads(json.dumps(state["kernel_accounting"]))
-        runtime.acknowledge_accounting_gap(state, metrics, "a" * 64)
+        runtime.acknowledge_accounting_gap(state, metrics, "a" * 64, runtime.accounting_claim(state))
         self.assertTrue(state["latched"])
         self.assertEqual(state["reasons"], ["nfqueue.netlink_dropped"])
         self.assertFalse(state["kernel_accounting"]["gap_history_latched"])
@@ -557,7 +606,8 @@ class RuntimeTests(unittest.TestCase):
         state, metrics = self.gap_ack_fixture()
         with patch.object(runtime, "observe", return_value={"state": state, "metrics": metrics}), \
              patch.object(runtime, "previous_state", return_value=state), patch.object(runtime, "atomic") as write:
-            result = runtime.monitor(self.cfg, accounting_gap_evidence="b" * 64)
+            result = runtime.monitor(self.cfg, accounting_gap_evidence="b" * 64,
+                                     accounting_gap_expected=runtime.accounting_claim(state))
         saved = json.loads(write.call_args_list[0].args[1])
         self.assertEqual(saved["gap_acknowledgements"][0]["evidence_sha256"], "b" * 64)
         self.assertFalse(saved["kernel_accounting"]["gap_history_latched"])
@@ -567,19 +617,59 @@ class RuntimeTests(unittest.TestCase):
             following = runtime.observe(self.cfg, saved)
         self.assertEqual(following["state"]["gap_acknowledgements"], saved["gap_acknowledgements"])
 
-    def test_gap_ack_rejects_unknown_active_gap_missing_evidence_and_audit_overflow(self):
-        for case in ("unknown", "active_gap", "no_history", "invalid_evidence", "audit_full"):
+    def test_gap_ack_rejects_incomplete_sample_missing_evidence_and_audit_overflow(self):
+        for case in ("unknown", "no_history", "invalid_evidence", "audit_full"):
             state, metrics = self.gap_ack_fixture()
             evidence = "a" * 64
-            if case == "unknown": metrics["telemetry_known"] = 0
-            if case == "active_gap": state["kernel_accounting"]["unexplained_gap"] = 1
+            if case == "unknown": state["current_sample_valid"] = False
             if case == "no_history": state["kernel_accounting"]["gap_history_latched"] = False
             if case == "invalid_evidence": evidence = "not-a-reference"
             if case == "audit_full": state["gap_acknowledgements"] = [{}] * 32
             before = json.dumps([state, metrics], sort_keys=True)
             with self.subTest(case=case), self.assertRaises(RuntimeError):
-                runtime.acknowledge_accounting_gap(state, metrics, evidence)
+                runtime.acknowledge_accounting_gap(state, metrics, evidence, runtime.accounting_claim(state))
             self.assertEqual(before, json.dumps([state, metrics], sort_keys=True))
+
+    def test_persistent_gap_can_be_audited_without_restart_or_rewriting_past_quality(self):
+        data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
+        prior = None
+        for sample in (sample_fixture(100, 100), sample_fixture(5100, 100, 11000000000),
+                       sample_fixture(5200, 200, 12000000000)):
+            with self.observation_patches(data), patch.object(runtime, "kernel_sample", return_value=sample):
+                result = runtime.observe(self.cfg, prior)
+                prior = result["state"]
+        self.assertEqual(result["metrics"]["telemetry_known"], 0)
+        self.assertEqual(prior["kernel_accounting"]["unexplained_gap"], 5000)
+        runtime.acknowledge_accounting_gap(prior, result["metrics"], "d" * 64, runtime.accounting_claim(prior))
+        self.assertEqual(result["metrics"]["telemetry_known"], 0)
+        self.assertEqual(prior["gap_acknowledgements"][0]["before"]["unexplained_gap"], 5000)
+        with self.observation_patches(data), patch.object(runtime, "kernel_sample",
+                return_value=sample_fixture(5300, 300, 13000000000)):
+            following = runtime.observe(self.cfg, prior)
+        self.assertEqual(following["metrics"]["telemetry_known"], 1)
+        self.assertEqual(following["metrics"]["degraded_latched"], 0)
+        self.assertEqual(following["state"]["kernel_accounting"]["gap_history_peak"], 5000)
+
+    def test_gap_ack_compares_reviewed_history_and_rejects_unreviewed_growth(self):
+        state, metrics = self.gap_ack_fixture()
+        reviewed = runtime.accounting_claim(state)
+        state["kernel_accounting"].update(unexplained_gap=50000, gap_history_peak=50000)
+        before = json.dumps(state, sort_keys=True)
+        with self.assertRaisesRegex(RuntimeError, "history changed"):
+            runtime.acknowledge_accounting_gap(state, metrics, "e" * 64, reviewed)
+        self.assertEqual(json.dumps(state, sort_keys=True), before)
+
+    def test_unknown_publication_survives_invalid_state_and_preserves_original_error(self):
+        from contextlib import nullcontext
+        for prior in (OSError("unreadable"), {"latched": False, "kernel_accounting": "invalid"}):
+            with patch.object(runtime, "locked", return_value=nullcontext()), \
+                 patch.object(runtime, "previous_state", side_effect=prior if isinstance(prior, Exception) else None,
+                              return_value=prior), patch.object(runtime, "publish_metrics") as publish:
+                with self.assertRaisesRegex(RuntimeError, "original failure"):
+                    with runtime.monitored_lock(self.cfg, True):
+                        raise RuntimeError("original failure")
+                self.assertEqual(publish.call_args.args[1]["telemetry_known"], 0)
+                self.assertEqual(publish.call_args.args[1]["degraded_latched"], 1)
 
     def test_normal_ack_cannot_clear_accounting_gap_history(self):
         state, metrics = self.gap_ack_fixture()
