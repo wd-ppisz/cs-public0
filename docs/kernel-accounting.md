@@ -13,11 +13,52 @@ counter reset, reversed clock or observation gap over 60 seconds is an explicit
 discontinuity. It sets telemetry unknown and latches degradation. Existing latches
 survive upgrades; old states start a new kernel accounting baseline.
 
+The supplied [monitor timer](../config/cs-public0-monitor.timer) uses
+`OnUnitActiveSec=10s` and `AccuracySec=1s`. The 60-second continuity limit is a
+deliberate maximum observation gap, not an expected sampling interval or proof
+that packets were lost. A long monitor outage invalidates continuity even when
+the next counters are equal: a whole number of 32-bit wraps can leave a small
+modulo delta. The half-range delta checks alone do not rule that out. These
+bounds do not qualify arbitrary traffic rates or eliminate all wrap ambiguity.
+Do not use a timer interval of 60 seconds or more with this profile; changing
+the cadence or continuity bound requires separate qualification.
+
+After a discontinuity, the unknown sample becomes a fresh accounting baseline.
+A subsequent complete, continuous sample without an unexplained gap can become
+known again; the degraded latch remains set until an explicit `acknowledge`
+succeeds on a known observation. If every sample exceeds the continuity bound,
+fix the sampling cadence or its execution failure first. Acknowledge does not
+waive the observation requirements.
+
 A positive unexplained gap produces `accounting_status=UNKNOWN_GAP` and
 `telemetry_known=0`, including a single burst leaving a constant gap. It does not
-claim a confirmed bypass. Pending enqueue work can resolve the gap later. The
-existing unknown-telemetry alert covers persistent gaps. Reported queue/netlink
-loss still latches degradation. `acknowledge` refuses an unknown observation.
+claim a confirmed bypass. A later ID surplus can come from GSO and cannot
+resolve the cause of an earlier gap. The monitor therefore retains
+`accounting_gap_history_peak` and a separate `accounting_gap_history_latched`
+across samples, monitor restarts and source discontinuities. Current quality
+can become known again, but the historical latch keeps `degraded_latched=1`
+and the existing Degraded alert active. It represents unresolved uncertainty,
+including a possible read skew, not a confirmed bypass or packet-loss count.
+New read failures still produce `telemetry_known=0` independently.
+Reported queue/netlink loss has its own retained latch. Ordinary `acknowledge`
+does not clear accounting history.
+
+An explicit operator decision can start a fresh accounting baseline:
+
+```sh
+sudo /usr/local/libexec/cs-public0 acknowledge-accounting-gap \
+  --evidence-sha256 SHA256_OF_THE_RETAINED_REPORT
+```
+
+This requires a known current observation without a current gap. It records
+the previous accounting sample, evidence reference and actual integer wall /
+monotonic timestamps in `gap_acknowledgements`, in the same atomic state write
+as the new baseline. The historical peak and other degradation latches remain.
+The SHA is an operator-supplied reference, not evidence attestation. The monitor
+timer never acknowledges automatically. Its existing lock serializes state
+updates. The audit is bounded to 32 decisions and the existing 64 KiB state cap;
+overflow refuses the operation and requires separately controlled archiving,
+without automatic history deletion.
 
 `decoder.pkts` remains independent telemetry. Its asynchronous aggregation cannot
 create a kernel-accounting loss. GSO can generate multiple queue IDs for one nft

@@ -76,6 +76,22 @@ class Templates(unittest.TestCase):
         self.assertIn('ExecStart=/usr/local/libexec/cs-public0 monitor', monitor)
         self.assertNotIn(' disarm', monitor)
 
+    def test_start_and_validation_use_the_same_reloadable_yaml_rules(self):
+        service = environment().get_template('cs-public0.service.j2').render(defaults())
+        start = next(line for line in service.splitlines() if line.startswith('ExecStart='))
+        self.assertNotIn(' -S ', start)
+        self.assertNotIn(' -s ', start)
+        tasks = yaml.safe_load((ROOT / 'ansible/roles/cs_public0/tasks/main.yml').read_text())
+        task = next(t for t in tasks if t['name'] == 'Validate the complete Suricata configuration')
+        argv = task['ansible.builtin.command']['argv']
+        self.assertNotIn('-S', argv)
+        self.assertNotIn('-s', argv)
+        self.assertIn('--simulate-ips', argv)
+        self.assertIn('unix-command.enabled=no', argv)
+        profile = yaml.safe_load(environment().get_template('suricata.yaml.j2').render(defaults()))
+        self.assertEqual(profile['default-rule-path'], defaults()['cs_public0_rules_dir'])
+        self.assertEqual(profile['rule-files'], ['local.rules'])
+
     def test_passive_install_default_and_example(self):
         self.assertIs(defaults()['cs_public0_enabled'], False)
         example = yaml.safe_load((ROOT / 'examples/apache-cloudstack-kvm/settings.yml').read_text())

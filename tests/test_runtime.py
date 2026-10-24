@@ -45,12 +45,36 @@ class RuntimeTests(unittest.TestCase):
              patch.object(runtime.Path, "resolve", return_value=Path("/usr/bin/suricata")), \
              patch.object(runtime, "secure_path"), patch.object(runtime, "validate_rules"), \
              patch.object(runtime, "table", return_value=None), \
-             patch.object(runtime, "run", return_value=result) as execute:
+             patch.object(runtime, "run", return_value=result) as execute, \
+             patch.object(runtime, "selected_rules") as selected:
             runtime.preflight(self.cfg, test_engine=False)
             self.assertFalse(any("-T" in call.args[0] for call in execute.call_args_list))
             execute.reset_mock()
             runtime.preflight(self.cfg)
             self.assertTrue(any("-T" in call.args[0] for call in execute.call_args_list))
+            self.assertEqual(selected.call_count, 2)
+
+    def test_effective_yaml_must_select_exactly_the_validated_alert_file(self):
+        good = ("default-rule-path = /etc/cs-public0/rules\n"
+                "rule-files = (null)\nrule-files.0 = local.rules\n")
+        cases = [good.replace("local.rules", "other.rules"),
+                 good.replace("/etc/cs-public0/rules", "/var/lib/suricata/rules"),
+                 good + "rule-files.1 = foreign.rules\n",
+                 good + "rule-files.0 = local.rules\n",
+                 good.replace("rule-files.0 = local.rules\n", ""),
+                 good.replace("local.rules", "*.rules"),
+                 good.replace("local.rules", "../rules/local.rules"),
+                 good.replace("rule-files = (null)", "rule-files = unexpected"),
+                 "", "x" * (runtime.MAX_MESSAGE + 1)]
+        with patch.object(runtime, "run", return_value=SimpleNamespace(stdout=good)) as execute:
+            runtime.selected_rules(self.cfg, Path("/usr/bin/suricata"))
+            self.assertEqual(execute.call_args.args[0],
+                ["/usr/bin/suricata", "--dump-config", "-c", self.cfg["suricata_config"]])
+        for raw in cases:
+            with self.subTest(raw=raw[:120]), \
+                 patch.object(runtime, "run", return_value=SimpleNamespace(stdout=raw)), \
+                 self.assertRaises(RuntimeError):
+                runtime.selected_rules(self.cfg, Path("/usr/bin/suricata"))
 
     def test_arm_retries_transient_readiness_timeouts(self):
         for error in (subprocess.TimeoutExpired("systemctl", 15), IndexError("proc stat")):
@@ -433,8 +457,30 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(gap, 1000)
         previous, gap, _ = self.account(previous, sample_fixture(1100, 1100, 12000000000))
         self.assertEqual(gap, 0)
-        _, gap, _ = self.account(previous, sample_fixture(1200, 1300, 13000000000))
+        previous, gap, _ = self.account(previous, sample_fixture(1200, 1300, 13000000000))
         self.assertEqual(gap, 0)
+        self.assertEqual(previous["kernel_accounting"]["gap_history_peak"], 1000)
+
+    def test_gso_surplus_and_restart_cannot_erase_an_observed_unknown_period(self):
+        data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
+        prior = None
+        for sample in (sample_fixture(100, 100), sample_fixture(5100, 100, 11000000000),
+                       sample_fixture(5200, 10300, 12000000000)):
+            with self.observation_patches(data), patch.object(runtime, "kernel_sample", return_value=sample):
+                result = runtime.observe(self.cfg, prior)
+                prior = result["state"]
+        self.assertEqual(result["metrics"]["accounting_unexplained_gap"], 0)
+        self.assertEqual(result["metrics"]["accounting_gap_history_peak"], 5000)
+        self.assertEqual(result["metrics"]["telemetry_known"], 1)
+        self.assertEqual(result["metrics"]["degraded_latched"], 1)
+        self.assertEqual(result["metrics"]["accounting_gap_history_latched"], 1)
+        self.assertEqual(prior["accounting_status"], "OBSERVED_NO_GAP")
+        # Zapis/ponowny odczyt stanu nie jest operatorem rozwiązującym lukę.
+        prior = json.loads(json.dumps(prior))
+        changed = sample_fixture(10, 10, 13000000000)
+        changed["boot_id"] = "another-boot"
+        accounting, _, _ = runtime.account_kernel(prior, changed, prior["sensor"])
+        self.assertEqual(accounting["gap_history_peak"], 5000)
 
     def test_unsigned_wrap_and_observation_discontinuities(self):
         previous, _, _ = self.account(None, sample_fixture(100, (1<<32)-5))
@@ -461,11 +507,81 @@ class RuntimeTests(unittest.TestCase):
              patch.object(runtime, "previous_state", return_value=prior), patch.object(runtime, "atomic") as write:
             result = runtime.observe(self.cfg, prior)
             self.assertEqual(result["metrics"]["telemetry_known"], 0)
-            self.assertEqual(result["metrics"]["degraded_latched"], 0)
+            self.assertEqual(result["metrics"]["degraded_latched"], 1)
             self.assertEqual(result["metrics"]["full_inspection_verified"], 0)
             with self.assertRaisesRegex(RuntimeError, "cannot acknowledge unknown"):
                 runtime.monitor(self.cfg, acknowledge=True)
             write.assert_not_called()
+
+    def gap_ack_fixture(self):
+        previous, _, _ = self.account(None, sample_fixture(100, 100))
+        previous, _, _ = self.account(previous, sample_fixture(5100, 100, 11000000000))
+        previous, _, _ = self.account(previous, sample_fixture(5200, 10300, 12000000000))
+        previous.update(latched=True, reasons=["nfqueue.netlink_dropped"], accounting_status="OBSERVED_NO_GAP")
+        return previous, {"telemetry_known": 1, "degraded_latched": 1, "accounting_gap_history_latched": 1}
+
+    def test_gap_ack_is_audited_without_erasing_peak_or_other_latches(self):
+        state, metrics = self.gap_ack_fixture()
+        before = json.loads(json.dumps(state["kernel_accounting"]))
+        runtime.acknowledge_accounting_gap(state, metrics, "a" * 64)
+        self.assertTrue(state["latched"])
+        self.assertEqual(state["reasons"], ["nfqueue.netlink_dropped"])
+        self.assertFalse(state["kernel_accounting"]["gap_history_latched"])
+        self.assertEqual(state["kernel_accounting"]["gap_history_peak"], 5000)
+        self.assertEqual(metrics["degraded_latched"], 1)
+        self.assertEqual(state["gap_acknowledgements"][0]["before"], before)
+        self.assertEqual(state["gap_acknowledgements"][0]["evidence_sha256"], "a" * 64)
+        self.assertIs(type(state["gap_acknowledgements"][0]["monotonic_ns"]), int)
+        self.assertIs(type(state["gap_acknowledgements"][0]["unix_ns"]), int)
+        state, metrics = self.gap_ack_fixture()
+        with patch.object(runtime, "observe", return_value={"state": state, "metrics": metrics}), \
+             patch.object(runtime, "previous_state", return_value=state), patch.object(runtime, "atomic") as write:
+            result = runtime.monitor(self.cfg, accounting_gap_evidence="b" * 64)
+        saved = json.loads(write.call_args_list[0].args[1])
+        self.assertEqual(saved["gap_acknowledgements"][0]["evidence_sha256"], "b" * 64)
+        self.assertFalse(saved["kernel_accounting"]["gap_history_latched"])
+        self.assertTrue(saved["latched"])
+        data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
+        with self.observation_patches(data):
+            following = runtime.observe(self.cfg, saved)
+        self.assertEqual(following["state"]["gap_acknowledgements"], saved["gap_acknowledgements"])
+
+    def test_gap_ack_rejects_unknown_active_gap_missing_evidence_and_audit_overflow(self):
+        for case in ("unknown", "active_gap", "no_history", "invalid_evidence", "audit_full"):
+            state, metrics = self.gap_ack_fixture()
+            evidence = "a" * 64
+            if case == "unknown": metrics["telemetry_known"] = 0
+            if case == "active_gap": state["kernel_accounting"]["unexplained_gap"] = 1
+            if case == "no_history": state["kernel_accounting"]["gap_history_latched"] = False
+            if case == "invalid_evidence": evidence = "not-a-reference"
+            if case == "audit_full": state["gap_acknowledgements"] = [{}] * 32
+            before = json.dumps([state, metrics], sort_keys=True)
+            with self.subTest(case=case), self.assertRaises(RuntimeError):
+                runtime.acknowledge_accounting_gap(state, metrics, evidence)
+            self.assertEqual(before, json.dumps([state, metrics], sort_keys=True))
+
+    def test_normal_ack_cannot_clear_accounting_gap_history(self):
+        state, metrics = self.gap_ack_fixture()
+        with patch.object(runtime, "observe", return_value={"state": state, "metrics": metrics}), \
+             patch.object(runtime, "previous_state", return_value=state), patch.object(runtime, "atomic"):
+            result = runtime.monitor(self.cfg, acknowledge=True)
+        self.assertFalse(result["state"]["latched"])
+        self.assertTrue(result["state"]["kernel_accounting"]["gap_history_latched"])
+        self.assertEqual(result["metrics"]["degraded_latched"], 1)
+
+    def test_closed_unrelated_fd_is_skipped_but_permission_failure_is_unknown(self):
+        def read(path, *args, **kwargs):
+            if str(path).endswith("nfnetlink_queue"):
+                return "100 200 0 2 65531 0 0 42 1\n"
+            return "sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n0 12 200 0 0 0 0 0 7 300\n"
+        for error in (FileNotFoundError(), PermissionError()):
+            with patch.object(runtime.Path, "read_text", read), \
+                 patch.object(runtime.Path, "iterdir", return_value=iter([Path('/proc/101/fd/8'), Path('/proc/101/fd/9')])), \
+                 patch.object(runtime.os, "readlink", side_effect=[error, 'socket:[300]']):
+                if isinstance(error, PermissionError):
+                    with self.assertRaises(PermissionError): runtime.queue(self.cfg, 101)
+                else:
+                    self.assertEqual(runtime.queue(self.cfg, 101)["inode"], 300)
 
     def test_netlink_loss_latches_with_equal_nft_and_sequence_counts(self):
         data = {"decoder.pkts": 2, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}

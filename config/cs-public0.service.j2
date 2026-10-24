@@ -7,7 +7,7 @@ Conflicts=suricata.service
 [Service]
 Type=simple
 ExecStartPre=/usr/local/libexec/cs-public0 check
-ExecStart={{ cs_public0_binary }} -c /etc/cs-public0/suricata.yaml -S {{ cs_public0_rules_dir }}/local.rules -l {{ cs_public0_log_dir }} --runmode=workers --init-errors-fatal -q {{ cs_public0_queue }}
+ExecStart={{ cs_public0_binary }} -c /etc/cs-public0/suricata.yaml -l {{ cs_public0_log_dir }} --runmode=workers --init-errors-fatal -q {{ cs_public0_queue }}
 ExecStartPost=/usr/local/libexec/cs-public0 arm
 ExecStopPost=/usr/local/libexec/cs-public0 disarm
 Restart=on-failure

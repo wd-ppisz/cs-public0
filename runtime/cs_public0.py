@@ -216,6 +216,28 @@ def validate_rules(cfg):
         return validate_rules_bytes(stream.read(MAX_RULES_BYTES + 1))
 
 
+def selected_rules(cfg, binary):
+    """Use the engine's YAML parser to bind selection to the validated file.
+
+    --dump-config exits without starting capture or compiling another engine.
+    Only the managed, single-file rule-files profile is accepted here.
+    """
+    raw = run([str(binary), "--dump-config", "-c", cfg["suricata_config"]]).stdout
+    require(len(raw.encode("utf-8")) <= MAX_MESSAGE, "configuration dump exceeds bound")
+    rows = {}
+    for line in raw.splitlines():
+        if line.startswith(("default-rule-path", "rule-files")):
+            key, sep, value = line.partition(" = ")
+            require(sep and key not in rows, "ambiguous rule selection in configuration dump")
+            rows[key] = value
+    path = Path(cfg["rules_file"])
+    require(set(rows) == {"default-rule-path", "rule-files", "rule-files.0"}
+            and rows["default-rule-path"] == str(path.parent)
+            and rows["rule-files"] in ("(null)", "")
+            and rows["rule-files.0"] == path.name,
+            "effective YAML must select only the validated alert rules file")
+
+
 def preflight(cfg, test_engine=True):
     require(Path("/sys/class/net", cfg["bridge"], "bridge").is_dir(), "configured interface is not a bridge")
     validate_rules(cfg)
@@ -225,13 +247,14 @@ def preflight(cfg, test_engine=True):
     require("NFQueue support:" in (info := run([str(binary), "--build-info"]).stdout)
             and re.search(r"Suricata version 8\.", info)
             and re.search(r"NFQueue support:\s+yes", info), "Suricata 8.x with NFQUEUE support is required")
+    selected_rules(cfg, binary)
     current = table(cfg)
     if current is not None:
         owned(cfg)
         require(exact_table(current, cfg), "foreign or modified nft table")
     run(["/usr/sbin/nft", "-c", "-f", "-"], ruleset(cfg))
     if test_engine:
-        run([str(binary), "-T", "-c", cfg["suricata_config"], "-S", cfg["rules_file"],
+        run([str(binary), "-T", "--simulate-ips", "-c", cfg["suricata_config"],
              "--init-errors-fatal", "--set", "unix-command.enabled=no"], timeout=ENGINE_TEST_TIMEOUT_SECONDS)
 
 
@@ -261,8 +284,15 @@ def queue(cfg, pid):
     inode, drops = int(sockets[0][9]), int(sockets[0][8])
     require(inode > 0 and drops >= 0, "invalid netlink socket schema")
     wanted = "socket:[" + str(inode) + "]"
-    require(any(os.readlink(fd) == wanted for fd in Path("/proc", str(pid), "fd").iterdir()),
-            "NFQUEUE listener is not owned by the sensor")
+    found = False
+    for fd in Path("/proc", str(pid), "fd").iterdir():
+        try:
+            found = os.readlink(fd) == wanted
+        except FileNotFoundError:
+            continue
+        if found:
+            break
+    require(found, "NFQUEUE listener is not owned by the sensor")
     return {"pending": values[2], "kernel_dropped": values[5], "user_dropped": values[6],
             "id_sequence": values[7], "portid": values[1], "inode": inode, "netlink_dropped": drops}
 
@@ -331,8 +361,16 @@ def account_kernel(previous, sample, current):
     total_after = total_before + width
     low, high = sample["nft"]["packets"] - total_after, sample["nft"]["packets"] - total_before
     gap = max(0, low - ceiling)
+    history = [gap]
+    if isinstance(prior, dict):
+        history += [prior.get("gap_history_peak", 0), prior.get("unexplained_gap", 0)]
+    require(all(type(value) is int and value >= 0 for value in history),
+            "invalid accounting gap history")
+    history_latched = prior.get("gap_history_latched", max(history) > 0) if isinstance(prior, dict) else False
+    require(type(history_latched) is bool, "invalid accounting history latch")
     state = {"sample": sample, "total_after": total_after,
-             "offset_ceiling": min(ceiling, high), "unexplained_gap": gap}
+             "offset_ceiling": min(ceiling, high), "unexplained_gap": gap,
+             "gap_history_peak": max(history), "gap_history_latched": bool(history_latched or gap)}
     return state, gap, reason
 
 
@@ -421,8 +459,10 @@ def midstream_counter(name):
 
 def observe(cfg, previous=None):
     previous = previous or {"latched": False, "sensor": None}
+    prior_accounting = previous.get("kernel_accounting")
+    prior_history = isinstance(prior_accounting, dict) and prior_accounting.get("gap_history_latched") is True
     metrics = {"telemetry_known": 0, "sensor_up": 0, "queue_listener": 0, "nft_rule": 0,
-               "degraded_latched": int(previous["latched"]), "full_inspection_verified": 0,
+               "degraded_latched": int(previous["latched"] or prior_history), "full_inspection_verified": 0,
                "last_publish_unix_seconds": time.time()}
     state = dict(previous)
     try:
@@ -452,11 +492,13 @@ def observe(cfg, previous=None):
         if previous.get("sensor") not in (None, current):
             reasons.append("sensor_restarted")
         accounting, gap, continuity_reason = account_kernel(previous, sample, current)
+        history_gap = accounting["gap_history_peak"]
         if continuity_reason:
             reasons.append(continuity_reason)
         candidate = {"kernel_accounting": accounting,
                      "accounting_status": "UNKNOWN_GAP" if gap else
                         ("UNKNOWN_DISCONTINUITY" if continuity_reason else "OBSERVED_NO_GAP"),
+                     "gap_acknowledgements": previous.get("gap_acknowledgements", []),
                      "sensor": current, "latched": bool(previous["latched"] or reasons), "reasons": reasons,
                      "counters": watched}
         require(len(json.dumps(candidate).encode()) <= MAX_STATE, "observed state too large")
@@ -465,7 +507,10 @@ def observe(cfg, previous=None):
         if midstream:
             metrics["midstream_policy_events_total"] = sum(midstream)
         metrics.update({"telemetry_known": int(not gap and not continuity_reason),
-                        "accounting_unexplained_gap": gap, "degraded_latched": int(state["latched"]),
+                        "accounting_gap_history_peak": history_gap,
+                        "accounting_gap_history_latched": int(accounting["gap_history_latched"]),
+                        "accounting_unexplained_gap": gap,
+                        "degraded_latched": int(state["latched"] or accounting["gap_history_latched"]),
                         "nft_packets_total": packets,
                         "decoder_packets_total": data["decoder.pkts"], "sensor_uptime_seconds": data["uptime"],
                         **{"queue_" + key: q[key] for key in
@@ -506,13 +551,39 @@ def previous_state(cfg):
     return previous
 
 
-def monitor(cfg, acknowledge=False):
+def acknowledge_accounting_gap(state, metrics, evidence):
+    """Record an explicit operator decision and fresh baseline in the same state write.
+
+    The supplied SHA references evidence; its format does not attest that evidence.
+    Other degradation latches and the historical peak are never cleared here.
+    """
+    require(isinstance(evidence, str) and re.fullmatch(r"[0-9a-f]{64}", evidence), "evidence SHA256 required")
+    require(metrics["telemetry_known"] == 1, "cannot acknowledge unknown current observation")
+    accounting = state["kernel_accounting"]
+    require(accounting["gap_history_latched"] and accounting["unexplained_gap"] == 0,
+            "no historical gap to acknowledge or current gap remains")
+    log = state.get("gap_acknowledgements", [])
+    require(isinstance(log, list) and len(log) < 32, "accounting acknowledgement audit bound reached")
+    before = json.loads(json.dumps(accounting))
+    state["gap_acknowledgements"] = log + [{"evidence_sha256": evidence, "before": before,
+        "monotonic_ns": time.monotonic_ns(), "unix_ns": time.time_ns(),
+        "other_latch_preserved": state["latched"]}]
+    sample = accounting["sample"]
+    accounting.update(total_after=sequence_delta(sample["after"]["id_sequence"], sample["before"]["id_sequence"]),
+                      offset_ceiling=sample["nft"]["packets"], gap_history_latched=False)
+    state["accounting_status"] = "ACKNOWLEDGED_GAP_HISTORY"
+    metrics.update(accounting_gap_history_latched=0, degraded_latched=int(state["latched"]))
+
+
+def monitor(cfg, acknowledge=False, accounting_gap_evidence=None):
     path = Path(cfg["state_dir"]) / "monitor.json"
     result = observe(cfg, previous_state(cfg))
     if acknowledge:
         require(result["metrics"]["telemetry_known"] == 1, "cannot acknowledge unknown telemetry")
         result["state"].update({"latched": False, "reasons": []})
-        result["metrics"]["degraded_latched"] = 0
+        result["metrics"]["degraded_latched"] = int(result["state"]["kernel_accounting"]["gap_history_latched"])
+    if accounting_gap_evidence is not None:
+        acknowledge_accounting_gap(result["state"], result["metrics"], accounting_gap_evidence)
     state_json = json.dumps(result["state"], sort_keys=True)
     require(len(state_json.encode()) <= MAX_STATE, "state publication too large")
     atomic(path, state_json)
@@ -527,8 +598,11 @@ def monitor(cfg, acknowledge=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="/etc/cs-public0/config.json")
-    parser.add_argument("command", choices=("check", "arm", "disarm", "status", "monitor", "acknowledge", "validate-rules"))
+    parser.add_argument("command", choices=("check", "arm", "disarm", "status", "monitor", "acknowledge", "validate-rules", "acknowledge-accounting-gap"))
+    parser.add_argument("--evidence-sha256")
     args = parser.parse_args()
+    require((args.command == "acknowledge-accounting-gap") == (args.evidence_sha256 is not None),
+            "evidence is required only for acknowledge-accounting-gap")
     require(os.geteuid() == 0, "root required")
     cfg = load_config(args.config)
     with locked(cfg):
@@ -536,8 +610,9 @@ def main():
             result = {"alert_rules": validate_rules(cfg)}
         elif args.command == "status":
             result = observe(cfg, previous_state(cfg))
-        elif args.command in ("monitor", "acknowledge"):
-            result = monitor(cfg, acknowledge=args.command == "acknowledge")
+        elif args.command in ("monitor", "acknowledge", "acknowledge-accounting-gap"):
+            result = monitor(cfg, acknowledge=args.command == "acknowledge",
+                             accounting_gap_evidence=args.evidence_sha256)
         else:
             {"check": preflight, "arm": arm, "disarm": disarm}[args.command](cfg)
             result = {"command": args.command, "ok": True}

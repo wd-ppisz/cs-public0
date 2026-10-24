@@ -191,11 +191,12 @@
     argv:
       - "{{ cs_public0_binary }}"
       - -T
+      - --simulate-ips
       - -c
       - /etc/cs-public0/suricata.yaml
-      - -S
-      - "{{ cs_public0_rules_dir }}/local.rules"
       - --init-errors-fatal
+      - --set
+      - unix-command.enabled=no
   changed_when: false
   when: not ansible_check_mode
 
