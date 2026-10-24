@@ -33,6 +33,10 @@ błędów składni, SID/GID, zależności i semantyki silnika wymaga jego testu.
    konfiguracją, classification, reference i threshold co jednostka docelowa.
    Wyłącz socket poleceń i użyj własnego katalogu logów. Nie otwieraj kolejki NFQ.
    Sprawdź exit status oraz liczbę załadowanych, pominiętych i błędnych reguł.
+   Dla profilu inline dodaj `--simulate-ips` oraz te same ustawienia CLI silnika
+   (w tym `stream.inline=yes`) co w jednostce produkcyjnej, z pominięciem `-q`.
+   Samo `-T` domyślnie może testować IDS. Potwierdź tryb IPS w rzeczywistym logu;
+   symulacja trybu nie odbiera obsługi kolejki ani ruchu przez sensor.
 3. Przygotuj transakcję obejmującą docelowy plik, gzip, manifest instalacyjny
    i piny IaC. Sam zapis `rules` bez aktualizacji weryfikacji startowej spowoduje
    odmowę następnego startu. Pełny playbook instalacyjny może restartować sensor;
