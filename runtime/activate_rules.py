@@ -232,6 +232,24 @@ def effective_settings(plan):
             "qualification differs from active engine overrides")
 
 
+def monitor_ready_after(plan, completed):
+    """Wait for a whole new observation; kernel-only samples remain UNKNOWN."""
+    state = json.loads(read_path(plan["cfg"]["monitor_state"], 65536), object_pairs_hook=unique)
+    accounting = state.get("kernel_accounting", {})
+    require(state.get("latched") is False
+            and accounting.get("gap_history_latched") is False
+            and accounting.get("observation_gap_history_latched", False) is False,
+            "post-reload monitor has unresolved degradation or history")
+    sensor, sample = state.get("sensor", {}), accounting.get("sample", {})
+    require(sensor.get("pid") == plan["binding"]["pid"]
+            and sensor.get("start_ticks") == plan["binding"]["start_ticks"]
+            and sample.get("boot_id") == plan["binding"]["boot_id"],
+            "post-reload monitor sensor epoch changed")
+    finished = sample.get("finished_ns")
+    return (state.get("current_sample_valid") is True and type(finished) is int
+            and finished > completed)
+
+
 def probe(plan):
     cfg, binding = plan["cfg"], plan["binding"]
     started = time.monotonic_ns()
@@ -365,9 +383,10 @@ def activate(plan, raw_plan, check_only=False):
         result["phase"] = state["phase"]
         deadline = time.monotonic_ns() + 20_000_000_000
         while True:
-            after = probe(plan)
-            if after["health"]["finished_ns"] > completed:
-                break
+            if monitor_ready_after(plan, completed):
+                after = probe(plan)
+                if after["health"]["finished_ns"] > completed:
+                    break
             require(time.monotonic_ns() < deadline, "no fresh post-reload monitor observation")
             time.sleep(0.25)
         require(after["packets"] > second["packets"], "no observed post-reload traffic progress")

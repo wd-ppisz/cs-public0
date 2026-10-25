@@ -304,6 +304,51 @@ class RuntimeTests(unittest.TestCase):
              patch.object(runtime, "owned"), patch.object(runtime, "counters", return_value=data):
             return runtime.observe(self.cfg)
 
+    def test_busy_engine_preserves_eighty_seconds_of_kernel_samples_but_is_unknown(self):
+        data = {"decoder.pkts": 1000, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
+        previous = None
+        for i in range(10):
+            sample = sample_fixture(100 + i * 10, 100 + i * 10, started=(i * 10 + 1) * 10**9)
+            with self.observation_patches(data), patch.object(runtime, "kernel_sample", return_value=sample):
+                if 0 < i < 9:
+                    with patch.object(runtime, "counters", side_effect=TimeoutError("busy reload")):
+                        result = runtime.observe(self.cfg, previous)
+                    self.assertEqual(result["metrics"]["telemetry_known"], 0)
+                    self.assertFalse(result["state"]["current_sample_valid"])
+                    self.assertTrue(result["state"]["kernel_sample_valid"])
+                else:
+                    result = runtime.observe(self.cfg, previous)
+                    self.assertEqual(result["metrics"]["telemetry_known"], 1)
+                previous = result["state"]
+                self.assertEqual(previous["kernel_accounting"]["sample"], sample)
+                self.assertFalse(previous["kernel_accounting"]["observation_gap_history_latched"])
+                self.assertEqual(result["metrics"]["degraded_latched"], 0)
+
+    def test_busy_engine_cannot_hide_kernel_loss_or_a_real_missing_sample(self):
+        data = {"decoder.pkts": 10, "uptime": 10, **dict.fromkeys(runtime.LOSS_COUNTERS, 0)}
+        with self.observation_patches(data), patch.object(runtime, "kernel_sample", return_value=sample_fixture(10, 10)):
+            previous = runtime.observe(self.cfg)["state"]
+        sample = sample_fixture(20, 20, started=20 * 10**9)
+        sample["before"]["kernel_dropped"] = sample["after"]["kernel_dropped"] = 1
+        with self.observation_patches(data), patch.object(runtime, "kernel_sample", return_value=sample), \
+             patch.object(runtime, "counters", side_effect=TimeoutError("busy reload")):
+            loss = runtime.observe(self.cfg, previous)
+        self.assertEqual(loss["metrics"]["telemetry_known"], 0)
+        self.assertEqual(loss["metrics"]["degraded_latched"], 1)
+        with self.observation_patches(data), patch.object(runtime, "kernel_sample",
+             return_value=sample_fixture(20, 19, started=20 * 10**9)), \
+             patch.object(runtime, "counters", side_effect=TimeoutError("busy reload")):
+            gap = runtime.observe(self.cfg, previous)
+        self.assertEqual(gap["state"]["accounting_status"], "UNKNOWN_GAP")
+        self.assertEqual(gap["metrics"]["accounting_unexplained_gap"], 1)
+        with self.observation_patches(data), patch.object(runtime, "kernel_sample", side_effect=RuntimeError("missing")):
+            missing = runtime.observe(self.cfg, previous)
+        self.assertFalse(missing["state"]["kernel_sample_valid"])
+        with self.observation_patches(data), patch.object(runtime, "kernel_sample", return_value=sample_fixture(30, 30, started=90 * 10**9)):
+            after = runtime.observe(self.cfg, missing["state"])
+        self.assertTrue(after["state"]["kernel_accounting"]["observation_gap_history_latched"])
+        self.assertEqual(after["metrics"]["degraded_latched"], 1)
+
     def test_flow_exception_policy_latches(self):
         result = self.observe_counter("flow.memcap_exception_policy.pass_flow")
         self.assertEqual(result["metrics"]["degraded_latched"], 1)

@@ -157,9 +157,36 @@ class ActivationTests(unittest.TestCase):
         stack = contextlib.ExitStack()
         stack.enter_context(patch.object(activation, "SuricataCommands", Session))
         stack.enter_context(patch.object(activation, "probe", probe))
+        stack.enter_context(patch.object(activation, "monitor_ready_after", return_value=True))
         stack.enter_context(patch.object(activation, "qualify", qualify))
         stack.enter_context(patch.object(activation.runtime, "selected_rules", return_value=None))
         return stack
+
+    def test_post_reload_readiness_waits_for_engine_and_kernel_without_clearing_latches(self):
+        path = self.target / "monitor-readiness.json"
+        plan = {"cfg": {"monitor_state": str(path)}, "binding": self.binding}
+        state = {"latched": False, "current_sample_valid": False,
+                 "sensor": {"pid": self.binding["pid"], "start_ticks": self.binding["start_ticks"]},
+                 "kernel_accounting": {"gap_history_latched": False,
+                     "observation_gap_history_latched": False,
+                     "sample": {"finished_ns": 20, "boot_id": self.binding["boot_id"]}}}
+        path.write_text(json.dumps(state))
+        self.assertFalse(activation.monitor_ready_after(plan, 10))
+        state["current_sample_valid"] = True
+        path.write_text(json.dumps(state))
+        self.assertFalse(activation.monitor_ready_after(plan, 20))
+        self.assertTrue(activation.monitor_ready_after(plan, 10))
+        for key in ("gap_history_latched", "observation_gap_history_latched"):
+            state["kernel_accounting"][key] = True
+            path.write_text(json.dumps(state))
+            with self.assertRaisesRegex(RuntimeError, "unresolved degradation"):
+                activation.monitor_ready_after(plan, 10)
+            state["kernel_accounting"][key] = False
+        state["sensor"]["start_ticks"] += 1
+        state["current_sample_valid"] = False
+        path.write_text(json.dumps(state))
+        with self.assertRaisesRegex(RuntimeError, "sensor epoch changed"):
+            activation.monitor_ready_after(plan, 10)
 
     def test_real_four_file_activation_with_separate_command_and_health_receipts(self):
         with self.patches():
