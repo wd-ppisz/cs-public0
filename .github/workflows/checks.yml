@@ -14,7 +14,9 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - name: Ansible syntax
         working-directory: ansible
-        run: ansible-playbook -i ../examples/apache-cloudstack-kvm/inventory.ini site.yml --syntax-check
+        run: |
+          ansible-playbook -i ../examples/apache-cloudstack-kvm/inventory.ini site.yml --syntax-check
+          ansible-playbook -i ../examples/apache-cloudstack-kvm/inventory.ini rule-controller.yml --syntax-check
       - name: Dependency audit
         run: |
           pip install pip-audit

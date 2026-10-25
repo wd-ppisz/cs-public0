@@ -1,0 +1,161 @@
+---
+# Day-2 only: install the manual controller. No sensor restart or rule reload.
+- name: Install the bounded manual rule controller
+  hosts: "{{ target | default('cs_public0_no_target') }}"
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    cs_public0_controller_directory: /usr/local/libexec/cs-public0-update
+    cs_public0_controller_service: cs-public0.service
+    cs_public0_controller_rules_directory: /etc/cs-public0/rules
+    cs_public0_controller_journal: /var/lib/cs-public0/rule-journal
+    cs_public0_controller_rules_name: local.rules
+    cs_public0_controller_gzip_name: local.rules.gz
+    cs_public0_controller_bootstrap: false
+    cs_public0_controller_immutable: []
+    cs_public0_controller_modules:
+      - activate_rules.py
+      - run_rule_activation.py
+      - migrate_rule_source.py
+      - rule_release.py
+      - rule_update_journal.py
+      - suricata_commands.py
+      - cs_public0.py
+  tasks:
+    - name: Require explicit source pins and one target
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - target == inventory_hostname
+          - ansible_play_hosts_all | length == 1
+          - cs_public0_controller_source is defined
+          - cs_public0_controller_sha256 is defined
+          - cs_public0_controller_sha256.keys() | sort == cs_public0_controller_modules | sort
+          - cs_public0_controller_bootstrap is boolean
+          - cs_public0_controller_service is match('^[A-Za-z0-9_-]{1,80}\.service$')
+          - cs_public0_controller_directory is match('^/usr/local/libexec/[A-Za-z0-9_-]+$')
+          - cs_public0_controller_rules_directory is match('^/etc/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$')
+          - cs_public0_controller_journal is match('^/var/lib/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$')
+
+    - name: Refuse an active controller or unresolved file transaction
+      ansible.builtin.shell: |
+        set -eu
+        test -z "$(systemctl list-units 'cs-public0-activate-*' --state=active,activating --no-legend --no-pager)"
+        test ! -e '{{ cs_public0_controller_journal }}/active.json'
+        test ! -L '{{ cs_public0_controller_journal }}/active.json'
+      changed_when: false
+
+    - name: Reject unsafe existing ancestors without chmod of shared directories
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import pathlib, stat, sys
+            for name in sys.argv[1:]:
+                for p in (pathlib.Path(name), *pathlib.Path(name).parents):
+                    try: s = p.lstat()
+                    except FileNotFoundError: continue
+                    if not stat.S_ISDIR(s.st_mode) or s.st_uid != 0 or s.st_mode & 0o022:
+                        raise SystemExit('unsafe directory: ' + str(p))
+          - "{{ cs_public0_controller_directory }}"
+          - "{{ cs_public0_controller_rules_directory }}"
+          - "{{ cs_public0_controller_journal }}"
+          - "/etc/systemd/system/{{ cs_public0_controller_service }}.d"
+      changed_when: false
+
+    - name: Verify every local source SHA before remote writes
+      ansible.builtin.stat:
+        path: "{{ cs_public0_controller_source }}/{{ item }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      loop: "{{ cs_public0_controller_modules }}"
+      register: cs_public0_controller_sources
+
+    - name: Require exact regular source modules
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+          - not (item.stat.islnk | default(false))
+          - item.stat.checksum == cs_public0_controller_sha256[item.item]
+      loop: "{{ cs_public0_controller_sources.results }}"
+
+    - name: Refuse replacement of already pinned controller code without a migration
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import json, pathlib, sys
+            release = pathlib.Path(sys.argv[1]) / 'release.json'
+            if release.exists() or release.is_symlink():
+                if release.is_symlink() or release.stat().st_size > 16384:
+                    raise SystemExit('unsafe installed release')
+                pins = json.loads(release.read_bytes())['immutable']
+                for name, expected in json.loads(sys.argv[3]).items():
+                    if pins.get(str(pathlib.Path(sys.argv[2]) / name)) != expected:
+                        raise SystemExit('pinned code requires a separate migration: ' + name)
+          - "{{ cs_public0_controller_rules_directory }}"
+          - "{{ cs_public0_controller_directory }}"
+          - "{{ cs_public0_controller_sha256 | to_json }}"
+      changed_when: false
+
+    - name: Create private controller journal and root-owned code directory
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: "{{ cs_public0_controller_directory }}", mode: "0755"}
+        - {path: "{{ cs_public0_controller_journal }}", mode: "0700"}
+
+    - name: Copy the pinned modules without starting a controller
+      ansible.builtin.copy:
+        src: "{{ cs_public0_controller_source }}/{{ item }}"
+        dest: "{{ cs_public0_controller_directory }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "0755"
+        validate: >-
+          /usr/bin/python3 -c "import sys; compile(open(sys.argv[1], 'rb').read(), sys.argv[1], 'exec')" %s
+      loop: "{{ cs_public0_controller_modules }}"
+
+    - name: Bootstrap startup verification only when explicitly selected
+      when: cs_public0_controller_bootstrap | bool
+      block:
+        - name: Initialize and verify the release before adding any startup dependency
+          ansible.builtin.command:
+            argv: >-
+              {{ ['/usr/bin/python3', cs_public0_controller_directory + '/rule_release.py', 'bootstrap',
+                   '--directory', cs_public0_controller_rules_directory,
+                   '--rules', cs_public0_controller_rules_name,
+                   '--gzip', cs_public0_controller_gzip_name]
+                 + (cs_public0_controller_immutable | map('regex_replace', '^(.*)$', '--immutable=\\1') | list) }}
+          changed_when: false
+
+        - name: Create the sensor drop-in directory
+          ansible.builtin.file:
+            path: "/etc/systemd/system/{{ cs_public0_controller_service }}.d"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Append a release check without clearing existing startup guards
+          ansible.builtin.copy:
+            dest: "/etc/systemd/system/{{ cs_public0_controller_service }}.d/public0-release.conf"
+            owner: root
+            group: root
+            mode: "0644"
+            content: |
+              [Service]
+              ExecStartPre=/usr/bin/python3 {{ cs_public0_controller_directory }}/rule_release.py verify --directory {{ cs_public0_controller_rules_directory }}
+
+        - name: Load the added guard without restarting the sensor
+          ansible.builtin.systemd_service:
+            daemon_reload: true
