@@ -90,6 +90,34 @@ an `ACTIVATED` receipt. Preserve all request, qualification and journal files.
 Neither this controller nor a green monitor proves complete packet inspection,
 service/OSD p99 or G6 qualification.
 
+## Disposable VM qualification
+
+`tests/integration/activation.py` is a separate, alert-only systemd/NFQUEUE
+qualification executable for the disposable GitHub Actions VM. It uses the
+real controller, a real sensor and the real monitor in private namespaces. It
+installs all four release images and requires a correlated alert from the new
+rule, legal request completion, an `ACTIVATED` receipt and the same sensor
+process/socket. Root-owned byte copies keep the immutable source contract
+independent of the runner checkout's user ownership.
+
+Four additional filesystem fixtures stop and actually kill a child after
+durable preparation, the first completed replacement, complete installation
+and reload intent. The first three explicitly recover every original image;
+the unknown reload case must refuse restore/reinstall and retain its intent.
+Those fixtures send no engine command and do not qualify production rollback.
+The VM is the hard outer cleanup boundary. This executable refuses ordinary
+non-CI invocation and must never be run on a production host. A missing
+prerequisite fails the CI gate; SKIP is not acceptance.
+The harness allows 420 seconds for setup, the bounded controller and fault
+fixtures; the entire dataplane job expires after 15 minutes, including setup.
+Sensor and monitor units have a separate 600-second lifetime; the controller
+retains its required 240-second limit. Legal traffic runs until controller
+completion or a 300-second cap, covering the controller wait of 260 seconds.
+
+This small two-rule laboratory contract does not qualify a full provider feed,
+production resource headroom, service/OSD p99, or fleet rollout. Keep those
+acceptances separate from a successful CI run and production activation.
+
 ## Existing CLI-selected rule sources
 
 An existing sensor started with `-S` requires a separate migration plan with
