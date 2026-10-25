@@ -139,6 +139,14 @@ operation. Neither this path nor a passing unit test qualifies all live kernels.
 See the [kernel references](references.md) for ID assignment, fail-open and netlink
 overrun semantics. Validate the source and effective behavior of your own kernel.
 
+Kernel samples are accounted and retained before requesting engine counters.
+A busy command socket (including a long blocking rule reload) leaves the engine
+telemetry UNKNOWN and the complete observation invalid, while preserving valid
+NFQUEUE/nft samples. A later successful counter read can recover known telemetry
+without inventing a missing kernel interval. This does not suppress real queue
+loss, socket/epoch changes or an actual pause longer than 60 seconds. Existing
+loss and observation-gap latches remain until their separate audited resolution.
+
 The managed alert-only preflight rejects secondary rule-source keys and enabled
 firewall/multi-detect profiles in the engine's effective dump, including sources
 introduced by YAML includes. Only its exact single `rule-files.0` is accepted.

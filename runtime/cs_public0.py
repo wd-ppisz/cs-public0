@@ -486,7 +486,7 @@ def observe(cfg, previous=None):
     metrics = {"telemetry_known": 0, "sensor_up": 0, "queue_listener": 0, "nft_rule": 0,
                "degraded_latched": int(previous["latched"] or prior_history), "full_inspection_verified": 0,
                "last_publish_unix_seconds": time.time()}
-    state = {**previous, "current_sample_valid": False}
+    state = {**previous, "current_sample_valid": False, "kernel_sample_valid": False}
     try:
         current = sensor(cfg)
         metrics["sensor_up"] = 1
@@ -494,6 +494,32 @@ def observe(cfg, previous=None):
         q = sample["after"]
         packets = sample["nft"]["packets"]
         metrics.update({"queue_listener": 1, "nft_rule": 1})
+        # Preserve independently observed kernel continuity even when the Unix
+        # manager is busy with a blocking reload and dump-counters times out.
+        accounting, gap, continuity_reason = account_kernel(previous, sample, current)
+        baseline = previous.get("counters", {}) if previous.get("sensor") == current else {}
+        kernel_reasons = ["nfqueue." + name for name in
+                          ("kernel_dropped", "user_dropped", "netlink_dropped")
+                          if max(sample["before"][name], q[name]) != baseline.get("nfqueue." + name, 0)]
+        if continuity_reason and continuity_reason != "nfqueue.observation_gap":
+            kernel_reasons.append(continuity_reason)
+        state = {**state, "sensor": current, "kernel_accounting": accounting,
+                 "accounting_status": "UNKNOWN_GAP" if gap else
+                     ("UNKNOWN_DISCONTINUITY" if continuity_reason else "OBSERVED_NO_GAP"),
+                 "kernel_sample_valid": True, "reasons": kernel_reasons,
+                 "counters": previous.get("counters", {}) if previous.get("sensor") == current else {},
+                 "latched": bool(previous["latched"] or kernel_reasons),
+                 "gap_acknowledgements": previous.get("gap_acknowledgements", [])}
+        state["accounting_claim_sha256"] = accounting_claim(state)
+        metrics.update({"nft_packets_total": packets,
+                        "accounting_unexplained_gap": gap,
+                        "accounting_gap_history_peak": accounting["gap_history_peak"],
+                        "accounting_gap_history_latched": int(accounting["gap_history_latched"]),
+                        "accounting_observation_gap_history_latched": int(accounting["observation_gap_history_latched"]),
+                        "degraded_latched": int(state["latched"] or accounting["gap_history_latched"]
+                                                or accounting["observation_gap_history_latched"]),
+                        **{"queue_" + key: q[key] for key in
+                           ("pending", "kernel_dropped", "user_dropped", "netlink_dropped", "id_sequence")}})
         data = counters(cfg, current["pid"])
         require(all(name in data for name in (*LOSS_COUNTERS, "decoder.pkts", "uptime"))
                 and data["uptime"] > 0, "incomplete counters")
@@ -513,11 +539,11 @@ def observe(cfg, previous=None):
             reasons.append("counter_reset")
         if previous.get("sensor") not in (None, current):
             reasons.append("sensor_restarted")
-        accounting, gap, continuity_reason = account_kernel(previous, sample, current)
         history_gap = accounting["gap_history_peak"]
         if continuity_reason and continuity_reason != "nfqueue.observation_gap":
             reasons.append(continuity_reason)
-        candidate = {"kernel_accounting": accounting, "current_sample_valid": not continuity_reason,
+        candidate = {"kernel_accounting": accounting, "kernel_sample_valid": True,
+                     "current_sample_valid": not continuity_reason,
                      "accounting_status": "UNKNOWN_GAP" if gap else
                         ("UNKNOWN_DISCONTINUITY" if continuity_reason else "OBSERVED_NO_GAP"),
                      "gap_acknowledgements": previous.get("gap_acknowledgements", []),
