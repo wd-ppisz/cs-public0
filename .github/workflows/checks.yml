@@ -24,6 +24,7 @@ jobs:
   dataplane:
     # This VM has its own kernel; namespaces do not alter its root firewall.
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install test dependencies
@@ -41,6 +42,16 @@ jobs:
           result=$?
           if [ "$result" -eq 77 ]; then
             echo '::error::Dataplane prerequisites unavailable; smoke was not validated.'
+            exit 1
+          fi
+          exit "$result"
+      - name: Four-file activation and process-death recovery
+        run: |
+          set +e
+          sudo --preserve-env=GITHUB_ACTIONS python3 tests/integration/activation.py
+          result=$?
+          if [ "$result" -eq 77 ]; then
+            echo '::error::Activation prerequisites unavailable; qualification was not validated.'
             exit 1
           fi
           exit "$result"
