@@ -95,6 +95,9 @@
                 if release.is_symlink() or release.stat().st_size > 16384:
                     raise SystemExit('unsafe installed release')
                 pins = json.loads(release.read_bytes())['immutable']
+                # An existing release must bind EVERY installed controller module.
+                # An absent pin requires a separate migration too; silently allowing
+                # it would let this play overwrite code outside the startup contract.
                 for name, expected in json.loads(sys.argv[3]).items():
                     if pins.get(str(pathlib.Path(sys.argv[2]) / name)) != expected:
                         raise SystemExit('pinned code requires a separate migration: ' + name)
@@ -135,7 +138,7 @@
                    '--directory', cs_public0_controller_rules_directory,
                    '--rules', cs_public0_controller_rules_name,
                    '--gzip', cs_public0_controller_gzip_name]
-                 + (cs_public0_controller_immutable | map('regex_replace', '^(.*)$', '--immutable=\\1') | list) }}
+                 + (cs_public0_controller_immutable | map('regex_replace', '^', '--immutable=') | list) }}
           changed_when: false
 
         - name: Create the sensor drop-in directory

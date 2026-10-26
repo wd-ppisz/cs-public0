@@ -78,6 +78,7 @@ sudo /usr/local/libexec/cs-public0 monitor
 
 See [installation](docs/installation.md), [rollback](docs/rollback.md) and
 [troubleshooting](docs/troubleshooting.md) for the complete operating procedure.
+For an existing SIEM agent, see [forwarding EVE events to Wazuh](docs/wazuh-integration.md).
 
 ## Availability and inspection limits
 
