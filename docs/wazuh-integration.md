@@ -31,3 +31,31 @@ out of public repositories.
 
 References: [Wazuh Suricata integration](https://documentation.wazuh.com/current/proof-of-concept-guide/integrate-network-ids-suricata.html)
 and [localfile configuration](https://documentation.wazuh.com/current/user-manual/reference/ossec-conf/localfile.html).
+
+## Grafana: top alert signatures and source IPs
+
+Import [the optional dashboard](../monitoring/grafana/wazuh-alert-details.json) into Grafana
+and select a VictoriaLogs datasource. The template includes four TOP 30 tables:
+alert signatures, alert source IPs, blocked signatures and blocked source IPs.
+
+This optional dashboard requires a separate Wazuh-to-VictoriaLogs pipeline. It does
+not install that pipeline or an agent. The log normalization contract is:
+
+- `app=wazuh` and `rule_id` containing the Wazuh Suricata rule ID (86xxx).
+- Preserve the decoded EVE fields under `data`: `event_type`, `src_ip`,
+  `alert.signature_id`, `alert.signature`, `alert.category` and `alert.action`.
+- Store the original event timestamp as the log timestamp. Count the selected
+  Grafana time range across all agents. Apply access controls to network metadata.
+
+The tables count collected alert events, not unique connections, packets or
+successful attacks. Source IPs identify event sources; spoofing, shared addresses
+and false positives require investigation. The blocked tables require the actual
+`data.alert.action=blocked` field. A signature name containing `DROP` with action
+`allowed` remains an alert, not a block. Capture/kernel/NFQUEUE losses are separate
+health signals and do not belong in the blocked rankings.
+
+An empty blocked table is expected for an alert-only ruleset, but empty search
+results alone cannot establish collector health. Verify current-file collection
+and fresh manager ingress as described above. These tables cover signature alerts
+forwarded by Wazuh; they do not promise a complete ledger of all engine or firewall
+drop reasons. No test attack or drop rule is required to use this dashboard.

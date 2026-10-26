@@ -1,0 +1,418 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_VICTORIALOGS",
+      "label": "VictoriaLogs",
+      "description": "VictoriaLogs datasource receiving normalized Wazuh alerts",
+      "type": "datasource",
+      "pluginId": "victoriametrics-logs-datasource",
+      "pluginName": "VictoriaLogs"
+    }
+  ],
+  "id": null,
+  "uid": "cs-public0-wazuh-alert-details",
+  "title": "cs-public0 — IDS alerts and IPS blocks",
+  "schemaVersion": 39,
+  "version": 0,
+  "editable": true,
+  "tags": [
+    "cs-public0",
+    "suricata",
+    "wazuh"
+  ],
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "refresh": "1m",
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "TOP 30 signatures — IDS alerts",
+      "description": "Counts centrally collected Suricata alert events in the selected time range across all agents. A source IP or signature match does not prove a successful attack. Includes allowed and blocked alerts. DROP in a signature name does not imply blocking.",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${DS_VICTORIALOGS}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "expr": "app:wazuh rule_id:~\"^86\" data.event_type:alert | stats by (data.alert.signature_id, data.alert.signature, data.alert.category) count() as events | sort by (events desc) | limit 30",
+          "queryType": "stats",
+          "maxLines": 30
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            },
+            "indexByName": {},
+            "renameByName": {
+              "data.alert.signature_id": "SID",
+              "data.alert.signature": "Signature",
+              "data.alert.category": "Category",
+              "data.src_ip": "Source IP",
+              "Value": "Events"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Events",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "No events",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Events",
+            "desc": true
+          }
+        ],
+        "footer": {
+          "show": false
+        },
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "TOP 30 source IPs — IDS alerts",
+      "description": "Counts centrally collected Suricata alert events in the selected time range across all agents. A source IP or signature match does not prove a successful attack. Includes allowed and blocked alerts. DROP in a signature name does not imply blocking.",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${DS_VICTORIALOGS}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "expr": "app:wazuh rule_id:~\"^86\" data.event_type:alert data.src_ip:* | stats by (data.src_ip) count() as events | sort by (events desc) | limit 30",
+          "queryType": "stats",
+          "maxLines": 30
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            },
+            "indexByName": {},
+            "renameByName": {
+              "data.alert.signature_id": "SID",
+              "data.alert.signature": "Signature",
+              "data.alert.category": "Category",
+              "data.src_ip": "Source IP",
+              "Value": "Events"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Events",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "No events",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Events",
+            "desc": true
+          }
+        ],
+        "footer": {
+          "show": false
+        },
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "TOP 30 signatures — IPS blocks",
+      "description": "Counts centrally collected Suricata alert events in the selected time range across all agents. A source IP or signature match does not prove a successful attack. Only alert.action=blocked. This is not a count of unique blocked packets and excludes capture, kernel and NFQUEUE losses. Empty results do not independently prove healthy collection.",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${DS_VICTORIALOGS}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "expr": "app:wazuh rule_id:~\"^86\" data.event_type:alert data.alert.action:blocked | stats by (data.alert.signature_id, data.alert.signature, data.alert.category) count() as events | sort by (events desc) | limit 30",
+          "queryType": "stats",
+          "maxLines": 30
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            },
+            "indexByName": {},
+            "renameByName": {
+              "data.alert.signature_id": "SID",
+              "data.alert.signature": "Signature",
+              "data.alert.category": "Category",
+              "data.src_ip": "Source IP",
+              "Value": "Events"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Events",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "No events",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Events",
+            "desc": true
+          }
+        ],
+        "footer": {
+          "show": false
+        },
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "TOP 30 source IPs — IPS blocks",
+      "description": "Counts centrally collected Suricata alert events in the selected time range across all agents. A source IP or signature match does not prove a successful attack. Only alert.action=blocked. This is not a count of unique blocked packets and excludes capture, kernel and NFQUEUE losses. Empty results do not independently prove healthy collection.",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${DS_VICTORIALOGS}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${DS_VICTORIALOGS}"
+          },
+          "expr": "app:wazuh rule_id:~\"^86\" data.event_type:alert data.alert.action:blocked data.src_ip:* | stats by (data.src_ip) count() as events | sort by (events desc) | limit 30",
+          "queryType": "stats",
+          "maxLines": 30
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true
+            },
+            "indexByName": {},
+            "renameByName": {
+              "data.alert.signature_id": "SID",
+              "data.alert.signature": "Signature",
+              "data.alert.category": "Category",
+              "data.src_ip": "Source IP",
+              "Value": "Events"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Events",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "No events",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Events",
+            "desc": true
+          }
+        ],
+        "footer": {
+          "show": false
+        },
+        "cellHeight": "sm"
+      }
+    }
+  ]
+}
