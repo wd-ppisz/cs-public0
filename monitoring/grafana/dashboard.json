@@ -35,7 +35,9 @@
         "refresh": 1,
         "includeAll": true,
         "allValue": ".*",
-        "multi": true
+        "multi": true,
+        "label": "Instance",
+        "description": "Choose one or more monitored exporter instances, or All to view them together."
       }
     ]
   },
@@ -43,7 +45,7 @@
     {
       "id": 1,
       "title": "Known telemetry",
-      "description": "Expected observations are available. This does not prove complete inspection; NFQUEUE fail-open bypass is not measured.",
+      "description": "1 means the required telemetry checks completed successfully for the latest sample; 0 means the observations are missing or unreliable. A known sample does not prove complete inspection or absence of fail-open bypass.",
       "type": "stat",
       "datasource": {
         "type": "prometheus",
@@ -97,7 +99,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "1 means the expected Suricata sensor process is running and matches the monitored identity; 0 means this check did not succeed. A running process alone does not prove packet inspection or forwarding health. Read this together with Known telemetry."
     },
     {
       "id": 3,
@@ -126,7 +129,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "1 means the monitored NFQUEUE has a userspace listener; 0 means the expected listener is absent. Listener presence alone does not prove that every selected packet reaches Suricata or is inspected."
     },
     {
       "id": 4,
@@ -155,12 +159,13 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "1 means the expected cs-public0 nftables queue selector was found for the configured bridge and queue; 0 means the check did not succeed. This verifies the selector's presence, not complete network coverage."
     },
     {
       "id": 5,
       "title": "Degraded latch",
-      "description": "Latches observed counter increases, resets and sensor restarts. A clear latch does not rule out unmeasured fail-open bypass.",
+      "description": "1 is the latched history of observed degradation, such as counter increases, resets or sensor restarts. The latch can remain set after the current sample recovers. A clear latch does not rule out unmeasured loss or fail-open bypass.",
       "type": "stat",
       "datasource": {
         "type": "prometheus",
@@ -214,7 +219,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Seconds since the last telemetry publication, calculated from the publication timestamp. A rising age means the publisher or scrape path may be stale. Missing data is Unknown, not a fresh publication."
     },
     {
       "id": 7,
@@ -243,7 +249,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Packets currently waiting in the monitored NFQUEUE. Sustained growth suggests the userspace consumer is not keeping up. An empty queue alone does not prove complete inspection or absence of bypass."
     },
     {
       "id": 8,
@@ -272,7 +279,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Five-minute rate of the nftables packet counter for the configured queue selector. It measures packets selected at this hook, not completed Suricata inspection, wire throughput or unique connections."
     },
     {
       "id": 9,
@@ -301,12 +309,13 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Five-minute rate of packets reported by Suricata's decoder. It is an engine counter, not a count of unique requests or confirmed attacks. Offload and sampling boundaries can make it differ from the nftables rate."
     },
     {
       "id": 10,
       "title": "Queue drops",
-      "description": "Reported kernel/user queue drops. Linux 6.8/6.11 fail-open bypass on saturation or failed userspace delivery does not increment these fields. Zero is not proof of complete inspection.",
+      "description": "Sum of the kernel and userspace NFQUEUE drop counters. These are queue delivery losses, not packets blocked by an IPS signature. Zero does not prove complete inspection: some fail-open paths do not increment these counters.",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -333,5 +342,6 @@
       },
       "options": {}
     }
-  ]
+  ],
+  "description": "Operational health of cs-public0 bridge inspection. Select one or more instances to inspect telemetry, the sensor, NFQUEUE and packet counters. These are health observations, not an attack verdict or proof of complete inspection. Missing values mean Unknown. Use the separate optional Wazuh dashboard for alert signatures and source IPs."
 }
