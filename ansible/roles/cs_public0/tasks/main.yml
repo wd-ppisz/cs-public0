@@ -194,6 +194,8 @@
       - --simulate-ips
       - -c
       - /etc/cs-public0/suricata.yaml
+      - -l
+      - "{{ cs_public0_log_dir }}"
       - --init-errors-fatal
       - --set
       - unix-command.enabled=no
