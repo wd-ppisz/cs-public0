@@ -43,42 +43,22 @@ Existing firewall chains still apply after a packet leaves this inspection hook.
 
 See [compatibility](docs/compatibility.md) for kernel, offload and validation limits.
 
-## Install without activating interception
+## Installation: start here
 
-Create an inventory using [the CloudStack/KVM example](examples/apache-cloudstack-kvm/).
-Change the example hostname and set `cs_public0_home_net` to the intended networks.
+Follow **[Install cs-public0 on one host, step by step](docs/installation.md)**.
+It distinguishes controller commands from target commands, provides a complete
+private inventory/settings example, and states what to check after each stage:
 
-```sh
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements-dev.txt
-cd ansible
-ansible-playbook -i ../examples/apache-cloudstack-kvm/inventory.ini site.yml \
-  -e @../examples/apache-cloudstack-kvm/settings.yml
-```
+1. Prepare the controller, engine and target host.
+2. Select one host and supply your reviewed alert-only ruleset.
+3. Install and validate with interception disabled.
+4. Activate explicitly and verify the queue, traffic and local telemetry.
+5. Connect Prometheus/Grafana and optional Wazuh collection, with withdrawal ready.
 
-`cs_public0_enabled` defaults to `false`. The playbook installs and validates files
-while leaving the interception service disabled. A running or enabled distribution
-`suricata.service` must be dealt with explicitly before installation. Review its
-updater too: starting it later conflicts with the inline service.
-
-After checking the host, rules, memory limits and recovery access, activate using
-the same playbook with `-e '{"cs_public0_enabled": true}'`. Activation starts the sensor,
-authenticates its command socket and queue ownership, then adds a dedicated table.
-The playbook stops an existing managed service before replacing its artifacts;
-full installation updates therefore include a bypass interval. Compatible
-controller/monitor-only changes can use [the dedicated update playbook](docs/kernel-accounting.md)
-without restarting Suricata.
-
-```sh
-sudo systemctl status cs-public0.service cs-public0-monitor.timer
-sudo /usr/local/libexec/cs-public0 status
-sudo /usr/local/libexec/cs-public0 monitor
-```
-
-See [installation](docs/installation.md), [rollback](docs/rollback.md) and
-[troubleshooting](docs/troubleshooting.md) for the complete operating procedure.
-For an existing SIEM agent, see [forwarding EVE events to Wazuh](docs/wazuh-integration.md).
+`cs_public0_enabled` defaults to `false`. Suricata and a production ruleset are
+external prerequisites; the bundled signature is a functional example.
+For an existing installation, read the guide's update and rollback sections before
+rerunning the installer, because a full install/update stops the managed sensor.
 
 ## Availability and inspection limits
 
