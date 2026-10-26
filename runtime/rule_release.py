@@ -15,6 +15,8 @@ from rule_update_journal import (MAX_FILE, directory, pin, read_file, require,
 
 SCHEMA = "cs-public0-rule-release-v1"
 MAX_METADATA = 16384
+# A full startup contract includes controller modules, units and their helpers.
+MAX_IMMUTABLE = 32
 
 
 def json_bytes(value):
@@ -58,7 +60,7 @@ def validate_release(value):
     require(type(value["rules_alert"]) is int and 0 < value["rules_alert"] <= 1000000
             and type(value["rules_drop"]) is int and value["rules_drop"] == 0, "alert-only counts required")
     immutable = value["immutable"]
-    require(isinstance(immutable, dict) and 1 <= len(immutable) <= 20, "explicit immutable pins required")
+    require(isinstance(immutable, dict) and 1 <= len(immutable) <= MAX_IMMUTABLE, "explicit immutable pins required")
     for path, expected in immutable.items():
         absolute(path)
         require(pin(expected), "invalid immutable pin")

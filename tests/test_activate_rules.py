@@ -74,6 +74,31 @@ class ActivationTests(unittest.TestCase):
             release.initialize(str(self.target), self.file_names, [str(self.binary)])
         self.assertEqual(release.manifest_for(self.manifest, self.next)["provider"], "preserved")
 
+    def test_complete_startup_contract_and_immutable_count_bound(self):
+        for count in (24, 32):
+            with self.subTest(count=count):
+                target = self.root / ('complete-' + str(count))
+                target.mkdir(mode=0o700)
+                paths = []
+                for number in range(count):
+                    path = self.root / ('immutable-' + str(count) + '-' + str(number))
+                    path.write_bytes(str(number).encode())
+                    paths.append(str(path))
+                (target / self.file_names['rules']).write_bytes(RULE)
+                (target / self.file_names['gzip']).write_bytes(gzip.compress(RULE, mtime=0))
+                (target / 'manifest.json').write_bytes(release.json_bytes(self.manifest))
+                release.initialize(str(target), self.file_names, paths)
+                value = release.verify_release(target / 'release.json')
+                self.assertEqual(len(value['immutable']), count)
+                Path(paths[-1]).write_bytes(b'changed')
+                with self.assertRaisesRegex(RuntimeError, 'immutable source changed'):
+                    release.verify_release(target / 'release.json')
+        value = json.loads((self.target / 'release.json').read_bytes())
+        value['immutable'] = {'/fixture/file-' + str(n): 'a' * 64 for n in range(33)}
+        with self.assertRaisesRegex(RuntimeError, 'explicit immutable pins required'):
+            release.validate_release(value)
+        self.assertEqual(release.MAX_METADATA, 16384)
+
     def test_four_asset_journal_updates_startup_guard_coherently(self):
         j = journal.RuleFileJournal(self.target, self.store)
         j.prepare(self.tx, self.images, self.plan["expected_old"], {n: release.sha(b) for n, b in self.images.items()})
