@@ -5,6 +5,11 @@
 > [inline latency advisory](docs/inline-latency-advisory.md). Do not enable inline
 > on production hosts until a packet-path fix is qualified.
 
+Read [performance pitfalls](docs/performance-pitfalls.md) for lessons from the
+incident, including GSO, checksum metadata, retransmission monitoring and controlled
+baseline comparisons. An [optional pinned GSO profile](docs/nfq-gso-profile.md)
+is available for a separately qualified compatible engine.
+
 Suricata inspection for IPv4 traffic forwarded through a Linux bridge, with an
 Ansible installer, scoped nftables rules, systemd lifecycle and Prometheus metrics.
 Apache CloudStack on KVM is one deployment example; the controller does not require

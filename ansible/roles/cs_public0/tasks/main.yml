@@ -5,6 +5,8 @@
       - ansible_system == 'Linux'
       - ansible_service_mgr == 'systemd'
       - cs_public0_enabled is boolean
+      - cs_public0_nfq_gso is boolean
+      - not cs_public0_nfq_gso or cs_public0_nfq_gso_binary_sha256 is match('^[a-f0-9]{64}$')
       - cs_public0_bridge is match('^[A-Za-z_][A-Za-z0-9_.-]{0,14}$')
       - cs_public0_table is match('^[A-Za-z_][A-Za-z0-9_.-]{0,14}$')
       - cs_public0_queue is integer
@@ -84,6 +86,19 @@
       - cs_public0_build.stdout is search('NFQueue support:\s+yes')
     fail_msg: Install a Suricata 8.x build with NFQUEUE before using this role.
 
+- name: Read the opted-in GSO engine pin before any service change
+  ansible.builtin.stat:
+    path: "{{ cs_public0_binary }}"
+    checksum_algorithm: sha256
+  register: cs_public0_gso_engine
+  when: cs_public0_nfq_gso
+
+- name: Require the explicit compatible GSO engine pin
+  ansible.builtin.assert:
+    that:
+      - cs_public0_gso_engine.stat.checksum == cs_public0_nfq_gso_binary_sha256
+  when: cs_public0_nfq_gso
+
 - name: Inspect the distribution sensor without changing it
   ansible.builtin.service_facts:
 
@@ -150,6 +165,7 @@
     mode: "{{ item.mode }}"
   loop:
     - {src: "{{ cs_public0_project_root }}/runtime/cs_public0.py", dest: /usr/local/libexec/cs-public0, mode: '0755'}
+    - {src: "{{ cs_public0_project_root }}/runtime/nfq_gso.py", dest: /usr/local/libexec/cs-public0-gso, mode: '0755'}
     - {src: "{{ cs_public0_rules_source }}", dest: "{{ cs_public0_rules_dir }}/local.rules", mode: '0640'}
 
 - name: Write runtime settings
