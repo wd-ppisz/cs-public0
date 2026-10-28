@@ -1,5 +1,10 @@
 # cs-public0
 
+> **Inline activation on hold (2026-10-28):** a multi-host deployment exhibited
+> substantial TLS/HTTP latency despite zero observed NFQUEUE drops. See the
+> [inline latency advisory](docs/inline-latency-advisory.md). Do not enable inline
+> on production hosts until a packet-path fix is qualified.
+
 Suricata inspection for IPv4 traffic forwarded through a Linux bridge, with an
 Ansible installer, scoped nftables rules, systemd lifecycle and Prometheus metrics.
 Apache CloudStack on KVM is one deployment example; the controller does not require
