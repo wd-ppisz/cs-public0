@@ -1,6 +1,9 @@
 ---
 # Installation does not activate packet interception unless explicitly requested.
 cs_public0_enabled: false
+# Opt-in requires a compatible GSO engine, an exact binary pin and a runtime acknowledgement.
+cs_public0_nfq_gso: false
+cs_public0_nfq_gso_binary_sha256: ""
 cs_public0_bridge: public0
 cs_public0_table: cs_public0
 cs_public0_queue: 100
