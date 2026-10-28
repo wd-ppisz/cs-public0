@@ -135,3 +135,5 @@ The automation, templates, tests and documentation in this repository are licens
 under [Apache License 2.0](LICENSE). Suricata, third-party signature feeds and system
 packages retain their own licenses; they are external dependencies. See
 [NOTICE](NOTICE) and [SECURITY.md](SECURITY.md).
+
+Explicit, per-host IPS opt-in is described in [Blocking policy](docs/blocking-policy.md).

@@ -14,6 +14,7 @@ from rule_update_journal import (MAX_FILE, directory, pin, read_file, require,
                                  unique, write_file)
 
 SCHEMA = "cs-public0-rule-release-v1"
+BLOCKING_SCHEMA = "cs-public0-rule-release-v2"
 MAX_METADATA = 16384
 # A full startup contract includes controller modules, units and their helpers.
 MAX_IMMUTABLE = 32
@@ -53,12 +54,17 @@ def names(value):
 
 def validate_release(value):
     keys = {"schema", "names", "rules_sha256", "rules_gzip_sha256", "rules_alert", "rules_drop", "immutable"}
-    require(isinstance(value, dict) and set(value) == keys and value["schema"] == SCHEMA,
-            "invalid release schema")
+    blocking = isinstance(value, dict) and value.get("schema") == BLOCKING_SCHEMA
+    require(isinstance(value, dict) and set(value) == (keys | {"drop_sids"} if blocking else keys)
+            and value["schema"] in {SCHEMA, BLOCKING_SCHEMA}, "invalid release schema")
+    sids = value.get("drop_sids", [])
+    require(isinstance(sids, list) and len(sids) <= 128
+            and all(type(s) is int and 1 <= s <= 4294967295 for s in sids)
+            and sids == sorted(set(sids)) and bool(sids) == blocking, "invalid DROP policy")
     names(value["names"])
     require(pin(value["rules_sha256"]) and pin(value["rules_gzip_sha256"]), "invalid rule pin")
     require(type(value["rules_alert"]) is int and 0 < value["rules_alert"] <= 1000000
-            and type(value["rules_drop"]) is int and value["rules_drop"] == 0, "alert-only counts required")
+            and type(value["rules_drop"]) is int and value["rules_drop"] == len(sids), "policy counts differ")
     immutable = value["immutable"]
     require(isinstance(immutable, dict) and 1 <= len(immutable) <= MAX_IMMUTABLE, "explicit immutable pins required")
     for path, expected in immutable.items():
@@ -76,13 +82,15 @@ def unpack(compressed):
     return raw
 
 
-def make_release(raw, compressed, file_names, immutable):
+def make_release(raw, compressed, file_names, immutable, drop_sids=()):
     names(file_names)
-    count = validate_rules_bytes(raw)
+    count = validate_rules_bytes(raw, drop_sids)
     require(unpack(compressed) == raw, "gzip differs from the exact rule bytes")
-    return validate_release({"schema": SCHEMA, "names": dict(file_names), "rules_sha256": sha(raw),
-        "rules_gzip_sha256": sha(compressed), "rules_alert": count, "rules_drop": 0,
-        "immutable": dict(immutable)})
+    return validate_release({"schema": BLOCKING_SCHEMA if drop_sids else SCHEMA,
+        "names": dict(file_names), "rules_sha256": sha(raw),
+        "rules_gzip_sha256": sha(compressed), "rules_alert": count - len(drop_sids),
+        "rules_drop": len(drop_sids), "immutable": dict(immutable),
+        **({"drop_sids": list(drop_sids)} if drop_sids else {})})
 
 
 def manifest_for(previous, release):
@@ -93,7 +101,12 @@ def manifest_for(previous, release):
     artifacts = value.get("artifacts", {})
     require(isinstance(artifacts, dict), "invalid artifact map")
     value.update(rules_sha256=release["rules_sha256"], rules_gzip_sha256=release["rules_gzip_sha256"],
-                 rules_alert=release["rules_alert"], rules_drop=0, actions={"alert": release["rules_alert"]})
+                 rules_alert=release["rules_alert"], rules_drop=release["rules_drop"],
+                 actions={"alert": release["rules_alert"], **({"drop": release["rules_drop"]} if release["rules_drop"] else {})})
+    if release["rules_drop"]:
+        value["drop_sids"] = release["drop_sids"]
+    else:
+        value.pop("drop_sids", None)
     value["artifacts"] = {**artifacts, "rules_sha256": release["rules_sha256"],
                            "rules_gzip_sha256": release["rules_gzip_sha256"]}
     json_bytes(value)
@@ -101,7 +114,8 @@ def manifest_for(previous, release):
 
 
 def verify_metadata(manifest, release):
-    require(manifest_for(manifest, release) == manifest, "manifest and release pins differ")
+    require(json_bytes(manifest_for(manifest, release)) == json_bytes(manifest),
+            "manifest and release pins differ")
 
 
 def verify_immutable(release):
@@ -121,7 +135,7 @@ def verify_release(path, immutable=True):
         compressed = read_file(fd, value["names"]["gzip"], MAX_FILE)[0]
         require(sha(raw) == value["rules_sha256"] and sha(compressed) == value["rules_gzip_sha256"],
                 "installed rule bytes changed")
-        require(make_release(raw, compressed, value["names"], value["immutable"]) == value,
+        require(make_release(raw, compressed, value["names"], value["immutable"], value.get("drop_sids", ())) == value,
                 "installed rules do not match release")
         manifest = json.loads(read_file(fd, value["names"]["manifest"], MAX_METADATA)[0],
                               object_pairs_hook=unique)
@@ -131,10 +145,11 @@ def verify_release(path, immutable=True):
     return value
 
 
-def prepare_images(target, raw, compressed):
+def prepare_images(target, raw, compressed, drop_sids=None):
     """Snapshot a verified current installation; return four coherent new images."""
     old = verify_release(Path(target) / "release.json")
-    new = make_release(raw, compressed, old["names"], old["immutable"])
+    new = make_release(raw, compressed, old["names"], old["immutable"],
+                       old.get("drop_sids", ()) if drop_sids is None else drop_sids)
     with directory(target) as fd:
         manifest = json.loads(read_file(fd, old["names"]["manifest"], MAX_METADATA)[0],
                               object_pairs_hook=unique)
