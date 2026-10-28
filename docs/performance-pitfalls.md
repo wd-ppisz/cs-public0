@@ -96,3 +96,15 @@ Include larger bodies, both directions, long-lived interactive connections,
 MTU variation and representative concurrency before broader deployment. Do not
 enable every host at once because a small canary passed. Keep automatic rollback
 windows in place until each candidate's measurements are accepted.
+
+Include operator checks of VM VNC consoles and VDI or remote desktop sessions
+alongside HTTP probes. A healthy short HTTP response can miss an interactive
+workflow regression. Record when the operator tested each path and whether
+inline was active. A confirmation of normal behavior is useful acceptance
+evidence; it does not establish a latency percentile or capacity limit.
+
+After transport validation, change signature actions in a separate, explicit
+step using a small reviewed SID allowlist. Keep GSO and queue ownership checks
+active during that reload. Preserve the alert-only snapshot and each rule's
+revision and definition hash, and observe actual EVE decisions and service
+behavior. Do not combine an offload repair with a blanket alert-to-DROP change.

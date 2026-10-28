@@ -77,7 +77,13 @@ def parse_plan(raw):
             "candidate_rules", "candidate_gzip", "candidate_rules_sha256", "candidate_gzip_sha256",
             "expected_old", "cfg", "binding", "unit", "selector_sha256", "qualification_settings",
             "startup_check"}
-    require(isinstance(p, dict) and set(p) == keys and p["schema"] == SCHEMA, "invalid activation plan")
+    require(isinstance(p, dict) and set(p) in (keys, keys | {"drop_sids"}) and p["schema"] == SCHEMA,
+            "invalid activation plan")
+    if "drop_sids" in p:
+        sids = p["drop_sids"]
+        require(isinstance(sids, list) and len(sids) <= 128
+                and all(type(s) is int and 1 <= s <= 4294967295 for s in sids)
+                and sids == sorted(set(sids)), "invalid explicit DROP policy")
     require(pin(p["nonce"]) and pin(p["selector_sha256"]), "explicit nonce/selector pin required")
     for key in ("target", "store", "candidate"):
         absolute(p[key])
@@ -201,7 +207,7 @@ def effective_settings(plan):
     overrides, options = {}, {}
     wanted = {s.partition("=")[0] for s in plan["qualification_settings"]}
     safe = {"unix-command.enabled", "unix-command.filename", "nfq.fail-open", "nfq.batchcount",
-            "max-pending-packets", "stats.interval"}
+            "max-pending-packets", "stats.interval", "nfq.gso"}
     i = 1
     while i < len(args):
         arg = args[i]
@@ -210,6 +216,7 @@ def effective_settings(plan):
             key, sep, value = args[i + 1].partition("=")
             require(sep and value and key in wanted | safe and key not in overrides,
                     "unsupported or ambiguous engine override")
+            require(key != "nfq.gso" or value == "yes", "GSO override must be enabled")
             overrides[key] = value
             i += 2
         elif arg in {"-c", "-q", "-l", "-S"}:
@@ -338,7 +345,7 @@ def activate(plan, raw_plan, check_only=False):
         compressed = read_file(candidate_fd, plan["candidate_gzip"], MAX_FILE)[0]
         require(sha(raw) == plan["candidate_rules_sha256"]
                 and sha(compressed) == plan["candidate_gzip_sha256"], "candidate bytes changed")
-        old, new, images, before = prepare_images(target, raw, compressed)
+        old, new, images, before = prepare_images(target, raw, compressed, plan.get("drop_sids"))
         require(before == plan["expected_old"], "installed release changed since approval")
         require(Path(plan["cfg"]["rules_file"]) == target / old["names"]["rules"], "rules target differs")
         require(plan["cfg"]["binary"] in old["immutable"]
@@ -352,13 +359,13 @@ def activate(plan, raw_plan, check_only=False):
         with SuricataCommands(plan["cfg"]["socket"], plan["binding"]) as session:
             session.require_reloadable()
             require(session.query("capture-mode") == "NFQ", "sensor is not in NFQ mode")
-            ruleset(session.query("ruleset-stats"), old["rules_alert"])
+            ruleset(session.query("ruleset-stats"), old["rules_alert"] + old["rules_drop"])
         # An exclusive snapshot supplies the actual bytes consumed by -T.
         log_dir = store / ("qualification-" + transaction)
         os.mkdir(log_dir, 0o700)
         with directory(log_dir, True) as log_fd:
             write_file(log_fd, "candidate.rules", raw)
-        qualification, log = qualify({**plan, "_new_count": new["rules_alert"]},
+        qualification, log = qualify({**plan, "_new_count": new["rules_alert"] + new["rules_drop"]},
                                      log_dir / "candidate.rules", log_dir)
         with directory(log_dir, True) as log_fd:
             require(sha(read_file(log_fd, "candidate.rules", MAX_FILE)[0]) == new["rules_sha256"],
@@ -377,7 +384,8 @@ def activate(plan, raw_plan, check_only=False):
         require(startup_check(plan) == new, "new startup verification failed")
         probe(plan)
         with SuricataCommands(plan["cfg"]["socket"], plan["binding"]) as session:
-            state = reload_installed(journal, transaction, session, old["rules_alert"], new["rules_alert"])
+            state = reload_installed(journal, transaction, session, old["rules_alert"] + old["rules_drop"],
+                                     new["rules_alert"] + new["rules_drop"])
             completed = session.events[-1]["finished_ns"]
         # COMMITTED is the command/file receipt, not complete health acceptance.
         result["phase"] = state["phase"]

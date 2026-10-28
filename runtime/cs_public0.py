@@ -179,7 +179,7 @@ def atomic(path, value, mode=0o600):
         temporary.unlink(missing_ok=True)
 
 
-def validate_rules_bytes(raw):
+def validate_rules_bytes(raw, drop_sids=()):
     """Validate an already bounded snapshot without performing I/O."""
     require(len(raw) <= MAX_RULES_BYTES, "rules file too large")
     try:
@@ -188,6 +188,11 @@ def validate_rules_bytes(raw):
         raise RuntimeError("rules file must be valid UTF-8") from error
     require(all(char in "\t\n" or char.isprintable() for char in source),
             "rules contain unsupported control or non-printable characters; use LF line endings")
+    require(isinstance(drop_sids, (list, tuple)) and len(drop_sids) <= 128
+            and all(type(s) is int and 1 <= s <= 4294967295 for s in drop_sids)
+            and list(drop_sids) == sorted(set(drop_sids)), "canonical DROP SID allowlist required")
+    selected, dropped = set(drop_sids), set()
+    occurrences = {}
     count = 0
     for raw_line in source.split("\n"):
         require(len(raw_line.encode("utf-8")) <= MAX_RULE_LINE_BYTES, "physical rule-file line too long")
@@ -195,8 +200,8 @@ def validate_rules_bytes(raw):
         if line and not line.startswith("#"):
             require(raw_line[0] not in " \t", "active rules must start in column one")
             require(not line.endswith("\\"), "rule continuations are not accepted")
-            require(re.match(r"^alert[ \t]+[^\n]+\([^\n]*\)[ \t]*$", line),
-                    "only single-line alert rules are accepted")
+            require(re.match(r"^(?:alert|drop)[ \t]+[^\n]+\([^\n]*\)[ \t]*$", line),
+                    "only single-line alert or explicitly allowed drop rules are accepted")
             options = line.split("(", 1)[1].rsplit(")", 1)[0]
             # Suricata 8 SigParseOptions splits at a semicolon unless its previous
             # byte is a backslash, including inside quoted option values.
@@ -204,16 +209,41 @@ def validate_rules_bytes(raw):
                      for option in re.split(r"(?<!\\);", options)]
             for forbidden in ("bypass", "replace"):
                 require(forbidden not in names, f"{forbidden} rule options are not accepted")
+            action = line.split(None, 1)[0]
+            sid_options = [o.partition(":")[2].strip() for o in re.split(r"(?<!\\);", options)
+                           if o.partition(":")[0].strip().lower() == "sid"]
+            if selected or action == "drop":
+                require(len(sid_options) == 1 and re.fullmatch(r"[1-9][0-9]{0,9}", sid_options[0]),
+                        "one canonical SID required by blocking policy")
+                sid = int(sid_options[0])
+                occurrences[sid] = occurrences.get(sid, 0) + 1
+                if action == "drop":
+                    require(sid in selected and sid not in dropped, "unapproved or duplicate DROP SID")
+                    dropped.add(sid)
+                else:
+                    require(sid not in selected, "selected SID is still alert")
             count += 1
-    require(count > 0, "rules file has no active alert rules")
+    require(dropped == selected and all(occurrences[s] == 1 for s in selected),
+            "missing or duplicate selected DROP SID")
+    require(count > 0, "rules file has no active rules")
     return count
 
 
 def validate_rules(cfg):
     path = secure_path(cfg["rules_file"])
     require(path.stat().st_size <= MAX_RULES_BYTES, "rules file too large")
+    policy = ()
+    configured_path = Path(cfg["rules_file"])
+    release_path = configured_path.parent / "release.json"
+    if release_path.exists() or release_path.is_symlink():
+        # The explicit pinned release is the policy authority. Merely placing
+        # DROP bytes beside the default configuration never enables blocking.
+        from rule_release import verify_release
+        release = verify_release(release_path)
+        require(release["names"]["rules"] == configured_path.name, "release rule path differs")
+        policy = release.get("drop_sids", ())
     with path.open("rb") as stream:
-        return validate_rules_bytes(stream.read(MAX_RULES_BYTES + 1))
+        return validate_rules_bytes(stream.read(MAX_RULES_BYTES + 1), policy)
 
 
 def selected_rules(cfg, binary):
