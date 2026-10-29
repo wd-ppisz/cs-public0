@@ -6,7 +6,7 @@ After=cs-public0.service
 Type=oneshot
 ExecStart=/usr/local/libexec/cs-public0 monitor
 {% if cs_public0_nfq_gso %}
-ExecStart=/usr/local/libexec/cs-public0-gso --unit cs-public0.service --binary-sha256 {{ cs_public0_nfq_gso_binary_sha256 }} --queue {{ cs_public0_queue }} --host %H --metrics-file {{ cs_public0_metrics_file | dirname }}/cs_public0_gso.prom
+ExecStart=/usr/local/libexec/cs-public0-gso --unit cs-public0.service --binary-sha256 {{ cs_public0_nfq_gso_binary_sha256 }} --queue {{ cs_public0_queue }} --host %H --rcvbuf-size {{ cs_public0_nfq_rcvbuf_size }} --metrics-file {{ cs_public0_metrics_file | dirname }}/cs_public0_gso.prom
 {% endif %}
 UMask=0022
 NoNewPrivileges=yes

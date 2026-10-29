@@ -1,0 +1,37 @@
+name: Optional NFQUEUE engine
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential autoconf automake libtool pkg-config rustc cargo python3 patch libpcap-dev libpcre2-dev libyaml-dev zlib1g-dev libnet1-dev libjansson-dev libcap-ng-dev libmagic-dev libnetfilter-queue-dev libnfnetlink-dev libnss3-dev liblz4-dev libhyperscan-dev dpkg-dev
+      - name: Fetch pinned public source
+        run: curl --fail --location --proto '=https' --tlsv1.2 --retry 2 --max-time 120 --max-filesize 67108864 -o "$RUNNER_TEMP/suricata.tar.gz" https://www.openinfosecfoundation.org/download/suricata-8.0.7.tar.gz
+      - name: Build without installation or activation
+        run: python3 -B tools/build_nfq_engine.py build --archive "$RUNNER_TEMP/suricata.tar.gz" --output "$GITHUB_WORKSPACE/engine-out" --source-commit "$GITHUB_SHA"
+      - name: Independently re-read package
+        run: |
+          python3 - <<'PY'
+          import json,pathlib,subprocess,sys
+          out=pathlib.Path('engine-out')
+          v=json.loads((out/'build.json').read_text())
+          p=subprocess.run([sys.executable,'-B','tools/build_nfq_engine.py','audit',
+              '--package',str(out/v['package_file']),
+              '--package-sha256',v['package_sha256'],
+              '--binary-sha256',v['binary_sha256']],capture_output=True,check=True)
+          (out/'audit.json').write_bytes(p.stdout)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nfq-engine-${{ github.sha }}
+          path: engine-out/
+          if-no-files-found: error
+          retention-days: 30

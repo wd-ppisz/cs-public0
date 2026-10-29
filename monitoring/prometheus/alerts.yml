@@ -35,3 +35,47 @@ groups:
         annotations:
           summary: 'Bridge inspection degradation latched on {{ $labels.instance }}'
           description: 'Inspect queue drops, engine exceptions, resource pressure and restart history before acknowledging the latch.'
+      - alert: CsPublic0NfqNetlinkLoss
+        expr: increase(cs_public0_queue_netlink_dropped[10m]) > 0
+        for: 0s
+        labels: {severity: warning}
+        annotations:
+          summary: 'New NFQUEUE socket message loss on {{ $labels.instance }}'
+          description: 'Preserve the loss history. Socket Drops are not attack or lost-request counts. Check effective receive capacity, worker scheduling and traffic bursts.'
+      - alert: CsPublic0InspectionAccountingGap
+        expr: cs_public0_accounting_unexplained_gap > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Unresolved inspection accounting gap on {{ $labels.instance }}'
+          description: 'This is uncertainty between observation stages, not an exact count of requests accepted without inspection. Correlate queue/socket evidence without clearing history.'
+  # Optional GSO expectations have host/profile labels. Define them for every
+  # intended sensor in your own recording rules, independently of core labels.
+  # cs_public0_gso_expected{host="host-a",profile="public0-ipv4-alert"} 1
+  # cs_public0_expected_rcvbuf_bytes{host="host-a",profile="public0-ipv4-alert"} 33554432
+  - name: cs-public0-gso
+    interval: 15s
+    rules:
+      - alert: CsPublic0GsoNotConfirmed
+        expr: >-
+          (cs_public0_gso_expected == 1) unless on(host,profile)
+          ((cs_public0_gso_known == 1) and on(host,profile) (cs_public0_gso_enabled == 1)
+          and on(host,profile) ((cs_public0_gso_last_publish_unix_seconds <= time())
+          and on(host,profile) (time() - cs_public0_gso_last_publish_unix_seconds <= 45)))
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: 'GSO is not freshly confirmed on {{ $labels.host }}'
+          description: 'Verify the pinned engine, explicit setting, queue owner and current-invocation acknowledgement. Do not change NIC offloads automatically.'
+      - alert: CsPublic0ReceiveBufferNotConfirmed
+        expr: >-
+          (cs_public0_expected_rcvbuf_bytes > 0) unless on(host,profile)
+          ((cs_public0_nfq_rcvbuf_known == 1) and on(host,profile)
+          (cs_public0_nfq_rcvbuf_effective_bytes == on(host,profile) cs_public0_expected_rcvbuf_bytes)
+          and on(host,profile) ((cs_public0_gso_last_publish_unix_seconds <= time())
+          and on(host,profile) (time() - cs_public0_gso_last_publish_unix_seconds <= 45)))
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Required NFQUEUE receive buffer is not verified on {{ $labels.host }}'
+          description: 'Verify current socket identity, effective SO_RCVBUF and engine acknowledgement. A configured number alone is insufficient.'

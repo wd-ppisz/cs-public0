@@ -1,5 +1,8 @@
 # Optional NFQUEUE GSO profile
 
+For an independent socket-capacity option and runtime verification, see
+[NFQUEUE receive-buffer capacity](nfq-receive-buffer.md).
+
 The default remains non-activating. `cs_public0_nfq_gso: true` is intended only
 for an independently built and qualified engine implementing `nfq.gso` and the
 runtime acknowledgement described below. This setting does not install or patch

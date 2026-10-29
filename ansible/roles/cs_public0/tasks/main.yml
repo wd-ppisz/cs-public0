@@ -6,6 +6,9 @@
       - ansible_service_mgr == 'systemd'
       - cs_public0_enabled is boolean
       - cs_public0_nfq_gso is boolean
+      - cs_public0_nfq_rcvbuf_size is integer
+      - cs_public0_nfq_rcvbuf_size == 0 or (cs_public0_nfq_rcvbuf_size >= 1048576 and cs_public0_nfq_rcvbuf_size <= 67108864)
+      - cs_public0_nfq_rcvbuf_size == 0 or cs_public0_nfq_gso
       - not cs_public0_nfq_gso or cs_public0_nfq_gso_binary_sha256 is match('^[a-f0-9]{64}$')
       - cs_public0_bridge is match('^[A-Za-z_][A-Za-z0-9_.-]{0,14}$')
       - cs_public0_table is match('^[A-Za-z_][A-Za-z0-9_.-]{0,14}$')
