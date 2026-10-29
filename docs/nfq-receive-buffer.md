@@ -69,3 +69,28 @@ Scope end-to-end latency/retransmission probes to the connections and services
 they actually observe. An upload probe for one host does not qualify all
 clients or other hosts. Copy correctness, inspection completeness and
 forwarding availability remain separate checks.
+
+## Full packet queues can bypass inspection with zero Drops
+
+The socket receive buffer and the queue of packets awaiting verdicts must also be diagnosed separately when the socket has stopped losing messages. In the [Linux 6.17 NFQUEUE implementation](https://github.com/torvalds/linux/blob/v6.17/net/netfilter/nfnetlink_queue.c), a full packet queue with `NFQA_CFG_F_FAIL_OPEN` accepts the packet before assigning its NFQUEUE packet ID. That path does not increment `queue_dropped` or `queue_user_dropped`. Successful fail-open delivery can therefore leave kernel, user and socket Drops at zero while inspection is incomplete. This is different from a rule-driven DROP verdict.
+
+A bounded loopback experiment in a separate network namespace illustrates the distinction. The consumer deliberately held packets before issuing only `NF_ACCEPT` verdicts:
+
+| Same 32 small UDP datagrams | Queue limit 4 | Queue limit 64 |
+|---|---:|---:|
+| nft counter | 32 | 32 |
+| NFQUEUE IDs allocated | 4 | 32 |
+| Delivered to the owned backend before any verdict | 28 | 0 |
+| Delivered after draining the queue with ACCEPT | 32 | 32 |
+| Kernel/user/socket Drops | 0/0/0 | 0/0/0 |
+| nft minus allocated IDs after draining | 28 | 0 |
+
+Read-only kernel instrumentation, calibrated against these two cases, observed all 64 enqueue calls and exactly 28 executions of the full-queue fail-open branch before ID assignment. This establishes the mechanism in that isolated case; it does not classify an arbitrary production accounting gap or prove that all uninspected traffic followed that branch.
+
+A subsequent 60-second observation of natural traffic on one deployment directly observed 13 executions of the same branch with an effective queue limit and observed peak of 512 packets. Kernel, user and socket Drops remained zero. The separately instrumented pre-ID guard, message-allocation error and netlink-send error branches recorded no events in that window. This confirms that full-queue fail-open can occur in real traffic after socket-buffer loss has been addressed; it does not establish the cause of every historical gap or identify the worker scheduling, traffic burst or rule-processing cost that filled the queue. Instrumentation has processing overhead: this is not a capacity benchmark without probes. Exact instruction probes were tied to the inspected kernel module and calibrated first; those offsets are not portable diagnostics.
+
+The queue capacity is not the byte capacity reported by `SO_RCVBUF`. Suricata 8.0.7's NFQUEUE initialization passes `max-pending-packets * NFQ_BURST_FACTOR` to the queue length setter; the burst factor in that source is 4. Check the effective queue and the exact engine build instead of interpreting a configuration value as a kernel observation. A 16 MiB socket request cannot prevent a separate packet queue from filling.
+
+Keep history latched and compare queue pressure, enqueue-path fail-open, socket losses and the nft/ID bracket. A point-in-time pending value of zero does not exclude an earlier microburst. The accounting gap alone remains UNKNOWN: observation timing and packet transformations still need to be considered, and neither a gap nor a kernel packet count is an HTTP request count.
+
+Do not solve this by disabling fail-open on a production host. Increasing queue depth without a measured processing and latency budget can trade an inspection gap for memory use or forwarding delay. First reproduce the condition in an isolated fixture, then qualify any queue/worker/rule-cost change on a canary with service latency, retransmissions and an independent rollback.
