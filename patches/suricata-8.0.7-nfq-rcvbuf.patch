@@ -1,0 +1,59 @@
+--- a/src/source-nfq.c
++++ b/src/source-nfq.c
+@@ -157,6 +157,8 @@
+     NFQ_REPEAT_MODE,
+     NFQ_ROUTE_MODE,
+ } NFQMode;
++
++#include "source-nfq-rcvbuf.h"
+ 
+ #define NFQ_FLAG_FAIL_OPEN  (1 << 0)
+ #define NFQ_FLAG_GSO (1 << 1)
+@@ -171,6 +173,7 @@
+     uint32_t flags;
+     uint8_t batchcount;
+     uint32_t copy_range;
++    uint32_t rcvbuf_size;
+ } NFQCnf;
+ 
+ NFQCnf nfq_config;
+@@ -255,6 +258,12 @@
+ #else
+         FatalError("nfq.gso requires modern libnetfilter_queue and kernel headers");
+ #endif
++    }
++
++    const char *rcvbuf_text = NULL;
++    if (SCConfGet("nfq.rcvbuf-size", &rcvbuf_text) == 1 &&
++            NFQRcvbufParse(rcvbuf_text, &nfq_config.rcvbuf_size) != 0) {
++        FatalError("nfq.rcvbuf-size must be canonical decimal bytes between 1048576 and 67108864");
+     }
+ 
+     nfq_config.copy_range = 65535;
+@@ -724,12 +733,22 @@
+     }
+ #endif /* HAVE_NFQ_MAXLEN */
+ 
+-    /* set netlink buffer size to a decent value */
+-    nfnl_rcvbufsiz(nfq_nfnlh(q->h), queue_maxlen * 1500);
+-    SCLogInfo("setting nfnl bufsize to %" PRId32 "", queue_maxlen * 1500);
+-
+     q->nh = nfq_nfnlh(q->h);
+     q->fd = nfnl_fd(q->nh);
++    if (nfq_config.rcvbuf_size != 0) {
++        int effective = 0;
++        if (NFQRcvbufSet(q->fd, nfq_config.rcvbuf_size, &effective) != 0) {
++            SCLogError("NFQUEUE receive buffer requirement failed: requested=%u effective=%d",
++                    nfq_config.rcvbuf_size, effective);
++            return TM_ECODE_FAILED;
++        }
++        SCLogInfo("NFQUEUE receive buffer verified queue=%u requested=%u effective=%d",
++                (unsigned)q->queue_num, nfq_config.rcvbuf_size, effective);
++    } else {
++        /* Preserve upstream behaviour unless an explicit size was requested. */
++        nfnl_rcvbufsiz(q->nh, queue_maxlen * 1500);
++        SCLogInfo("setting nfnl bufsize to %" PRId32 "", queue_maxlen * 1500);
++    }
+     NFQMutexInit(q);
+ 
+     /* Set some netlink specific option on the socket to increase

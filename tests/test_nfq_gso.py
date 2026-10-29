@@ -18,6 +18,48 @@ gso, forwarding = module("nfq_gso"), module("forwarding_probe")
 
 
 class GSOTests(unittest.TestCase):
+    def test_socket_buffer_selects_exact_netfilter_port(self):
+        raw = ("UNCONN 0 0 0:123 * skmem:(r0,rb999,t0)\n"
+               "UNCONN 0 0 12:123 * sk=0 skmem:(r0,rb33554432,t0)\n"
+               "UNCONN 0 0 12:1234 * skmem:(r0,rb888,t0)\n")
+        self.assertEqual(gso.socket_rcvbuf(raw, 123), 33554432)
+        for bad in ("", raw + raw, raw.replace("rb33554432", "rb0"),
+                    raw.replace("rb33554432", "rb999999999999")):
+            with self.assertRaises(RuntimeError): gso.socket_rcvbuf(bad, 123)
+
+    def test_buffer_requires_explicit_bound_setting_ack_and_effective_capacity(self):
+        argv = ["suricata", "--set", "nfq.rcvbuf-size=16777216"]
+        ack = "Info: NFQUEUE receive buffer verified queue=32201 requested=16777216 effective=33554432\n"
+        diag = "UNCONN 0 0 12:123 * skmem:(r0,rb33554432,t0)\n"
+        with patch.object(gso, "socket_identity", side_effect=["77", "77"]), \
+             patch.object(gso, "command", side_effect=[diag, ack]):
+            self.assertEqual(gso.verify_rcvbuf(None, argv, "test.service", "a" * 32, 32201, 123, 16777216), 33554432)
+        for fault in ("clamp", "ack", "socket", "duplicate", "setting", "boolean"):
+            bad_argv = argv + ["--set", "nfq.rcvbuf-size=16777216"] if fault == "duplicate" else argv
+            if fault == "setting": bad_argv = ["suricata", "nfq.rcvbuf-size=16777216"]
+            with self.subTest(fault=fault), \
+                 patch.object(gso, "socket_identity", side_effect=["77", "88" if fault == "socket" else "77"]), \
+                 patch.object(gso, "command", side_effect=[diag.replace("33554432", "1536000") if fault == "clamp" else diag,
+                                                         ack.replace("32201", "32202") if fault == "ack" else ack]):
+                with self.assertRaises(RuntimeError):
+                    gso.verify_rcvbuf(None, bad_argv, "test.service", "a" * 32, 32201, 123,
+                                      True if fault == "boolean" else 16777216)
+
+    def test_socket_inode_requires_bound_process_fd_and_unique_netlink_row(self):
+        process = SimpleNamespace(__truediv__=lambda *a: None)
+        class Process:
+            def __truediv__(self, part):
+                self.assert_part = part
+                return SimpleNamespace(iterdir=lambda: ["/proc/123/fd/4"])
+        row = "0000 12 123 0 0 0 0 2 0 77\n"
+        for raw, target, success in ((row, "socket:[77]", True), (row, "socket:[88]", False),
+                                     (row + row, "socket:[77]", False), (row.replace("12", "11", 1), "socket:[77]", False)):
+            with patch.object(gso, "Path", return_value=SimpleNamespace(read_text=lambda: raw)), \
+                 patch.object(gso.os, "readlink", return_value=target):
+                if success: self.assertEqual(gso.socket_identity(Process(), 123), "77")
+                else:
+                    with self.assertRaises(RuntimeError): gso.socket_identity(Process(), 123)
+
     def test_requires_one_explicit_unoverridden_cli_setting(self):
         self.assertTrue(gso.explicit_gso(["suricata", "--set", "nfq.gso=yes"]))
         for argv in (["suricata"], ["suricata", "nfq.gso=yes"],
