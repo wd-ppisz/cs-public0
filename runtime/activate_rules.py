@@ -77,13 +77,22 @@ def parse_plan(raw):
             "candidate_rules", "candidate_gzip", "candidate_rules_sha256", "candidate_gzip_sha256",
             "expected_old", "cfg", "binding", "unit", "selector_sha256", "qualification_settings",
             "startup_check"}
-    require(isinstance(p, dict) and set(p) in (keys, keys | {"drop_sids"}) and p["schema"] == SCHEMA,
+    require(isinstance(p, dict) and keys <= set(p) <= keys | {"drop_sids", "accepted_degradation"}
+            and p["schema"] == SCHEMA,
             "invalid activation plan")
     if "drop_sids" in p:
         sids = p["drop_sids"]
         require(isinstance(sids, list) and len(sids) <= 128
                 and all(type(s) is int and 1 <= s <= 4294967295 for s in sids)
                 and sids == sorted(set(sids)), "invalid explicit DROP policy")
+    if "accepted_degradation" in p:
+        policy = p["accepted_degradation"]
+        require(p.get("drop_sids") and isinstance(policy, dict)
+                and set(policy) == {"reference", "sha256", "allow_existing_accounting_gap"}
+                and pin(policy["sha256"]) and type(policy["allow_existing_accounting_gap"]) is bool,
+                "explicit selected-DROP degradation policy required")
+        require(absolute(policy["reference"]) == Path(p["store"]) / "accepted-monitor-state.json",
+                "accepted history must be a separate pinned transaction snapshot")
     require(pin(p["nonce"]) and pin(p["selector_sha256"]), "explicit nonce/selector pin required")
     for key in ("target", "store", "candidate"):
         absolute(p[key])
@@ -180,14 +189,52 @@ def exact_selector(document, cfg):
     return runtime.exact_table(normalized, cfg)
 
 
-def monitor_health(path, binding):
+def accepted_history(state, binding, policy):
+    """Accept a recorded degraded baseline without clearing or calling it healthy."""
+    raw = read_path(policy["reference"], 65536)
+    require(sha(raw) == policy["sha256"], "accepted history snapshot changed")
+    prior = json.loads(raw, object_pairs_hook=unique)
+    accounting, old = state["kernel_accounting"], prior["kernel_accounting"]
+    expected = {"pid": binding["pid"], "start_ticks": binding["start_ticks"]}
+    require(prior.get("sensor") == state.get("sensor") == expected
+            and prior.get("current_sample_valid") is True
+            and prior.get("latched") is True and state.get("latched") is True,
+            "accepted degradation sensor or latch differs")
+    finished = old["sample"]["finished_ns"]
+    require(type(finished) is int and 0 <= time.monotonic_ns() - finished <= 900_000_000_000
+            and old["sample"]["boot_id"] == binding["boot_id"], "accepted history expired or foreign")
+    for key in ("gap_history_latched", "observation_gap_history_latched"):
+        require(type(old.get(key, False)) is bool and accounting.get(key, False) is old.get(key, False),
+                "new accounting history condition")
+    require(state.get("reasons") == prior.get("reasons") == []
+            and isinstance(prior.get("counters"), dict) and prior["counters"]
+            and all(type(v) is int and v >= 0 for v in prior["counters"].values())
+            and isinstance(state.get("counters"), dict)
+            and all(type(v) is int and v >= 0 for v in state["counters"].values())
+            and state.get("counters") == prior["counters"], "new loss condition or critical counter change")
+    require(all(old["sample"]["after"][k] == accounting["sample"]["after"][k]
+                for k in ("portid", "inode")), "accepted history socket changed")
+    for key in ("degradation_acknowledgements", "gap_acknowledgements"):
+        require(state.get(key, []) == prior.get(key, []), "history acknowledgement changed")
+    require(type(old["unexplained_gap"]) is int and old["unexplained_gap"] >= 0
+            and type(accounting["unexplained_gap"]) is int and accounting["unexplained_gap"] >= 0,
+            "unknown accounting gap")
+    require((policy["allow_existing_accounting_gap"] is True and old["unexplained_gap"] > 0)
+            or accounting["unexplained_gap"] == 0, "new accounting gap")
+
+
+def monitor_health(path, binding, policy=None):
     state = json.loads(read_path(path, 65536), object_pairs_hook=unique)
-    require(state.get("latched") is False and state.get("current_sample_valid") is True,
+    require(state.get("current_sample_valid") is True,
             "monitor is degraded or current observation is incomplete")
     accounting = state["kernel_accounting"]
-    require(type(accounting["unexplained_gap"]) is int and accounting["unexplained_gap"] == 0
-            and accounting["gap_history_latched"] is False
-            and accounting.get("observation_gap_history_latched", False) is False, "unresolved monitor history")
+    if policy is None:
+        require(state.get("latched") is False, "monitor is degraded or current observation is incomplete")
+        require(type(accounting["unexplained_gap"]) is int and accounting["unexplained_gap"] == 0
+                and accounting["gap_history_latched"] is False
+                and accounting.get("observation_gap_history_latched", False) is False, "unresolved monitor history")
+    else:
+        accepted_history(state, binding, policy)
     sample = accounting["sample"]
     finished = sample["finished_ns"]
     require(type(finished) is int and 0 <= time.monotonic_ns() - finished <= HEALTH_AGE_NS
@@ -196,7 +243,9 @@ def monitor_health(path, binding):
             and state["sensor"]["start_ticks"] == binding["start_ticks"], "foreign monitor sensor")
     return {"finished_ns": finished, "sequence": state.get("sequence"),
             "socket": [sample["after"]["portid"], sample["after"]["inode"]],
-            "gap": 0, "degraded": False}
+            "gap": accounting["unexplained_gap"], "degraded": policy is not None,
+            **({"accepted_history_sha256": policy["sha256"],
+                "qualification": "OBSERVED_WITH_ACCEPTED_DEGRADATION_NOT_HEALTHY"} if policy else {})}
 
 
 def effective_settings(plan):
@@ -246,10 +295,14 @@ def monitor_ready_after(plan, completed):
     """Wait for a whole new observation; kernel-only samples remain UNKNOWN."""
     state = json.loads(read_path(plan["cfg"]["monitor_state"], 65536), object_pairs_hook=unique)
     accounting = state.get("kernel_accounting", {})
-    require(state.get("latched") is False
-            and accounting.get("gap_history_latched") is False
-            and accounting.get("observation_gap_history_latched", False) is False,
-            "post-reload monitor has unresolved degradation or history")
+    if "accepted_degradation" in plan:
+        if state.get("current_sample_valid") is True:
+            accepted_history(state, plan["binding"], plan["accepted_degradation"])
+    else:
+        require(state.get("latched") is False
+                and accounting.get("gap_history_latched") is False
+                and accounting.get("observation_gap_history_latched", False) is False,
+                "post-reload monitor has unresolved degradation or history")
     sensor, sample = state.get("sensor", {}), accounting.get("sample", {})
     require(sensor.get("pid") == plan["binding"]["pid"]
             and sensor.get("start_ticks") == plan["binding"]["start_ticks"]
@@ -286,7 +339,7 @@ def probe(plan):
             and all(q[k] == 0 for q in (before, after)
                     for k in ("kernel_dropped", "user_dropped", "netlink_dropped")),
             "queue loss or socket replacement")
-    health = monitor_health(cfg["monitor_state"], binding)
+    health = monitor_health(cfg["monitor_state"], binding, plan.get("accepted_degradation"))
     require(health["socket"] == [after["portid"], after["inode"]], "monitor queue socket differs")
     require(time.monotonic_ns() - started <= PROBE_LIMIT_NS, "control-plane probe exceeded one second")
     return {"queue": after, "packets": counter[0]["packets"], "health": health,
@@ -406,7 +459,8 @@ def activate(plan, raw_plan, check_only=False):
         delta = (after["queue"]["id_sequence"] - second["queue"]["id_sequence"]) % (1 << 32)
         require(0 < delta < (1 << 31), "no unambiguous NFQUEUE sequence progress")
         require(verify_release(target / "release.json") == new, "new release changed after reload")
-        result.update(phase="ACTIVATED", after=after, finished_ns=time.monotonic_ns())
+        result.update(phase="ACTIVATED_WITH_ACCEPTED_DEGRADATION" if "accepted_degradation" in plan
+                      else "ACTIVATED", after=after, finished_ns=time.monotonic_ns())
         write_file(store_fd, "result-" + transaction + ".json", encoded(result))
         return result
 
