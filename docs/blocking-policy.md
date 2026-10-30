@@ -25,6 +25,38 @@ not a blanket conversion of severity levels, rule categories, scan alerts or IP 
    never silently clear degraded history or retry an unknown reload result.
 
 No default SIDs are supplied: operators must assess their own services and signature content.
+
+### Explicit degraded-baseline operation
+
+The default activation path requires healthy monitoring and resolved history. An
+operator who deliberately keeps an existing degraded installation in service can
+instead supply an `accepted_degradation` object in a selected-DROP plan. It names
+`<store>/accepted-monitor-state.json`, its exact `sha256`, and the boolean
+`allow_existing_accounting_gap`. The snapshot must be a root-owned, immutable
+transaction input from the same sensor/boot, no older than 15 minutes.
+
+This option requires a latched baseline with a valid current observation and no
+current loss reasons. Critical loss counters, history flags and acknowledgement
+lists must remain unchanged. An ongoing accounting gap is allowed only when it
+already existed in the snapshot and was explicitly accepted; its magnitude can
+change and remains unqualified. A baseline with zero gap must retain zero gap.
+The ordinary fresh process, GSO/effective argument, exact source, queue/socket
+zero-loss and post-reload progress checks still apply. No latch, counter, alarm
+or acknowledgement is reset. The result is
+`ACTIVATED_WITH_ACCEPTED_DEGRADATION`, never a healthy-inspection qualification.
+This does not solve the known fail-open queue limitation or qualify capacity.
+
+For existing installations, `runtime/rule_policy_refresh.py` can replace the
+verifier, monitor and release metadata through a separate, exact three-image
+plan after staging the new controller in a new root-owned directory. The plan
+pins the old/new bytes and metadata, sensor identity, preserved rule/configuration
+files and the GSO/buffer guard command. Run `apply` in a bounded systemd unit
+with `recover` as `ExecStopPost`. All original images are saved before the first
+write; an incomplete transaction restores only matching owned images. A committed
+refresh leaves the running sensor and rules unchanged. Monitoring history must
+remain byte-identical while its timer is paused. Rule activation, qualification
+and the explicit degraded-baseline snapshot remain separate operations.
+
 Blocking matches only traffic visible to Suricata; encrypted application content needs a separate
 TLS visibility design. Availability exception policies and NFQUEUE bypass remain separate from
 the chosen rule actions. Review every rule-feed update; selected SIDs do not attest to unchanged

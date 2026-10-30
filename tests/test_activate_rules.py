@@ -319,6 +319,72 @@ class ActivationTests(unittest.TestCase):
                     activation.qualify(plan, d / "candidate.rules", d)
                 self.assertIn(b"2 rules", (d / "stdout.log").read_bytes())
 
+    def degraded_fixture(self, gap=57):
+        state = {"latched": True, "current_sample_valid": True, "reasons": [],
+            "sensor": {"pid": 123, "start_ticks": 456}, "counters": {"flow.memcap": 0},
+            "gap_acknowledgements": [{"old": "preserved"}], "degradation_acknowledgements": [],
+            "kernel_accounting": {"unexplained_gap": gap, "gap_history_peak": gap,
+                "gap_history_latched": gap > 0, "observation_gap_history_latched": False,
+                "sample": {"boot_id": self.binding["boot_id"], "finished_ns": time.monotonic_ns(),
+                           "after": {"portid": 123, "inode": 77}}}}
+        path = self.store / "accepted-monitor-state.json"
+        raw = release.json_bytes(state); path.write_bytes(raw)
+        policy = {"reference": str(path), "sha256": release.sha(raw),
+                  "allow_existing_accounting_gap": gap > 0}
+        live = self.root / "live-monitor.json"; live.write_bytes(raw)
+        return state, live, policy
+
+    def test_explicit_degraded_baseline_keeps_gap_history_and_never_claims_health(self):
+        state, live, policy = self.degraded_fixture()
+        before = live.read_bytes()
+        with self.assertRaises(RuntimeError):
+            activation.monitor_health(live, self.binding)
+        state["kernel_accounting"]["unexplained_gap"] += 3
+        live.write_bytes(release.json_bytes(state)); observed = live.read_bytes()
+        result = activation.monitor_health(live, self.binding, policy)
+        self.assertTrue(result["degraded"])
+        self.assertEqual(result["gap"], 60)
+        self.assertEqual(result["qualification"], "OBSERVED_WITH_ACCEPTED_DEGRADATION_NOT_HEALTHY")
+        self.assertEqual(live.read_bytes(), observed)
+        self.assertEqual(Path(policy["reference"]).read_bytes(), before)
+
+    def test_degraded_operation_rejects_new_loss_epoch_ack_or_missing_current_sample(self):
+        state, live, policy = self.degraded_fixture()
+        mutations = [lambda s: s["counters"].update({"flow.memcap": 1}),
+            lambda s: s.update(reasons=["new loss"]), lambda s: s.update(current_sample_valid=False),
+            lambda s: s["sensor"].update(start_ticks=457),
+            lambda s: s["gap_acknowledgements"].append({"new": "ack"}),
+            lambda s: s["kernel_accounting"].update(observation_gap_history_latched=True)]
+        for mutate in mutations:
+            bad = json.loads(json.dumps(state)); mutate(bad)
+            raw = release.json_bytes(bad); live.write_bytes(raw)
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                activation.monitor_health(live, self.binding, policy)
+            self.assertEqual(live.read_bytes(), raw)
+
+    def test_zero_baseline_cannot_accept_new_gap_and_snapshot_is_pinned_and_expires(self):
+        state, live, policy = self.degraded_fixture(0)
+        state["kernel_accounting"]["unexplained_gap"] = 1
+        live.write_bytes(release.json_bytes(state))
+        with self.assertRaisesRegex(RuntimeError, "new accounting gap"):
+            activation.monitor_health(live, self.binding, policy)
+        policy["sha256"] = "a" * 64
+        with self.assertRaisesRegex(RuntimeError, "snapshot changed"):
+            activation.monitor_health(live, self.binding, policy)
+        raw = Path(policy["reference"]).read_bytes(); policy["sha256"] = release.sha(raw)
+        with patch.object(activation.time, "monotonic_ns", return_value=time.monotonic_ns()+901_000_000_000):
+            with self.assertRaisesRegex(RuntimeError, "expired"):
+                activation.monitor_health(live, self.binding, policy)
+
+    def test_degraded_plan_requires_nonempty_selection_canonical_transaction_reference_and_bool(self):
+        _, _, policy = self.degraded_fixture()
+        plan = {**self.plan, "drop_sids": [9100011], "accepted_degradation": policy}
+        self.assertEqual(activation.parse_plan(release.json_bytes(plan)), plan)
+        for change in [{"drop_sids": []}, {"accepted_degradation": {**policy, "allow_existing_accounting_gap": 1}},
+                       {"accepted_degradation": {**policy, "reference": self.plan["cfg"]["monitor_state"]}}]:
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                activation.parse_plan(release.json_bytes({**plan, **change}))
+
     def test_selector_pin_excludes_only_counter_values_not_rule_or_handles(self):
         doc = {"nftables": [{"metainfo": {"version": "fixture"}},
             {"counter": {"name": "queued", "handle": 2, "packets": 10, "bytes": 100}},
