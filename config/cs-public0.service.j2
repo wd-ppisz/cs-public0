@@ -7,16 +7,16 @@ Conflicts=suricata.service
 [Service]
 Type=simple
 ExecStartPre=/usr/local/libexec/cs-public0 check
-ExecStart={{ cs_public0_binary }} -c /etc/cs-public0/suricata.yaml -l {{ cs_public0_log_dir }} --runmode=workers --init-errors-fatal -q {{ cs_public0_queue }}{% if cs_public0_nfq_gso %} --set nfq.gso=yes{% endif %}{% if cs_public0_nfq_rcvbuf_size | int > 0 %} --set nfq.rcvbuf-size={{ cs_public0_nfq_rcvbuf_size }}{% endif %}
+ExecStart={{ cs_public0_binary }} -c /etc/cs-public0/suricata.yaml -l {{ cs_public0_log_dir }} --runmode=workers --init-errors-fatal -q {{ cs_public0_queue }} --set stream.inline=yes{% if cs_public0_nfq_gso %} --set nfq.gso=yes{% endif %}{% if cs_public0_nfq_rcvbuf_size | int > 0 %} --set nfq.rcvbuf-size={{ cs_public0_nfq_rcvbuf_size }}{% endif %}
 
 {% if cs_public0_nfq_gso %}
-ExecStartPost=/usr/local/libexec/cs-public0-gso --unit cs-public0.service --binary-sha256 {{ cs_public0_nfq_gso_binary_sha256 }} --queue {{ cs_public0_queue }} --host %H --rcvbuf-size {{ cs_public0_nfq_rcvbuf_size }} --require --wait-seconds 90
+ExecStartPost=/usr/local/libexec/cs-public0-gso --unit cs-public0.service --binary-sha256 {{ cs_public0_nfq_gso_binary_sha256 }} --queue {{ cs_public0_queue }} --host %H --rcvbuf-size {{ cs_public0_nfq_rcvbuf_size }} --require --wait-seconds 240
 {% endif %}
 ExecStartPost=/usr/local/libexec/cs-public0 arm
 ExecStopPost=/usr/local/libexec/cs-public0 disarm
 Restart=on-failure
 RestartSec=2s
-TimeoutStartSec=480s
+TimeoutStartSec=780s
 TimeoutStopSec=20s
 KillMode=control-group
 MemoryMax={{ cs_public0_memory_max }}

@@ -88,9 +88,29 @@ class Templates(unittest.TestCase):
         self.assertNotIn('-s', argv)
         self.assertIn('--simulate-ips', argv)
         self.assertIn('unix-command.enabled=no', argv)
+        self.assertIn('--set stream.inline=yes', start)
+        self.assertTrue(any(a == '--set' and b == 'stream.inline=yes' for a, b in zip(argv, argv[1:])))
         profile = yaml.safe_load(environment().get_template('suricata.yaml.j2').render(defaults()))
         self.assertEqual(profile['default-rule-path'], defaults()['cs_public0_rules_dir'])
         self.assertEqual(profile['rule-files'], ['local.rules'])
+
+    def test_buffer_gate_precedes_selector_and_monitor_uses_same_request(self):
+        settings = {**defaults(), 'cs_public0_nfq_gso': True,
+                    'cs_public0_nfq_rcvbuf_size': 16777216,
+                    'cs_public0_nfq_gso_binary_sha256': 'a' * 64}
+        service = environment().get_template('cs-public0.service.j2').render(settings)
+        gate = next(line for line in service.splitlines() if line.startswith('ExecStartPost=')
+                    and '--require' in line)
+        arm = 'ExecStartPost=/usr/local/libexec/cs-public0 arm'
+        self.assertLess(service.index(gate), service.index(arm))
+        self.assertIn('--rcvbuf-size 16777216 --require', gate)
+        start = next(line for line in service.splitlines() if line.startswith('ExecStart='))
+        self.assertIn('--set nfq.rcvbuf-size=16777216', start)
+        monitor = environment().get_template('cs-public0-monitor.service.j2').render(settings)
+        self.assertIn('--rcvbuf-size 16777216 --metrics-file ', monitor)
+        passive = environment().get_template('cs-public0.service.j2').render(defaults())
+        self.assertNotIn('--set nfq.rcvbuf-size=', passive)
+        self.assertNotIn('--require', passive)
 
     def test_passive_install_default_and_example(self):
         self.assertIs(defaults()['cs_public0_enabled'], False)

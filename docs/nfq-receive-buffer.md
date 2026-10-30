@@ -37,6 +37,14 @@ The example therefore requires 32 MiB effective. The patch uses `SO_RCVBUF`,
 not `SO_RCVBUFFORCE`, refuses a clamped/unreadable result and changes no sysctl.
 Its startup log includes queue, requested bytes and `getsockopt` effective bytes.
 
+Before enabling the setting, read `sysctl net.core.rmem_max` on the canary.
+The host limit must be at least the requested value: 16777216 for the example,
+not the doubled effective value. A smaller limit makes startup fail before the
+selector is armed. If a host-wide change is needed, approve and manage it through
+your host IaC policy, then read it back; the installation role does not raise it
+automatically. Keep the receive-buffer feature disabled until that prerequisite
+is met. Do not use a successful YAML render as evidence of kernel capacity.
+
 The observer checks the exact engine hash and non-overridden CLI argument,
 service invocation/start ticks, owned socket inode, matching `ss` diagnostic
 and current-invocation engine acknowledgement. The selector is armed only

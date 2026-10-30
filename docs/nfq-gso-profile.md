@@ -43,3 +43,32 @@ probe per minute with a 20-second service limit. There is no catch-up loop.
 
 See [performance pitfalls](performance-pitfalls.md) for the incident evidence,
 metric scope and acceptance procedure.
+
+The production unit waits up to 240 seconds for the GSO acknowledgement, matching
+the sensor readiness budget. Its 780-second systemd startup budget includes
+configuration validation (180 seconds), the GSO gate (240 seconds), readiness
+(240 seconds), and a 120-second allowance for other startup work and the final
+observation. Local file I/O is still subject to the overall systemd timeout;
+this arithmetic is not a measured startup or capacity guarantee. Site-specific
+canary migrations may keep a shorter explicit gate to fit their independent
+rollback window; this change does not extend those leases automatically.
+
+The startup acknowledgement is evidence retained by journald, scoped to the
+current systemd invocation. A journal vacuum, rotation, or volatile-journal loss
+can remove it while the sensor keeps running. The observer then deliberately
+reports UNKNOWN (known=0, with an acknowledgement error), because command-line
+settings alone cannot establish that the kernel accepted GSO. The buffer gate
+also requires its invocation acknowledgement as well as the current effective
+socket capacity. UNKNOWN means missing verification evidence; it does not prove
+GSO was disabled or that forwarding failed. Keep the alert actionable as a
+monitoring-evidence problem. Do not automatically restart a healthy sensor,
+clear history, or turn UNKNOWN into a known/enabled result to silence it.
+Investigate journal retention and use a separately reviewed maintenance window
+if renewed initialization evidence is necessary. A durable attestation cache is
+not implemented by this observer; introducing one needs its own integrity and
+process/socket-reuse tests.
+
+Executable hashing uses 1 MiB reads instead of retaining the complete binary.
+The observer still hashes each observation and rechecks process and socket
+identity; this is a memory bound on the hash buffer, not a CPU, disk-I/O, total
+cgroup memory, or startup-time qualification.

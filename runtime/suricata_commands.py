@@ -206,7 +206,13 @@ def reload_time(message):
             and set(message[0]) == {"id", "last_reload"} and type(message[0]["id"]) is int
             and message[0]["id"] == 0 and isinstance(message[0]["last_reload"], str),
             "invalid reload time schema")
-    value = datetime.datetime.fromisoformat(message[0]["last_reload"])
+    raw = message[0]["last_reload"]
+    # Python 3.10 accepts extended offsets; Suricata emits the basic +HHMM form.
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    if len(raw) >= 5 and raw[-5] in "+-" and raw[-4:].isascii() and raw[-4:].isdigit():
+        raw = raw[:-2] + ":" + raw[-2:]
+    value = datetime.datetime.fromisoformat(raw)
     require(value.tzinfo is not None, "reload timestamp requires timezone")
     return value
 
