@@ -23,7 +23,15 @@ KillMode=control-group and a root execution identity. ExecStart must invoke
 /usr/bin/python3 -B HELPER apply --file PLAN --sha256 PLAN_SHA.
 ExecStopPost must invoke the same command with phase rollback. The helper checks
 these effective manager properties, its invocation and PID before writing.
-Set TimeoutStopSec=120s and MemoryMax=128M; retain the complete manager output.
+Set TimeoutStopSec=120s and a measured, bounded MemoryMax; retain the complete
+manager output. Use 512M as an example budget for the existing packaged verifier,
+with at least 2 GiB MemAvailable checked immediately before this operation.
+An observed refresh reached 168.5 MiB in its own unit; 128M was insufficient and
+stopped an earlier attempt before APPLYING or any target/monitor changes.
+Unit peak includes helper, children and charged memory; a warm read-only verifier
+sample can be much smaller and does not establish the cold-cache requirement.
+These are updater limits, separate from the running sensor's resource limits,
+and are not general capacity or reserved-memory claims. Measure each profile.
 The helper verifies the effective 120-second recovery budget. Its bounded lock
 wait plus three command timeouts use up to 70 seconds before filesystem overhead.
 
