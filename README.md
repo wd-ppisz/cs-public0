@@ -1,9 +1,11 @@
 # cs-public0
 
-> **Inline activation on hold (2026-10-28):** a multi-host deployment exhibited
-> substantial TLS/HTTP latency despite zero observed NFQUEUE drops. See the
-> [inline latency advisory](docs/inline-latency-advisory.md). Do not enable inline
-> on production hosts until a packet-path fix is qualified.
+> **Version 1.0 — known security limitation:** queue pressure can cause fail-open
+> forwarding without inspection, including cases with zero exported Drops.
+> A larger netlink receive buffer does not solve packet-queue saturation.
+> Read [Known vulnerabilities and limitations](#known-vulnerabilities-and-limitations)
+> before activation. Version 1.0 is a versioned baseline, not a universal capacity
+> or loss-free inspection certification.
 
 Read [performance pitfalls](docs/performance-pitfalls.md) for lessons from the
 incident, including GSO, checksum metadata, retransmission monitoring and controlled
@@ -17,7 +19,8 @@ CloudStack APIs, credentials or agents.
 
 The default profile accepts **alert-only** signatures and rejects `bypass` options.
 The included signature is a connectivity example, not a threat feed. Operators supply and review their own
-rulesets. This project does not install or redistribute the Suricata engine.
+rulesets. The default installer requires a separately supplied Suricata engine;
+the optional [pinned engine build](docs/nfq-engine-build.md) has a separate GPL license.
 Threshold and rate-filter overrides are disabled with an explicit empty source
 (`threshold-file: /dev/null`).
 
@@ -89,6 +92,33 @@ a clear degraded latch do not prove complete inspection. See the
 An alert-only ruleset does not guarantee zero packet loss: parser behavior, kernel
 resources and software faults are independent of signature actions. TLS payloads
 remain encrypted. No universal throughput or latency guarantee is implied.
+
+## Known vulnerabilities and limitations
+
+**Unresolved inspection bypass under NFQUEUE pressure affects version 1.0.**
+With fail-open enabled, a full packet queue can accept packets without sending
+them through Suricata. This can happen before an NFQUEUE packet ID is assigned
+and without incrementing the queue kernel/user drop counters. Separately, a full
+netlink receive buffer can lose delivery messages. Neither an alert-only ruleset,
+low average CPU nor zero current Drops proves complete inspection.
+
+The supported buffer option and observer improve delivery headroom and visibility;
+they do not remove this security limitation. There is no verified universal safe
+traffic rate, no CVE identifier assigned by this project, and no claim that every
+observed accounting gap was caused by the same path. The detailed mechanism,
+bounded observations and diagnostic limits are in
+[NFQUEUE receive-buffer capacity](docs/nfq-receive-buffer.md).
+
+Keep fail-open semantics explicit, retain history and alert on queue/socket loss,
+unknown/stale telemetry, accounting gaps and service latency/retransmissions.
+Qualify each host class and representative load with independent management and
+rollback. Do not silently disable fail-open or increase queue depth as a purported
+fix: that can trade incomplete inspection for forwarding delay or outage.
+
+The [2026-10-28 latency incident](docs/inline-latency-advisory.md) additionally
+demonstrated why an arbitrary stock engine/offload combination must not be assumed
+safe. GSO operation requires a compatible, pinned and locally qualified engine.
+See [version 1.0 release notes](docs/releases/v1.0.0.md) and [SECURITY.md](SECURITY.md).
 
 ## Tests
 
