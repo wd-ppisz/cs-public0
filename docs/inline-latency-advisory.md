@@ -1,6 +1,9 @@
 # Inline latency advisory - 2026-10-28
 
-**Status: inline production activation is on hold. No packet-path fix has been qualified.**
+**Status: historical incident; arbitrary stock/offload combinations remain
+unqualified.** Version 1.0 includes an optional pinned GSO/copy profile that an
+operator can qualify for its own hosts. This does not establish safety for other
+engines/topologies or resolve the separate queue-pressure inspection limitation.
 
 A multi-host deployment using Suricata 8.0.7, NFQUEUE and an alert-only ruleset
 showed substantial TLS handshake and HTTP transfer latency. Internal checks reached
@@ -15,8 +18,12 @@ Withdrawing inline inspection on the desktop host immediately returned its HTTP
 probe to roughly 15-17 ms and TLS to about 8 ms. After withdrawing the other inline
 instances, application probes returned close to their earlier baseline.
 This identifies the deployed inline packet path as an operational cause.
-The exact code/kernel/offload mechanism remains under investigation. A checksum,
-GSO/GRO, TCP reassembly or verdict-path explanation has not been proven.
+The original observations alone did not prove a checksum, GSO/GRO, TCP reassembly
+or verdict-path mechanism. Subsequent controlled deployment of the compatible
+GSO/copy profile restored the operator-observed interactive service behaviour.
+That result is scoped to those hosts; see [the profile](nfq-gso-profile.md) and
+[performance pitfalls](performance-pitfalls.md). Inspection under queue pressure
+remains a separate open issue documented in [NFQUEUE capacity](nfq-receive-buffer.md).
 
 ## Operator action
 
