@@ -207,7 +207,7 @@ def effective_settings(plan):
     overrides, options = {}, {}
     wanted = {s.partition("=")[0] for s in plan["qualification_settings"]}
     safe = {"unix-command.enabled", "unix-command.filename", "nfq.fail-open", "nfq.batchcount",
-            "max-pending-packets", "stats.interval", "nfq.gso"}
+            "max-pending-packets", "stats.interval", "nfq.gso", "nfq.rcvbuf-size"}
     i = 1
     while i < len(args):
         arg = args[i]
@@ -217,6 +217,9 @@ def effective_settings(plan):
             require(sep and value and key in wanted | safe and key not in overrides,
                     "unsupported or ambiguous engine override")
             require(key != "nfq.gso" or value == "yes", "GSO override must be enabled")
+            if key == "nfq.rcvbuf-size":
+                require(re.fullmatch(r"[1-9][0-9]{6,7}", value) and
+                        1048576 <= int(value) <= 67108864, "invalid receive buffer override")
             overrides[key] = value
             i += 2
         elif arg in {"-c", "-q", "-l", "-S"}:

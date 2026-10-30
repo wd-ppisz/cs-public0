@@ -39,8 +39,17 @@
           - -c
           - |
             import json, runpy, subprocess
+            from pathlib import Path
             r = runpy.run_path('/usr/local/libexec/cs-public0', run_name='update_preflight')
             cfg = r['load_config']('/etc/cs-public0/config.json')
+            release = Path(cfg['rules_file']).parent / 'release.json'
+            if release.exists() or release.is_symlink():
+                raise SystemExit('installed rule release requires a separately reviewed immutable migration')
+            library = Path('/usr/local/libexec/cs-public0-lib')
+            for path in [library] + [library / name for name in
+                    ('cs_public0.py', 'rule_release.py', 'rule_update_journal.py')]:
+                if path.exists() or path.is_symlink():
+                    r['secure_path'](path, directory=path == library)
             for unit in (cfg['service'], 'cs-public0-monitor.timer'):
                 subprocess.run(['systemctl', 'is-active', '--quiet', unit], check=True)
             assert subprocess.check_output(['systemctl', 'is-enabled', 'cs-public0-monitor.timer'], text=True).strip() == 'enabled'
@@ -57,15 +66,28 @@
             state: stopped
           loop: [cs-public0-monitor.timer, cs-public0-monitor.service]
 
-        - name: Install the reviewed controller with Python syntax validation
-          ansible.builtin.copy:
-            src: ../runtime/cs_public0.py
-            dest: /usr/local/libexec/cs-public0
+        - name: Create the private runtime bundle before replacing the entry point
+          ansible.builtin.file:
+            path: /usr/local/libexec/cs-public0-lib
+            state: directory
             owner: root
             group: root
             mode: '0755'
+
+        - name: Install the reviewed controller with Python syntax validation
+          ansible.builtin.copy:
+            src: "../runtime/{{ item.source }}"
+            dest: "{{ item.target }}"
+            owner: root
+            group: root
+            mode: "{{ item.mode }}"
             validate: >-
               /usr/bin/python3 -c "import sys; compile(open(sys.argv[1], 'rb').read(), sys.argv[1], 'exec')" %s
+          loop:
+            - {source: cs_public0.py, target: /usr/local/libexec/cs-public0-lib/cs_public0.py, mode: '0644'}
+            - {source: rule_release.py, target: /usr/local/libexec/cs-public0-lib/rule_release.py, mode: '0644'}
+            - {source: rule_update_journal.py, target: /usr/local/libexec/cs-public0-lib/rule_update_journal.py, mode: '0644'}
+            - {source: cs_public0.py, target: /usr/local/libexec/cs-public0, mode: '0755'}
 
         - name: Publish the first observation with the updated monitor
           ansible.builtin.systemd_service:

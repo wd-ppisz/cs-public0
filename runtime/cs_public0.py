@@ -229,6 +229,24 @@ def validate_rules_bytes(raw, drop_sids=()):
     return count
 
 
+def release_verifier():
+    # The installed entry point has no .py suffix and lives outside the optional
+    # update controller. Keep its imports in its own root-owned runtime bundle.
+    installed = Path(__file__).name == "cs-public0"
+    before = list(sys.path)
+    try:
+        if installed:
+            library = Path(__file__).with_name("cs-public0-lib")
+            secure_path(library, directory=True)
+            for name in ("cs_public0.py", "rule_release.py", "rule_update_journal.py"):
+                secure_path(library / name)
+            sys.path.insert(0, str(library))
+        from rule_release import verify_release
+        return verify_release
+    finally:
+        sys.path[:] = before
+
+
 def validate_rules(cfg):
     path = secure_path(cfg["rules_file"])
     require(path.stat().st_size <= MAX_RULES_BYTES, "rules file too large")
@@ -238,8 +256,7 @@ def validate_rules(cfg):
     if release_path.exists() or release_path.is_symlink():
         # The explicit pinned release is the policy authority. Merely placing
         # DROP bytes beside the default configuration never enables blocking.
-        from rule_release import verify_release
-        release = verify_release(release_path)
+        release = release_verifier()(release_path)
         require(release["names"]["rules"] == configured_path.name, "release rule path differs")
         policy = release.get("drop_sids", ())
     with path.open("rb") as stream:

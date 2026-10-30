@@ -50,6 +50,7 @@
                     raise SystemExit('Unsafe existing directory: ' + str(path))
       - /etc/cs-public0
       - /usr/local/libexec
+      - /usr/local/libexec/cs-public0-lib
       - "{{ cs_public0_rules_dir }}"
       - "{{ cs_public0_runtime_dir }}"
       - "{{ cs_public0_state_dir }}"
@@ -159,6 +160,14 @@
   loop: "{{ cs_public0_shared_directories.results }}"
   when: not item.stat.exists
 
+- name: Create the private runtime library directory
+  ansible.builtin.file:
+    path: /usr/local/libexec/cs-public0-lib
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
 - name: Install the controller and local alert rules
   ansible.builtin.copy:
     src: "{{ item.src }}"
@@ -168,6 +177,9 @@
     mode: "{{ item.mode }}"
   loop:
     - {src: "{{ cs_public0_project_root }}/runtime/cs_public0.py", dest: /usr/local/libexec/cs-public0, mode: '0755'}
+    - {src: "{{ cs_public0_project_root }}/runtime/cs_public0.py", dest: /usr/local/libexec/cs-public0-lib/cs_public0.py, mode: '0644'}
+    - {src: "{{ cs_public0_project_root }}/runtime/rule_release.py", dest: /usr/local/libexec/cs-public0-lib/rule_release.py, mode: '0644'}
+    - {src: "{{ cs_public0_project_root }}/runtime/rule_update_journal.py", dest: /usr/local/libexec/cs-public0-lib/rule_update_journal.py, mode: '0644'}
     - {src: "{{ cs_public0_project_root }}/runtime/nfq_gso.py", dest: /usr/local/libexec/cs-public0-gso, mode: '0755'}
     - {src: "{{ cs_public0_rules_source }}", dest: "{{ cs_public0_rules_dir }}/local.rules", mode: '0640'}
 
@@ -218,6 +230,8 @@
       - --init-errors-fatal
       - --set
       - unix-command.enabled=no
+      - --set
+      - stream.inline=yes
   changed_when: false
   when: not ansible_check_mode
 

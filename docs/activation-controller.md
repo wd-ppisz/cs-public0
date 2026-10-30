@@ -17,9 +17,35 @@ an active controller or unresolved transaction.
 The startup verifier checks the exact rules, complete gzip expansion, counts,
 provider manifest and immutable files. Keep the engine binary, effective YAML,
 classification/reference/threshold files, startup verifier, unit/drop-in and all
-seven controller modules in the immutable map (at most 20 files). The policy is a
+seven controller modules in the immutable map (at most 32 files). The policy is a
 root-owned local source pin, not a signature or attestation. All three mutable
 rule files and `release.json` must be in the same protected directory.
+
+For an installed `cs-public0` entry point, include that file and its three
+`/usr/local/libexec/cs-public0-lib/` modules as well as the controller copies.
+If the immutable list includes the generated `public0-release.conf` drop-in,
+pre-stage its exact documented `[Service]`/`ExecStartPre` content through your
+host IaC during the maintenance window before enabling bootstrap. The playbook
+checks its root ownership, permissions and exact bytes before any writes.
+It refuses a missing or different pinned drop-in; it does not create a new
+startup dependency before the rule metadata has been initialized successfully.
+
+With the default paths, the exact content of
+`/etc/systemd/system/cs-public0.service.d/public0-release.conf` is:
+
+```ini
+[Service]
+ExecStartPre=/usr/bin/python3 /usr/local/libexec/cs-public0-update/rule_release.py verify --directory /etc/cs-public0/rules
+```
+
+Keep the final newline and adjust both paths if you override the playbook
+variables. Do not reload systemd or restart the sensor between staging this
+file and successfully bootstrapping the rule metadata.
+
+The lightweight `ansible/monitor.yml` update is for installations without
+`release.json`. Once a rule release exists, it refuses the update before stopping
+the monitor timer. Changes to a pinned installation need a separately reviewed
+immutable-source migration, including the entry point and runtime bundle.
 
 An activation plan is a bounded, root-owned JSON object with schema
 `cs-public0-activation-v1`. Its exact fields are checked by

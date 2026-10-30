@@ -238,5 +238,24 @@ class CommandTests(unittest.TestCase):
             control.reload_time([{"id": 0, "last_reload": "2026-10-24T12:00:00"}])
 
 
+class ReloadTimeCompatibilityTests(unittest.TestCase):
+    def test_basic_offsets_are_normalized_before_the_python310_parser(self):
+        actual_datetime = control.datetime.datetime
+        observed = []
+        class Python310Datetime(actual_datetime):
+            @classmethod
+            def fromisoformat(cls, value):
+                observed.append(value)
+                if value.endswith(('Z', '+0000', '+0530', '-0230')):
+                    raise ValueError('basic offsets unsupported before Python 3.11')
+                return actual_datetime.fromisoformat(value)
+        with patch.object(control.datetime, 'datetime', Python310Datetime):
+            for suffix, seconds in [('+0000', 0), ('+0530', 19800), ('-0230', -9000), ('Z', 0)]:
+                value = control.reload_time([{'id': 0, 'last_reload': '2026-10-30T12:00:00.000001' + suffix}])
+                self.assertEqual(value.utcoffset().total_seconds(), seconds)
+                self.assertEqual(value.microsecond, 1)
+        self.assertEqual([s[-6:] for s in observed], ['+00:00', '+05:30', '-02:30', '+00:00'])
+
+
 if __name__ == "__main__":
     unittest.main()

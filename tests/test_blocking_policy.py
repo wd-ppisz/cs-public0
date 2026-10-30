@@ -6,6 +6,9 @@ import unittest
 from unittest.mock import patch
 import tempfile
 import json
+import shutil
+import subprocess
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime"))
 from cs_public0 import validate_rules_bytes
@@ -102,6 +105,52 @@ class BlockingPolicyTests(unittest.TestCase):
                 else:
                     with self.assertRaises(RuntimeError):
                         activation.effective_settings(plan)
+
+    def test_installed_helper_resolves_its_complete_bundle_in_isolated_python(self):
+        root = Path(__file__).resolve().parents[1]
+        tasks = yaml.safe_load((root / 'ansible/roles/cs_public0/tasks/main.yml').read_text())
+        install = next(t for t in tasks if t['name'] == 'Install the controller and local alert rules')
+        expected = {'cs_public0.py', 'rule_release.py', 'rule_update_journal.py'}
+        bundled = {Path(row['dest']).name for row in install['loop']
+                   if row['dest'].startswith('/usr/local/libexec/cs-public0-lib/')}
+        self.assertEqual(bundled, expected)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            helper = base / 'cs-public0'
+            library = base / 'cs-public0-lib'
+            library.mkdir()
+            shutil.copyfile(root / 'runtime/cs_public0.py', helper)
+            for name in expected: shutil.copyfile(root / 'runtime' / name, library / name)
+            # Only ownership checks are replaced for this temporary test tree.
+            # Real modules must import from the installed bundle, with -I
+            # excluding the repository, current directory and PYTHONPATH.
+            code = ('import runpy,sys,pathlib,json; ns=runpy.run_path(sys.argv[1]); '
+                    'fn=ns["release_verifier"]; '
+                    'fn.__globals__["secure_path"]=lambda p,directory=False:pathlib.Path(p); '
+                    'fn(); print(json.dumps({n:sys.modules[n].__file__ for n in '
+                    '("cs_public0","rule_release","rule_update_journal")}))')
+            result = subprocess.run([sys.executable, '-I', '-B', '-c', code, str(helper)],
+                                    cwd=base, capture_output=True, text=True, check=True)
+            actual = json.loads(result.stdout)
+            self.assertEqual({Path(p).name for p in actual.values()}, expected)
+            self.assertTrue(all(Path(p).parent == library for p in actual.values()))
+
+    def test_activation_accepts_only_canonical_bounded_receive_buffer_override(self):
+        plan = {"binding": {"pid": 123, "cli_rule_file": False},
+                "cfg": {"binary": "/engine", "suricata_config": "/config.yaml", "queue": 32201},
+                "qualification_settings": ["stream.inline=yes"]}
+        args = ["/engine", "-c", "/config.yaml", "-q", "32201", "--set", "stream.inline=yes"]
+        for value in ("1048576", "16777216", "67108864", "0", "1048575", "67108865",
+                      "016777216", "+16777216", "16MiB", "True"):
+            accepted = value in ("1048576", "16777216", "67108864")
+            raw = ("\0".join(args + ["--set", "nfq.rcvbuf-size=" + value]) + "\0").encode()
+            with self.subTest(value=value), patch.object(activation, "bounded_read", return_value=raw):
+                if accepted: activation.effective_settings(plan)
+                else:
+                    with self.assertRaises(RuntimeError): activation.effective_settings(plan)
+        raw = ("\0".join(args + ["--set", "nfq.rcvbuf-size=16777216"] * 2) + "\0").encode()
+        with patch.object(activation, "bounded_read", return_value=raw), self.assertRaises(RuntimeError):
+            activation.effective_settings(plan)
 
 if __name__ == "__main__":
     unittest.main()

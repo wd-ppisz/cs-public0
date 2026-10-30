@@ -39,6 +39,34 @@
           - cs_public0_controller_rules_directory is match('^/etc/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$')
           - cs_public0_controller_journal is match('^/var/lib/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$')
 
+    - name: Verify an explicitly pinned generated drop-in before any writes
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import json, pathlib, stat, sys
+            path = pathlib.Path(sys.argv[1])
+            paths = json.loads(sys.argv[4])
+            if type(paths) is not list or any(type(p) is not str for p in paths):
+                raise SystemExit('immutable sources must be a list of paths')
+            if str(path) in paths:
+                expected = ('[Service]\nExecStartPre=/usr/bin/python3 ' + sys.argv[2] +
+                            '/rule_release.py verify --directory ' + sys.argv[3] + '\n').encode()
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    raise SystemExit('pre-stage the exact generated drop-in before pinning it')
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022
+                        or info.st_size > 16384 or path.read_bytes() != expected):
+                    raise SystemExit('pre-staged drop-in must be root-owned, safe and byte-identical')
+          - "/etc/systemd/system/{{ cs_public0_controller_service }}.d/public0-release.conf"
+          - "{{ cs_public0_controller_directory }}"
+          - "{{ cs_public0_controller_rules_directory }}"
+          - "{{ cs_public0_controller_immutable | to_json }}"
+      when: cs_public0_controller_bootstrap | bool
+      changed_when: false
+
     - name: Refuse an active controller or unresolved file transaction
       ansible.builtin.shell: |
         set -eu

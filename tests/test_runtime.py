@@ -274,7 +274,16 @@ class RuntimeTests(unittest.TestCase):
         timeout = int(next(line.split("=", 1)[1].rstrip("s")
                            for line in unit.splitlines() if line.startswith("TimeoutStartSec=")))
         self.assertGreaterEqual(runtime.SENSOR_READY_TIMEOUT_SECONDS, runtime.ENGINE_TEST_TIMEOUT_SECONDS)
-        self.assertLess(runtime.ENGINE_TEST_TIMEOUT_SECONDS + runtime.SENSOR_READY_TIMEOUT_SECONDS, timeout)
+        import importlib.util
+        import re
+        spec = importlib.util.spec_from_file_location("startup_gso", Path(__file__).parents[1] / "runtime/nfq_gso.py")
+        gso = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gso)
+        gate = int(re.search(r"--wait-seconds\s+(\d+)", unit).group(1))
+        self.assertEqual(gate, gso.MAX_WAIT_SECONDS)
+        self.assertGreaterEqual(gate, runtime.SENSOR_READY_TIMEOUT_SECONDS)
+        total = runtime.ENGINE_TEST_TIMEOUT_SECONDS + gate + runtime.SENSOR_READY_TIMEOUT_SECONDS
+        self.assertGreaterEqual(timeout - total, 60)
 
     def test_arm_allows_engine_initialization_longer_than_configuration_validation(self):
         with patch.object(runtime, "preflight"), \

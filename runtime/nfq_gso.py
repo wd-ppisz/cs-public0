@@ -16,6 +16,9 @@ import subprocess
 import time
 
 
+MAX_WAIT_SECONDS = 240
+
+
 def require(value, message):
     if not value:
         raise RuntimeError(message)
@@ -51,16 +54,33 @@ def socket_identity(process, portid):
     return inode
 
 
+def diagnostic_portid(portid):
+    # /proc keeps uint32; ss formats and filters this field as signed int32.
+    require(type(portid) is int and 0 < portid <= 4294967295, "invalid netlink port")
+    return portid - 4294967296 if portid >= 2147483648 else portid
+
+
 def socket_rcvbuf(raw, portid):
     # ss netlink diagnostics identifies the protocol and socket port ID. Bind it
     # to an owned inode via /proc before AND after this separate observation.
     rows = [line for line in raw.splitlines()
-            if len(line.split()) >= 6 and line.split()[3] == "12:" + str(portid)]
+            if len(line.split()) >= 6 and line.split()[3] == "12:" + str(diagnostic_portid(portid))]
     require(len(rows) == 1, "ambiguous socket buffer diagnostic")
     values = re.findall(r"\bskmem:\(r\d+,rb(\d+),", rows[0])
     require(len(values) == 1 and 0 < int(values[0]) <= 134217728,
             "unknown effective socket buffer")
     return int(values[0])
+
+
+def queue_socket_identity(process, queue):
+    rows = [line.split() for line in Path("/proc/net/netfilter/nfnetlink_queue").read_text().splitlines()
+            if line.split() and line.split()[0] == str(queue)]
+    require(len(rows) == 1 and len(rows[0]) == 9 and rows[0][1].isascii()
+            and rows[0][1].isdigit() and 0 < int(rows[0][1]) <= 4294967295,
+            "unknown or ambiguous NFQUEUE port")
+    portid = int(rows[0][1])
+    # Netlink port IDs identify sockets; they need not equal the owner's PID.
+    return portid, socket_identity(process, portid)
 
 
 def verify_rcvbuf(process, argv, unit, invocation, queue, portid, requested):
@@ -71,7 +91,8 @@ def verify_rcvbuf(process, argv, unit, invocation, queue, portid, requested):
             any(a == "--set" and b == setting for a, b in zip(argv, argv[1:])),
             "explicit receive buffer request is missing or overridden")
     inode = socket_identity(process, portid)
-    effective = socket_rcvbuf(command(["ss", "-a", "-n", "-m", "-e", "-f", "netlink"]), portid)
+    effective = socket_rcvbuf(command(["ss", "-a", "-n", "-m", "-e", "-f", "netlink",
+                                      "src", "12:" + str(diagnostic_portid(portid))]), portid)
     require(effective == requested * 2, "effective receive buffer differs from requirement")
     expected = ("NFQUEUE receive buffer verified queue=" + str(queue) + " requested=" +
                 str(requested) + " effective=" + str(effective))
@@ -82,6 +103,18 @@ def verify_rcvbuf(process, argv, unit, invocation, queue, portid, requested):
             "receive buffer acknowledgement is absent or differs")
     require(socket_identity(process, portid) == inode, "NFQUEUE socket changed")
     return effective
+
+
+def file_sha256(path):
+    # Bound additional Python memory independently of executable file size.
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def observe(unit, binary_sha256, queue, rcvbuf_size=0):
@@ -98,12 +131,9 @@ def observe(unit, binary_sha256, queue, rcvbuf_size=0):
         start = (process / "stat").read_bytes().rsplit(b")", 1)[1].split()[19]
         argv = (process / "cmdline").read_bytes().decode().rstrip("\0").split("\0")
         require(explicit_gso(argv), "explicit nfq.gso=yes is missing or overridden")
-        require(hashlib.sha256((process / "exe").read_bytes()).hexdigest() == binary_sha256,
+        require(file_sha256(process / "exe") == binary_sha256,
                 "unexpected engine binary")
-        rows = [line.split() for line in Path("/proc/net/netfilter/nfnetlink_queue").read_text().splitlines()
-                if line.split() and line.split()[0] == str(queue)]
-        require(len(rows) == 1 and len(rows[0]) == 9 and int(rows[0][1]) == pid,
-                "queue does not belong to the bound process")
+        queue_socket = queue_socket_identity(process, queue)
         acknowledgement = command(["journalctl", "--no-pager", "-o", "cat", "-n", "1",
                                    "-u", unit, "_SYSTEMD_INVOCATION_ID=" + invocation,
                                    "--grep=NFQUEUE GSO enabled"])
@@ -111,14 +141,12 @@ def observe(unit, binary_sha256, queue, rcvbuf_size=0):
                     for line in acknowledgement.splitlines()), "GSO acknowledgement is absent")
         effective = 0
         if rcvbuf_size:
-            effective = verify_rcvbuf(process, argv, unit, invocation, queue, pid, rcvbuf_size)
+            effective = verify_rcvbuf(process, argv, unit, invocation, queue, queue_socket[0], rcvbuf_size)
         require(unit_state(unit) == before and
                 (process / "stat").read_bytes().rsplit(b")", 1)[1].split()[19] == start,
                 "sensor invocation changed during observation")
-        after_rows = [line.split() for line in Path("/proc/net/netfilter/nfnetlink_queue").read_text().splitlines()
-                      if line.split() and line.split()[0] == str(queue)]
-        require(len(after_rows) == 1 and len(after_rows[0]) == 9 and int(after_rows[0][1]) == pid,
-                "queue owner changed during observation")
+        require(queue_socket_identity(process, queue) == queue_socket,
+                "queue socket changed during observation")
         value.update(known=True, enabled=True, pid=pid, invocation=invocation,
                      rcvbuf_known=bool(rcvbuf_size), rcvbuf_effective_bytes=effective)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
@@ -177,7 +205,7 @@ def main():
     require(os.geteuid() == 0, "root required")
     require(re.fullmatch(r"[a-zA-Z0-9_-]{1,80}\.service", args.unit), "invalid unit")
     require(re.fullmatch(r"[a-f0-9]{64}", args.binary_sha256), "explicit engine pin required")
-    require(0 <= args.queue <= 65535 and 0 <= args.wait_seconds <= 90, "invalid bound")
+    require(0 <= args.queue <= 65535 and 0 <= args.wait_seconds <= MAX_WAIT_SECONDS, "invalid bound")
     require(args.rcvbuf_size == 0 or 1048576 <= args.rcvbuf_size <= 67108864, "invalid buffer bound")
     deadline = time.monotonic() + args.wait_seconds
     while True:
