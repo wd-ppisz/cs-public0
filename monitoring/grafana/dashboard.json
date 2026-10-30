@@ -254,7 +254,7 @@
     },
     {
       "id": 8,
-      "title": "Queued packets per second",
+      "title": "Packets selected by nftables per second",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -280,7 +280,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Five-minute rate of the nftables packet counter for the configured queue selector. It measures packets selected at this hook, not completed Suricata inspection, wire throughput or unique connections."
+      "description": "Five-minute rate of packets selected at the nftables hook. Full-queue fail-open packets can increment this counter without receiving an NFQUEUE ID. This is not the number enqueued or completely inspected."
     },
     {
       "id": 9,
@@ -341,6 +341,68 @@
         "overrides": []
       },
       "options": {}
+    },
+    {
+      "id": 11,
+      "title": "Netlink socket drops per second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(rate(cs_public0_queue_netlink_dropped{instance=~\"$instance\"}[5m])) and on(instance,bridge,queue) ((time() - cs_public0_last_publish_unix_seconds{instance=~\"$instance\"}) >= 0) and on(instance,bridge,queue) ((time() - cs_public0_last_publish_unix_seconds{instance=~\"$instance\"}) < 120)",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown",
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Lost netlink messages for the monitored socket. Separate from kernel/user queue losses and rule-driven IPS drops. Zero cannot exclude full-queue fail-open. Missing or stale publications remain Unknown. Freshness is matched on instance, bridge and queue: runtime/cs_public0.py publish_metrics emits bridge and queue on every metric, including last_publish_unix_seconds; Prometheus supplies instance."
+    },
+    {
+      "id": 12,
+      "title": "Accounting gap: nft versus NFQUEUE IDs",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(cs_public0_accounting_unexplained_gap{instance=~\"$instance\"}) and on(instance,bridge,queue) ((time() - cs_public0_last_publish_unix_seconds{instance=~\"$instance\"}) >= 0) and on(instance,bridge,queue) ((time() - cs_public0_last_publish_unix_seconds{instance=~\"$instance\"}) < 120)",
+          "legendFormat": "{{instance}} / {{bridge}} / {{queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown",
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Observed discrepancy between nft selection and NFQUEUE IDs. It is not an HTTP request count or a direct count of confirmed fail-open packets. A positive gap remains visible even when combined telemetry is unknown. Missing or stale publications remain Unknown. Freshness is matched on instance, bridge and queue: runtime/cs_public0.py publish_metrics emits bridge and queue on every metric, including last_publish_unix_seconds; Prometheus supplies instance."
     }
   ],
   "description": "Operational health of cs-public0 bridge inspection. Select one or more instances to inspect telemetry, the sensor, NFQUEUE and packet counters. These are health observations, not an attack verdict or proof of complete inspection. Missing values mean Unknown. Use the separate optional Wazuh dashboard for alert signatures and source IPs."
