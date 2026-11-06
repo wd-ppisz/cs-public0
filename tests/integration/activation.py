@@ -221,7 +221,8 @@ class ActivationLab(Lab):
         compressed = gzip.compress(RULE, mtime=0)
         (self.directory / "local.rules.gz").write_bytes(compressed)
         pins = {str(p): release.sha(p.read_bytes()) for p in [binary, config, *modules.glob("*.py")]}
-        require(len(pins) <= 20, "explicit immutable source set too large")
+        # Same bounded immutable contract as rule_release.MAX_IMMUTABLE.
+        require(len(pins) <= 32, "explicit immutable source set too large")
         old = release.make_release(RULE, compressed, FILES, pins)
         (self.directory / "manifest.json").write_bytes(release.json_bytes(release.manifest_for({}, old)))
         release.initialize(self.directory, FILES, list(pins))
