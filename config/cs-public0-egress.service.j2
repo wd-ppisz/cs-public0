@@ -1,0 +1,38 @@
+[Unit]
+Description=cs-public0 independent outbound security observations
+# No Requires/BindsTo/PartOf or reload action on a sensor or log transport.
+
+[Service]
+Type=oneshot
+User=root
+Group={{ cs_public0_egress_log_group }}
+SupplementaryGroups={{ cs_public0_egress_input_group | default('root') }}
+WorkingDirectory=/
+ExecStart=/usr/bin/python3 -E -s -B {{ cs_public0_egress_bundle }}/egress_collector.py --config {{ cs_public0_egress_config_path }}
+UMask=0027
+CPUQuota=10%
+MemoryMax=96M
+MemorySwapMax=0
+TasksMax=4
+TimeoutStartSec=8s
+TimeoutStopSec=1s
+KillMode=control-group
+Restart=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths={{ cs_public0_egress_configuration.state_directory }} {{ cs_public0_egress_configuration.details_file | dirname }} {{ cs_public0_egress_configuration.metrics_file | dirname }}
+StandardOutput=journal
+StandardError=journal

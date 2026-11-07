@@ -1,0 +1,226 @@
+---
+# Explicit day-2 install. Does not touch a sensor, NFQUEUE, rules or EVE config.
+- name: Install independent bounded egress observation collector
+  hosts: "{{ target | default('cs_public0_no_target') }}"
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    cs_public0_egress_enable: false
+    cs_public0_egress_bundle: /usr/local/libexec/cs-public0-egress-v1
+    cs_public0_egress_config_path: /etc/cs-public0/egress.json
+    cs_public0_egress_log_group: root
+    cs_public0_egress_input_group: root
+  tasks:
+    - name: Require one explicit target and exact reviewed artifacts
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - target == inventory_hostname
+          - ansible_play_hosts_all | length == 1
+          - cs_public0_egress_enable is boolean
+          - cs_public0_egress_configuration.schema == 'cs-public0-egress-config-v1'
+          - cs_public0_egress_configuration.initial_position == 'end'
+          - cs_public0_egress_source is defined
+          - cs_public0_egress_pins.keys() | list | sort == ['egress_collector.py', 'egress_model.py']
+          - cs_public0_egress_config_bytes | from_json == cs_public0_egress_configuration
+          - cs_public0_egress_config_bytes | hash('sha256') == cs_public0_egress_config_sha256
+          - cs_public0_egress_catalog_bytes | from_json == cs_public0_egress_catalog
+          - cs_public0_egress_catalog_bytes | hash('sha256') == cs_public0_egress_catalog_sha256
+          - cs_public0_egress_catalog.schema == 'cs-public0-egress-catalog-v1'
+          - cs_public0_egress_catalog.rules_sha256 == cs_public0_egress_configuration.rules_identity.sha256
+          - cs_public0_egress_bundle is match('^/usr/local/libexec/cs-public0-egress-v[0-9]+$')
+          - cs_public0_egress_config_path == '/etc/cs-public0/egress.json'
+          - cs_public0_egress_configuration.catalog_file == '/etc/cs-public0/egress-catalog.json'
+          - cs_public0_egress_configuration.state_directory == '/var/lib/cs-public0-egress'
+          - cs_public0_egress_configuration.details_file == '/var/lib/cs-public0-egress-log/events.jsonl'
+          - cs_public0_egress_configuration.metrics_file is match('^/var/lib/[a-zA-Z0-9_/-]+/cs_public0_egress[.]prom$')
+          - cs_public0_egress_configuration.eve_file is match('^/var/log/[a-zA-Z0-9_/-]+/eve[.]json$')
+          - cs_public0_egress_configuration.rules_file is match('^/(etc|var/lib)/[a-zA-Z0-9_/-]+/[a-zA-Z0-9_.-]+[.]rules$')
+          - cs_public0_egress_configuration.ioc_file | default('') == ''
+          - cs_public0_egress_log_group is match('^[a-z_][a-z0-9_-]{0,31}$')
+          - cs_public0_egress_input_group is match('^[a-z_][a-z0-9_-]{0,31}$')
+
+    - name: Require readable EVE without DAC override capabilities
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/setpriv
+          - --reuid=0
+          - "--regid={{ cs_public0_egress_log_group }}"
+          - "--groups=root,{{ cs_public0_egress_input_group }}"
+          - --bounding-set=-all
+          - --inh-caps=-all
+          - --ambient-caps=-all
+          - --no-new-privs
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import os, pathlib, stat, sys
+            caps = dict(line.split(':', 1) for line in pathlib.Path('/proc/self/status').read_text().splitlines() if ':' in line)
+            if any(int(caps[k].strip(), 16) for k in ('CapEff', 'CapPrm', 'CapBnd', 'CapAmb')):
+                raise SystemExit('probe did not drop capabilities')
+            fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                s = os.fstat(fd)
+                if not stat.S_ISREG(s.st_mode) or s.st_nlink != 1: raise SystemExit('unsafe EVE source')
+                os.read(fd, 1)
+            finally: os.close(fd)
+          - "{{ cs_public0_egress_configuration.eve_file }}"
+      changed_when: false
+
+    - name: Refuse active installation, unsafe paths or replacement of installed policy
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import base64, hashlib, json, pathlib, stat, subprocess, sys
+            if sys.version_info < (3, 10): raise SystemExit('Python 3.10 or later required')
+            payload = json.loads(base64.b64decode(sys.stdin.buffer.read(), validate=True))
+            cfg_raw, catalog_raw = (base64.b64decode(payload[k], validate=True) for k in ('config_b64', 'catalog_b64'))
+            cfg = json.loads(cfg_raw); bundle = pathlib.Path(payload['bundle'])
+            pins = payload['pins']
+            unit = pathlib.Path('/etc/systemd/system/cs-public0-egress.service')
+            timer = pathlib.Path('/etc/systemd/system/cs-public0-egress.timer')
+            unit_raw, timer_raw = (base64.b64decode(payload[k], validate=True) for k in ('unit_b64', 'timer_b64'))
+            targets = {pathlib.Path(payload['config_path']): hashlib.sha256(cfg_raw).hexdigest(),
+                       pathlib.Path(cfg['catalog_file']): hashlib.sha256(catalog_raw).hexdigest(),
+                       unit: hashlib.sha256(unit_raw).hexdigest(), timer: hashlib.sha256(timer_raw).hexdigest(),
+                       **{bundle / n: h for n, h in pins.items()}}
+            dirs = [bundle, pathlib.Path(payload['config_path']).parent, pathlib.Path(cfg['state_directory']),
+                    pathlib.Path(cfg['details_file']).parent, pathlib.Path(cfg['metrics_file']).parent,
+                    unit.parent]
+            for p in dirs:
+                for a in (p, *p.parents):
+                    try: s = a.lstat()
+                    except FileNotFoundError: continue
+                    if not stat.S_ISDIR(s.st_mode) or s.st_uid != 0 or s.st_mode & 0o022:
+                        raise SystemExit('unsafe installation ancestor')
+            for name in ('cs-public0-egress.service', 'cs-public0-egress.timer'):
+                r = subprocess.run(['/usr/bin/systemctl', 'show', name, '-p', 'ActiveState', '--value'],
+                                   capture_output=True, timeout=5)
+                if r.returncode not in (0, 4) or r.stdout.strip() not in (b'', b'inactive', b'failed'):
+                    raise SystemExit('active collector requires a separately coordinated migration')
+            if bundle.exists() and {p.name for p in bundle.iterdir()} - set(pins):
+                raise SystemExit('foreign bundle inventory')
+            for p, expected in targets.items():
+                try: s = p.lstat()
+                except FileNotFoundError: continue
+                if (not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_nlink != 1 or s.st_mode & 0o022
+                        or hashlib.sha256(p.read_bytes()).hexdigest() != expected):
+                    raise SystemExit('installed artifact differs; explicit migration required')
+            rules = pathlib.Path(cfg['rules_file'])
+            before = rules.lstat()
+            if not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_mode & 0o022 or before.st_nlink != 1:
+                raise SystemExit('unsafe rule file')
+            h = hashlib.sha256()
+            with rules.open('rb') as f:
+                for chunk in iter(lambda: f.read(65536), b''): h.update(chunk)
+            after = rules.lstat()
+            identity = {'device': after.st_dev, 'inode': after.st_ino, 'size': after.st_size,
+                        'mtime_ns': after.st_mtime_ns, 'ctime_ns': after.st_ctime_ns, 'sha256': h.hexdigest()}
+            stable = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            if stable(before) != stable(after) or identity != cfg['rules_identity']:
+                raise SystemExit('rule identity changed since candidate preflight')
+        # Large catalogs travel over stdin, never an execve argument.
+        stdin: "{{ {'config_b64': (cs_public0_egress_config_bytes | b64encode), 'catalog_b64': (cs_public0_egress_catalog_bytes | b64encode), 'bundle': cs_public0_egress_bundle, 'pins': cs_public0_egress_pins, 'unit_b64': (lookup('ansible.builtin.template', '../config/cs-public0-egress.service.j2') | b64encode), 'timer_b64': (lookup('ansible.builtin.file', '../config/cs-public0-egress.timer', rstrip=false) | b64encode), 'config_path': cs_public0_egress_config_path} | to_json | b64encode }}"
+        stdin_add_newline: false
+      changed_when: false
+
+    - name: Check local runtime pins
+      ansible.builtin.stat:
+        path: "{{ cs_public0_egress_source }}/{{ item.key }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      loop: "{{ cs_public0_egress_pins | dict2items }}"
+      register: cs_public0_egress_sources
+
+    - name: Require exact regular local source files
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+          - not (item.stat.islnk | default(false))
+          - item.stat.checksum == item.item.value
+      loop: "{{ cs_public0_egress_sources.results }}"
+
+    - name: Create dedicated collector directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: "{{ cs_public0_egress_bundle }}", group: root, mode: '0755'}
+        - {path: /etc/cs-public0, group: root, mode: '0755'}
+        - {path: /var/lib/cs-public0-egress, group: root, mode: '0700'}
+        - {path: /var/lib/cs-public0-egress-log, group: "{{ cs_public0_egress_log_group }}", mode: '0750'}
+
+    - name: Install exact runtime files
+      ansible.builtin.copy:
+        src: "{{ cs_public0_egress_source }}/{{ item.key }}"
+        dest: "{{ cs_public0_egress_bundle }}/{{ item.key }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ cs_public0_egress_pins | dict2items }}"
+
+    - name: Write exact configuration and catalog bytes atomically
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import base64, hashlib, os, pathlib, sys, tempfile
+            p = pathlib.Path(sys.argv[1]); raw = base64.b64decode(sys.stdin.buffer.read(), validate=True)
+            if len(raw) > 4 * 1024 * 1024: raise SystemExit('artifact size bound')
+            if hashlib.sha256(raw).hexdigest() != sys.argv[2]: raise SystemExit('artifact SHA mismatch')
+            if p.exists() and p.read_bytes() == raw: raise SystemExit(0)
+            fd, name = tempfile.mkstemp(prefix='.egress-', dir=p.parent)
+            try:
+                with os.fdopen(fd, 'wb') as f:
+                    os.fchmod(f.fileno(), 0o600); f.write(raw); f.flush(); os.fsync(f.fileno())
+                os.replace(name, p)
+            finally:
+                if os.path.exists(name): os.unlink(name)
+          - "{{ item.path }}"
+          - "{{ item.sha256 }}"
+        stdin: "{{ item.raw_b64 }}"
+        stdin_add_newline: false
+      loop:
+        - {path: "{{ cs_public0_egress_config_path }}", raw_b64: "{{ cs_public0_egress_config_bytes | b64encode }}", sha256: "{{ cs_public0_egress_config_sha256 }}"}
+        - {path: "{{ cs_public0_egress_configuration.catalog_file }}", raw_b64: "{{ cs_public0_egress_catalog_bytes | b64encode }}", sha256: "{{ cs_public0_egress_catalog_sha256 }}"}
+      loop_control:
+        label: "{{ item.path }}"
+      changed_when: true
+
+    - name: Install independent collector service
+      ansible.builtin.template:
+        src: ../config/cs-public0-egress.service.j2
+        dest: /etc/systemd/system/cs-public0-egress.service
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Install independent collector timer
+      ansible.builtin.copy:
+        src: ../config/cs-public0-egress.timer
+        dest: /etc/systemd/system/cs-public0-egress.timer
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable only the explicitly accepted collector timer
+      ansible.builtin.systemd_service:
+        name: cs-public0-egress.timer
+        daemon_reload: true
+        enabled: "{{ cs_public0_egress_enable }}"
+        state: "{{ 'started' if cs_public0_egress_enable else 'stopped' }}"

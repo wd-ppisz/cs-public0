@@ -1,0 +1,12 @@
+[Unit]
+Description=Read bounded public0 egress observations independently
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+Persistent=false
+Unit=cs-public0-egress.service
+
+[Install]
+WantedBy=timers.target
