@@ -259,7 +259,7 @@ def direction(event, flow, nets):
 
 class IOC:
     def __init__(self, data):
-        if not isinstance(data, dict) or data.get("schema") != "cs-public0-egress-ioc-v1":
+        if not isinstance(data, dict) or data.get("schema") not in {"cs-public0-egress-ioc-v1", "cs-public0-egress-ioc-v2"}:
             raise ValueError("IOC schema")
         self.source = text(data["source"], 256)
         self.version = text(data["version"], 128)
@@ -275,7 +275,24 @@ class IOC:
         if not isinstance(addresses, list) or len(addresses) > 65536:
             raise ValueError("IOC address bound")
         self.addresses = frozenset(ipv4(x) for x in addresses)
-        canonical = ("\n".join(sorted(self.addresses)) + "\n").encode()
+        self.prefixes = {}
+        if data["schema"] == "cs-public0-egress-ioc-v2":
+            raw_networks = data["networks"]
+            if not isinstance(raw_networks, list) or len(raw_networks) > 65536:
+                raise ValueError("IOC prefix bound")
+            parsed = []
+            for value in raw_networks:
+                net = ipaddress.ip_network(value, strict=True)
+                if net.version != 4 or str(net) != value or net.prefixlen < 8:
+                    raise ValueError("IOC prefix")
+                self.prefixes.setdefault(net.prefixlen, set()).add(int(net.network_address))
+                parsed.append(value)
+            if raw_networks != sorted(set(parsed)):
+                raise ValueError("IOC prefix canonical order")
+            canonical = json.dumps({"addresses": sorted(self.addresses), "networks": raw_networks},
+                                   sort_keys=True, separators=(",", ":")).encode()
+        else:
+            canonical = ("\n".join(sorted(self.addresses)) + "\n").encode()
         if hashlib.sha256(canonical).hexdigest() != self.content_sha256:
             raise ValueError("IOC content mismatch")
 
@@ -283,11 +300,22 @@ class IOC:
         return self.fetched <= now < self.expires
 
     def match(self, address, now):
-        if not self.fresh(now) or address not in self.addresses:
+        if not self.fresh(now):
             return None
+        prefix = None
+        if address not in self.addresses:
+            numeric = int(ipaddress.IPv4Address(address))
+            for length, starts in self.prefixes.items():
+                masked = numeric & ((2**32 - 1) ^ (2**(32 - length) - 1))
+                if masked in starts:
+                    prefix = str(ipaddress.IPv4Network((masked, length)))
+                    break
+            if prefix is None:
+                return None
         return {"source": self.source, "version": self.version,
                 "content_sha256": self.content_sha256, "published_unix": self.published,
-                "fetched_unix": self.fetched, "expires_unix": self.expires}
+                "fetched_unix": self.fetched, "expires_unix": self.expires,
+                **({"matched_prefix": prefix} if prefix is not None else {})}
 
 
 def observation(event, flow, config, catalog, source_ref, received_unix, rules_sha256, ioc=None):

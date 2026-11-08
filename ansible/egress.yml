@@ -38,7 +38,7 @@
           - cs_public0_egress_configuration.metrics_file is match('^/var/lib/[a-zA-Z0-9_/-]+/cs_public0_egress[.]prom$')
           - cs_public0_egress_configuration.eve_file is match('^/var/log/[a-zA-Z0-9_/-]+/eve[.]json$')
           - cs_public0_egress_configuration.rules_file is match('^/(etc|var/lib)/[a-zA-Z0-9_/-]+/[a-zA-Z0-9_.-]+[.]rules$')
-          - cs_public0_egress_configuration.ioc_file | default('') == ''
+          - cs_public0_egress_configuration.ioc_file | default('') in ['', '/var/lib/cs-public0-ip-intelligence/ioc.json']
           - cs_public0_egress_log_group is match('^[a-z_][a-z0-9_-]{0,31}$')
           - cs_public0_egress_input_group is match('^[a-z_][a-z0-9_-]{0,31}$')
 
