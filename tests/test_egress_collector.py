@@ -122,6 +122,30 @@ class EgressCollector(unittest.TestCase):
         self.assertEqual(self.scalar("collector_up"), 0)
         self.assertEqual(self.scalar("source_available"), 0)
 
+    def test_live_stats_arriving_during_read_are_fresh_at_publication(self):
+        self.run_once(NOW - 65)
+        self.append(stats(when="2026-11-07T08:00:03Z"))
+        with mock.patch.object(c.time, "time", side_effect=[NOW, NOW + 2]):
+            result = c.run(self.cfg)
+        self.assertTrue(result["success"])
+        self.assertEqual(self.scalar("last_publish_unix_seconds"), NOW + 2)
+        self.assertEqual(self.scalar("source_fresh"), 1)
+        self.assertEqual(self.scalar("collection_continuity_known"), 1)
+
+    def test_live_publication_does_not_qualify_still_future_stats(self):
+        self.run_once(NOW - 65)
+        self.append(stats(when="2026-11-07T08:00:05Z"))
+        with mock.patch.object(c.time, "time", side_effect=[NOW, NOW + 2]):
+            self.assertTrue(c.run(self.cfg)["success"])
+        self.assertEqual(self.scalar("source_fresh"), 0)
+        self.assertEqual(self.scalar("collection_continuity_known"), 0)
+
+    def test_explicit_clock_remains_fixed_for_publication(self):
+        self.append(stats())
+        with mock.patch.object(c.time, "time", side_effect=AssertionError("explicit clock")):
+            self.assertTrue(self.run_once()["success"])
+        self.assertEqual(self.scalar("last_publish_unix_seconds"), NOW)
+
     def test_partial_line_resumes_and_invalid_does_not_commit_partial_work(self):
         raw = wire(alert())
         self.eve.write_bytes(wire(stats()) + raw[:40])

@@ -416,7 +416,8 @@ def source_cursor(store, f, info, config, now):
 
 
 def run(config, now=None):
-    now = time.time() if now is None else now
+    live_clock = now is None
+    now = time.time() if live_clock else now
     state_dir = pathlib.Path(config["state_directory"])
     if not state_dir.is_dir() or state_dir.is_symlink():
         raise ValueError("state directory must be installed")
@@ -424,12 +425,12 @@ def run(config, now=None):
     lock_fd = os.open(state_dir / "lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return _run_locked(config, state_dir, now)
+        return _run_locked(config, state_dir, now, live_clock=live_clock)
     finally:
         os.close(lock_fd)
 
 
-def _run_locked(config, state_dir, now):
+def _run_locked(config, state_dir, now, live_clock=False):
     catalog = None
     catalog_content_hash = None
     ioc = None
@@ -629,7 +630,10 @@ def _run_locked(config, state_dir, now):
                 s.db.rollback()  # Physical disk exhaustion remains unhealthy.
     finally:
         try:
-            atomic(config["metrics_file"], metrics(s, now, success, available, ioc, current_ready))
+            # Stats may arrive after the run began while the bounded reader is active.
+            # Evaluate their age at publication; an explicit test clock stays fixed.
+            published = time.time() if live_clock else now
+            atomic(config["metrics_file"], metrics(s, published, success, available, ioc, current_ready))
         finally:
             s.db.close()
     return {"success": success, "error": error, "sensor_action": "NONE"}
