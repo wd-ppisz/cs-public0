@@ -57,6 +57,7 @@ def atomic(path, raw, mode=0o600):
     path = Path(path)
     temporary = path.with_name('.' + path.name + '.' + str(os.getpid()))
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    os.fchmod(fd, mode)
     with os.fdopen(fd, 'wb') as out:
         out.write(raw)
         out.flush()

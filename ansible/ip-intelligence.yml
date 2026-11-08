@@ -8,7 +8,7 @@
   any_errors_fatal: true
   vars:
     cs_public0_ip_enable: false
-    cs_public0_ip_bundle: /usr/local/libexec/cs-public0-ip-intelligence-v2
+    cs_public0_ip_bundle: /usr/local/libexec/cs-public0-ip-intelligence-v3
     cs_public0_ip_config: /etc/cs-public0/ip-intelligence.json
   tasks:
     - name: Require one explicit host and exact installed configuration/source bytes
@@ -91,7 +91,7 @@
         group: root
         mode: "{{ item.mode }}"
       loop:
-        - {path: /usr/local/libexec/cs-public0-ip-intelligence-v2, mode: '0755'}
+        - {path: /usr/local/libexec/cs-public0-ip-intelligence-v3, mode: '0755'}
         - {path: /etc/cs-public0, mode: '0755'}
         - {path: /var/lib/cs-public0-ip-intelligence, mode: '0700'}
 
