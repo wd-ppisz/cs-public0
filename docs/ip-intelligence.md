@@ -38,6 +38,11 @@ five minutes, the other providers at least one hour. Failed attempts also count
 towards that interval. Spamhaus explicitly requires at least an hour between
 automated downloads. A source growing by more than 50 percent, above a small
 initial threshold, requires investigation; its last good snapshot is retained.
+Retrieval receipts and cache are persisted before policy construction, and the
+apply intent is persisted before kernel operations. A killed process therefore
+cannot erase the provider retry interval or claim a completed deployment. The
+updater has a 3 GiB cgroup limit, sized for the full fresh-download/apply cycle,
+including child processes; the smaller isolated subset alone is not sizing proof.
 
 The first apply requires fresh IPInsights, IPsum, Spamhaus and ThreatFox data.
 Later retrieval errors retain each last good source only until its expiry;

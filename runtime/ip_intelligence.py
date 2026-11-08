@@ -488,6 +488,9 @@ def main():
                                              'reason': str(error)[:256]}
         now = int(time.time())  # Admission uses the clock after potentially slow retrieval and parsing.
         needs_refresh = refresh_required(state, now)
+        # Retrieval receipts survive process/cgroup failure during the expensive
+        # policy build or nft readback. Provider retry intervals include errors.
+        atomic(path, encoded(state))
         try:
             # The short read still verifies ownership, exact expressions and expiry policy.
             # A no-op does not claim a new kernel-member verification or deployment time.
@@ -496,6 +499,8 @@ def main():
                 needs_refresh = True
             if config['mode'] == 'apply' and not args.preview and needs_refresh:
                 state['apply_success'] = False
+                state['apply_attempt_unix'] = now
+                atomic(path, encoded(state))
                 if not state.get('last_apply_unix'):
                     require(all(n in state['feeds'] and state['feeds'][n]['fetched_unix'] <= now < state['feeds'][n]['expires_unix']
                                 for n in config['required_sources']), 'required initial sources are not fresh')
