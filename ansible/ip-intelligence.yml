@@ -43,7 +43,7 @@
           - -B
           - -c
           - |
-            import base64, hashlib, json, pathlib, stat, sys
+            import base64, hashlib, json, os, pathlib, stat, subprocess, sys
             pins=json.loads(base64.b64decode(sys.argv[1])); bundle=pathlib.Path(sys.argv[2])
             config=pathlib.Path(sys.argv[3]); expected=sys.argv[4]
             for path in (bundle, config.parent, pathlib.Path('/var/lib/cs-public0-ip-intelligence'), pathlib.Path('/var/lib/node_exporter')):
@@ -59,11 +59,28 @@
                     if not stat.S_ISREG(s.st_mode) or s.st_nlink!=1 or s.st_uid!=0 or s.st_mode & 0o022 or hashlib.sha256(p.read_bytes()).hexdigest()!=digest:
                         raise SystemExit('installed version differs; use a new version')
             if config.exists() and hashlib.sha256(config.read_bytes()).hexdigest()!=expected:
-                raise SystemExit('installed configuration differs; explicit migration required')
+                old=config.read_bytes()
+                if not sys.argv[5] or hashlib.sha256(old).hexdigest()!=sys.argv[5]:
+                    raise SystemExit('installed configuration differs; explicit migration required')
+                state=pathlib.Path('/var/lib/cs-public0-ip-intelligence')
+                if (state/'state.json').exists():raise SystemExit('repair refuses initialized updater')
+                for unit in ['cs-public0-ip-intelligence.timer','cs-public0-ip-intelligence.service']:
+                    active=subprocess.check_output(['systemctl','show',unit,'-p','ActiveState','--value'],text=True).strip()
+                    enabled=subprocess.run(['systemctl','is-enabled',unit],capture_output=True,text=True).stdout.strip()
+                    if active in ['active','activating','deactivating'] or enabled=='enabled':raise SystemExit('repair refuses active updater')
+                tables=json.loads(subprocess.check_output(['nft','-j','list','tables']))['nftables']
+                if any(x.get('table',{}).get('name')=='cs_public0_ioc' for x in tables):raise SystemExit('repair refuses installed IP policy')
+                backup=state/'config.before-byte-repair.json'
+                if backup.exists():
+                    if backup.read_bytes()!=old:raise SystemExit('repair backup differs')
+                else:
+                    fd=os.open(backup,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                    with os.fdopen(fd,'wb') as out:out.write(old);out.flush();os.fsync(out.fileno())
           - "{{ cs_public0_ip_pins | to_json | b64encode }}"
           - "{{ cs_public0_ip_bundle }}"
           - "{{ cs_public0_ip_config }}"
           - "{{ cs_public0_ip_config_sha256 }}"
+          - "{{ cs_public0_ip_repair_config_sha256 | default('') }}"
       changed_when: false
 
     - name: Create separate root-owned code/config/state directories
@@ -88,12 +105,27 @@
       loop: "{{ cs_public0_ip_pins.keys() | list }}"
 
     - name: Install exact policy bytes
-      ansible.builtin.copy:
-        content: "{{ cs_public0_ip_config_bytes }}"
-        dest: "{{ cs_public0_ip_config }}"
-        owner: root
-        group: root
-        mode: '0600'
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import base64,hashlib,os,pathlib,sys
+            raw=base64.b64decode(sys.stdin.buffer.read(),validate=True)
+            if hashlib.sha256(raw).hexdigest()!=sys.argv[2]:raise SystemExit('configuration bytes differ')
+            path=pathlib.Path(sys.argv[1])
+            if path.exists() and path.read_bytes()==raw:raise SystemExit(0)
+            temporary=path.with_name('.'+path.name+'.install')
+            fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+            with os.fdopen(fd,'wb') as out:out.write(raw);out.flush();os.fsync(out.fileno())
+            os.replace(temporary,path)
+            if path.read_bytes()!=raw:raise SystemExit('configuration readback differs')
+          - "{{ cs_public0_ip_config }}"
+          - "{{ cs_public0_ip_config_sha256 }}"
+        stdin: "{{ cs_public0_ip_config_bytes | b64encode }}"
+        stdin_add_newline: false
 
     - name: Install bounded updater unit
       ansible.builtin.copy:
