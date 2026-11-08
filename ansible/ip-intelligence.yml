@@ -1,0 +1,218 @@
+---
+# Independent day-2 IP policy. Does not restart or edit Suricata/NFQUEUE.
+- name: Install a pinned public0 IP intelligence updater and DROP inventory
+  hosts: "{{ target | default('cs_public0_no_target') }}"
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    cs_public0_ip_enable: false
+    cs_public0_ip_bundle: /usr/local/libexec/cs-public0-ip-intelligence-v1
+    cs_public0_ip_config: /etc/cs-public0/ip-intelligence.json
+  tasks:
+    - name: Require one explicit host and exact installed configuration/source bytes
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - target == inventory_hostname
+          - ansible_play_hosts_all | length == 1
+          - cs_public0_ip_enable is boolean
+          - cs_public0_ip_configuration.schema == 'cs-public0-ip-intelligence-v1'
+          - cs_public0_ip_configuration.bridge == 'public0'
+          - cs_public0_ip_configuration.mode in ['observe', 'apply']
+          - cs_public0_ip_configuration.state_directory == '/var/lib/cs-public0-ip-intelligence'
+          - cs_public0_ip_configuration.metrics_file == '/var/lib/node_exporter/cs_public0_ip_intelligence.prom'
+          - cs_public0_ip_config_sha256 is match('^[a-f0-9]{64}$')
+          - cs_public0_ip_config_bytes | hash('sha256') == cs_public0_ip_config_sha256
+          - cs_public0_ip_config_bytes | from_json == cs_public0_ip_configuration
+          - cs_public0_ip_configuration.protected_networks | length > 0
+          - cs_public0_ip_pins.keys() | sort == ['ip_intelligence.py', 'policy_inventory.py']
+
+    - name: Verify local source hashes before transfer
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.file', cs_public0_ip_source + '/runtime/' + item, rstrip=False) | hash('sha256') == cs_public0_ip_pins[item]
+      loop: "{{ cs_public0_ip_pins.keys() | list }}"
+
+    - name: Refuse unsafe paths or unplanned replacement of an installed version
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import base64, hashlib, json, pathlib, stat, sys
+            pins=json.loads(base64.b64decode(sys.argv[1])); bundle=pathlib.Path(sys.argv[2])
+            config=pathlib.Path(sys.argv[3]); expected=sys.argv[4]
+            for path in (bundle, config.parent, pathlib.Path('/var/lib/cs-public0-ip-intelligence'), pathlib.Path('/var/lib/node_exporter')):
+                for parent in (path,*path.parents):
+                    if not parent.exists(): continue
+                    info=parent.lstat()
+                    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_mode & 0o022:
+                        raise SystemExit('unsafe ancestor')
+            if bundle.exists():
+                if {p.name for p in bundle.iterdir()} != set(pins): raise SystemExit('installed bundle inventory differs')
+                for name,digest in pins.items():
+                    p=bundle/name;s=p.lstat()
+                    if not stat.S_ISREG(s.st_mode) or s.st_nlink!=1 or s.st_uid!=0 or s.st_mode & 0o022 or hashlib.sha256(p.read_bytes()).hexdigest()!=digest:
+                        raise SystemExit('installed version differs; use a new version')
+            if config.exists() and hashlib.sha256(config.read_bytes()).hexdigest()!=expected:
+                raise SystemExit('installed configuration differs; explicit migration required')
+          - "{{ cs_public0_ip_pins | to_json | b64encode }}"
+          - "{{ cs_public0_ip_bundle }}"
+          - "{{ cs_public0_ip_config }}"
+          - "{{ cs_public0_ip_config_sha256 }}"
+      changed_when: false
+
+    - name: Create separate root-owned code/config/state directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: /usr/local/libexec/cs-public0-ip-intelligence-v1, mode: '0755'}
+        - {path: /etc/cs-public0, mode: '0755'}
+        - {path: /var/lib/cs-public0-ip-intelligence, mode: '0700'}
+
+    - name: Install only the two pinned independent modules
+      ansible.builtin.copy:
+        src: "{{ cs_public0_ip_source }}/runtime/{{ item }}"
+        dest: "{{ cs_public0_ip_bundle }}/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ cs_public0_ip_pins.keys() | list }}"
+
+    - name: Install exact policy bytes
+      ansible.builtin.copy:
+        content: "{{ cs_public0_ip_config_bytes }}"
+        dest: "{{ cs_public0_ip_config }}"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Install bounded updater unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cs-public0-ip-intelligence.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=public0 IP intelligence and atomic scoped blocklists
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/python3 -B {{ cs_public0_ip_bundle }}/ip_intelligence.py --config {{ cs_public0_ip_config }} --config-sha256 {{ cs_public0_ip_config_sha256 }}
+          {% if cs_public0_ip_abuse_credential | default(false) %}
+          LoadCredential=abuse-ch:/etc/cs-public0/credentials/abuse-ch
+          {% endif %}
+          User=root
+          UMask=0077
+          CPUQuota=100%
+          MemoryMax=2G
+          MemorySwapMax=0
+          TasksMax=32
+          TimeoutStartSec=300
+          TimeoutStopSec=10
+          KillMode=control-group
+          NoNewPrivileges=yes
+          PrivateTmp=yes
+          ProtectHome=yes
+          ProtectSystem=strict
+          ReadWritePaths=/var/lib/cs-public0-ip-intelligence /var/lib/node_exporter
+          RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+    - name: Install regular updater timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cs-public0-ip-intelligence.timer
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Refresh public0 IP intelligence with provider-specific intervals
+          [Timer]
+          OnBootSec=90s
+          OnUnitInactiveSec=300s
+          AccuracySec=10s
+          [Install]
+          WantedBy=timers.target
+
+    - name: Install read-only DROP inventory unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cs-public0-policy-inventory.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Read-only inventory of installed DROP rules and controller receipts
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/python3 -B {{ cs_public0_ip_bundle }}/policy_inventory.py
+          User=root
+          UMask=0077
+          CPUQuota=50%
+          MemoryMax=256M
+          MemorySwapMax=0
+          TasksMax=8
+          TimeoutStartSec=30
+          NoNewPrivileges=yes
+          PrivateTmp=yes
+          ProtectHome=yes
+          ProtectSystem=strict
+          ReadWritePaths=/var/lib/node_exporter
+
+    - name: Install inventory timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cs-public0-policy-inventory.timer
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Publish public0 DROP inventory every minute
+          [Timer]
+          OnBootSec=60s
+          OnUnitInactiveSec=60s
+          AccuracySec=5s
+          [Install]
+          WantedBy=timers.target
+
+    - name: Read back pinned modules and policy before enabling anything
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import base64,hashlib,json,pathlib,sys
+            pins=json.loads(base64.b64decode(sys.argv[1]));root=pathlib.Path(sys.argv[2])
+            for name,digest in pins.items():
+                if hashlib.sha256((root/name).read_bytes()).hexdigest()!=digest:raise SystemExit('source readback differs')
+            if hashlib.sha256(pathlib.Path(sys.argv[3]).read_bytes()).hexdigest()!=sys.argv[4]:raise SystemExit('config readback differs')
+          - "{{ cs_public0_ip_pins | to_json | b64encode }}"
+          - "{{ cs_public0_ip_bundle }}"
+          - "{{ cs_public0_ip_config }}"
+          - "{{ cs_public0_ip_config_sha256 }}"
+      changed_when: false
+
+    - name: Reload unit definitions without touching the packet sensor
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Enable only explicitly accepted timers
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: "{{ cs_public0_ip_enable }}"
+        state: "{{ cs_public0_ip_enable | ternary('started', 'stopped') }}"
+      loop:
+        - cs-public0-ip-intelligence.timer
+        - cs-public0-policy-inventory.timer
