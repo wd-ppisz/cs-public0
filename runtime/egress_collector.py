@@ -16,7 +16,8 @@ import tempfile
 import time
 
 from egress_model import (CATEGORIES, DIRECTIONS, MAX_RECORD, SEVERITIES, Catalog,
-                          IOC, direction, flow_key, integer, networks, observation, strict_json, timestamp, validate_config)
+                          IOC, direction, flow_key, integer, networks, observation, qualify_feed_roles,
+                          strict_json, timestamp, validate_config)
 
 MAX_BYTES = 2 * 1024 * 1024
 MAX_ROWS = 1000
@@ -184,6 +185,12 @@ class Consumer:
         item = json.loads(canonical(candidate))
         d, basis, connection, limits = direction(row, flow, networks(self.config["owned_ipv4_networks"]))
         item.update(direction=d, direction_basis=basis, connection_evidence=connection, published_unix=now)
+        # Also qualifies candidates admitted before this collector upgrade.
+        item = qualify_feed_roles(item)
+        if item is None:
+            self.s.count("record:ipinsights_non_ingress_filtered")
+            return
+        item["classification_revision"] = 2
         item["limitations"] = sorted(set(item["limitations"] + limits))
         if item["observed_unix"] > now + 5:
             item["limitations"].append("SOURCE_CLOCK_SKEW_AFTER_COLLECTOR_REVERSAL")
@@ -203,7 +210,13 @@ class Consumer:
             self.s.count("record:dedup_evicted", excess)
         self.s.db.execute("INSERT INTO seen VALUES (?,?)", (item["event_id"], now))
         self.s.db.execute("INSERT INTO outbox VALUES (?,?)", (item["event_id"], serialized))
-        self.s.count("observation:" + ":".join(item[k] for k in ("category", "severity", "direction")))
+        dimensions = ":".join(item[k] for k in ("category", "severity", "direction"))
+        self.s.count("observation_v2:" + dimensions)
+        # Preserve the legacy counter contract and its history for existing
+        # consumers. New dashboards use only v2; historical scan cannot be
+        # retrospectively separated into signatures and reputation contacts.
+        legacy_category = "scan" if item["category"] == "reputation" else item["category"]
+        self.s.count("observation:" + ":".join((legacy_category, item["severity"], item["direction"])))
         self.s.count("record:accepted")
 
     def accept(self, row, ref, now):
@@ -311,10 +324,18 @@ def metrics(store, now, success, available, ioc, catalog_ready=None):
     counts = dict(store.db.execute("SELECT key,value FROM counts"))
     lines = []
     for category in CATEGORIES:
+        if category == "reputation":
+            continue
         for severity in SEVERITIES:
             for direction in DIRECTIONS:
                 key = "observation:" + ":".join((category, severity, direction))
                 lines.append('cs_public0_egress_observations_total{category="%s",severity="%s",direction="%s"} %d' %
+                             (category, severity, direction, counts.get(key, 0)))
+    for category in CATEGORIES:
+        for severity in SEVERITIES:
+            for direction in DIRECTIONS:
+                key = "observation_v2:" + ":".join((category, severity, direction))
+                lines.append('cs_public0_egress_observations_v2_total{category="%s",severity="%s",direction="%s"} %d' %
                              (category, severity, direction, counts.get(key, 0)))
     for outcome in OUTCOMES:
         lines.append('cs_public0_egress_records_total{outcome="%s"} %d' % (outcome, counts.get("record:" + outcome, 0)))
@@ -339,9 +360,11 @@ def metrics(store, now, success, available, ioc, catalog_ready=None):
                                   now - store.get("last_invalid", -1e30) >= 60 and
                                   0 <= now - store.get("last_stats", 0) <= 30),
               "catalog_ready": int(ready),
+              "classification_v2_ready": int(success and available and ready),
+              "ipinsights_non_ingress_filtered_total": counts.get("record:ipinsights_non_ingress_filtered", 0),
               "backlog_bytes": store.get("backlog_bytes", 0)}
     lines.extend("cs_public0_egress_%s %s" % (k, v) for k, v in values.items())
-    if len(lines) > 86:
+    if len(lines) > 148:
         raise ValueError("metric series budget")
     return ("\n".join(lines) + "\n").encode()
 

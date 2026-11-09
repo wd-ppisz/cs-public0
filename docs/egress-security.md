@@ -49,6 +49,26 @@ guest compromise, end-to-end application success or complete inspection.
 
 ## Controlled policy and IOC contract
 
+Classification revision 2 applies IPInsights only to attacker-source reputation
+on an independently qualified ingress flow. Such observations use `reputation`
+with low severity and no enforcement. IPInsights-only egress and unknown-direction
+candidates are omitted from publication, not reinterpreted as abuse by a guest.
+The filter runs after joining a pending event to its flow; a source-IP comparison
+alone cannot qualify direction. Presence on the provider's IP list is not scan
+detection. A separately qualified signature retains its category, including
+a scan signature when the peer also happens to match IPInsights. Other IOC source
+receipts remain visible and do not inherit the IPInsights-only downgrade.
+
+New main dashboards use `cs_public0_egress_observations_v2_total` and exclude
+`category="reputation"`; a separate context panel retains those observations.
+`ipinsights_non_ingress_filtered_total` retains a bounded technical count of
+omitted source-feed candidates. The v2 counter starts with the new collector and does not import legacy scan
+counts. Old counters and SQLite state are retained, including the old meaning of
+IPInsights-only `scan` for legacy consumers. Never subtract a guessed historical
+amount, reset collection cursors, or present the old mixed count as proven scans.
+`classification_v2_ready` identifies publication by the new observer; the existing
+source/lag/continuity checks still determine whether collection is healthy.
+
 Classification uses an operator-supplied catalog of exact GID/SID/revision,
 category and required metadata, bound to an explicit rule-file artifact SHA256. An unreviewed
 revision, changed ruleset or mismatched metadata is not silently accepted.

@@ -13,7 +13,7 @@ import zlib
 from array import array
 from datetime import datetime
 
-CATEGORIES = ("c2", "ioc", "scan", "other")
+CATEGORIES = ("c2", "ioc", "scan", "other", "reputation")
 SEVERITIES = ("high", "medium", "low", "unknown")
 DIRECTIONS = ("egress", "ingress", "unknown")
 SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -367,7 +367,7 @@ class IOC:
             return {'source': self.source, 'version': self.version,
                     'content_sha256': self.content_sha256, 'published_unix': self.published,
                     'fetched_unix': self.fetched, 'expires_unix': self.expires,
-                    'matched_sources': matches, 'category': 'scan' if untrusted_only else 'ioc',
+                    'matched_sources': matches, 'category': 'reputation' if untrusted_only else 'ioc',
                     'severity': 'low' if untrusted_only else 'high', 'enforcement': 'none'}
         prefix = None
         if address not in self.addresses:
@@ -383,6 +383,29 @@ class IOC:
                 "content_sha256": self.content_sha256, "published_unix": self.published,
                 "fetched_unix": self.fetched, "expires_unix": self.expires,
                 **({"matched_prefix": prefix} if prefix is not None else {})}
+
+
+def qualify_feed_roles(item):
+    """Qualify the final publication using the observed initiation direction.
+
+    IPInsights describes attacker source reputation, not malicious destinations.
+    A pending candidate may await its flow; call this only after the final join.
+    The caller owns this dictionary. Raw EVE and admitted source receipts stay
+    retained separately; omitting a match does not rewrite either input.
+    """
+    sources = (item.get('ioc') or {}).get('matched_sources', [])
+    if item['direction'] != 'ingress' and any(s.get('name') == 'ipinsights' for s in sources):
+        remaining = [s for s in sources if s.get('name') != 'ipinsights']
+        item['ioc'] = dict(item['ioc'], matched_sources=remaining) if remaining else None
+        if item.get('evidence_kind') == 'ioc_contact_observation' and not remaining:
+            if not item.get('signature'):
+                return None
+            item.update(evidence_kind='signature_observation_unqualified', category='other', severity='unknown')
+        sources = remaining
+    if (item.get('evidence_kind') == 'ioc_contact_observation' and sources
+            and all(s.get('name') == 'ipinsights' for s in sources)):
+        item.update(category='reputation', severity='low')
+    return item
 
 
 def observation(event, flow, config, catalog, source_ref, received_unix, rules_sha256, ioc=None):
