@@ -28,7 +28,9 @@ SPECIAL = tuple(ipaddress.ip_network(x) for x in (
     '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24', '192.168.0.0/16',
     '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/3'))
 SOURCES = {
-    'ipinsights': {'url': 'https://www.ipinsights.io/downloads/blocklist.txt', 'format': 'addresses', 'mode': 'inbound_drop', 'interval': 3600, 'age': 86400},
+    # INC-2026-11-09: this feed included public resolvers (1.1.1.1, 8.8.8.8).
+    # Quarantine it from enforcement; valid syntax/freshness does not qualify an IP for DROP.
+    'ipinsights': {'url': 'https://www.ipinsights.io/downloads/blocklist.txt', 'format': 'addresses', 'mode': 'detect', 'interval': 3600, 'age': 86400},
     'feodo': {'url': 'https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt', 'format': 'addresses', 'mode': 'outbound_drop', 'interval': 300, 'age': 86400},
     'ipsum3': {'url': 'https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt', 'format': 'addresses', 'mode': 'inbound_drop', 'interval': 3600, 'age': 172800,
                'github': ('stamparm/ipsum', 'levels/3.txt')},
@@ -412,7 +414,7 @@ def ioc_snapshot(feeds, protected, now):
     """A generated IP snapshot for the existing EVE observer; no domain-coverage claim."""
     hosts, prefixes, expirations = set(), set(), []
     for name, feed in feeds.items():
-        # Scanner-only IPInsights is enforced inbound; it is not a C2 feed.
+        # Quarantined scanner data must not label outgoing connections as C2.
         if name == 'ipinsights' or name not in SOURCES or not feed['fetched_unix'] <= now < feed['expires_unix']:
             continue
         expirations.append(feed['expires_unix'])

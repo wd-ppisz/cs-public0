@@ -88,16 +88,25 @@ class IntelligenceTests(unittest.TestCase):
                     expires_unix=NOW + 120, **kwargs)
 
     def test_direction_and_protected_overlap(self):
-        feeds = {'ipinsights': self.feed(['1.2.3.4/32', '83.168.93.5/32']),
+        feeds = {'ipsum3': self.feed(['1.2.3.4/32', '83.168.93.5/32']),
                  'spamhaus': self.feed(['5.6.7.0/24']), 'firehol1': self.feed(['9.10.11.12/32'])}
         result = ipi.policy(feeds, ipi.protected_config(['83.168.92.0/22']), NOW)
         self.assertEqual(result['incoming'], ['1.2.3.4/32', '5.6.7.0/24'])
         self.assertEqual(result['outgoing'], ['5.6.7.0/24'])
 
+    def test_quarantined_ipinsights_never_blocks_public_resolver_replies(self):
+        feed = self.feed(['1.1.1.1/32', '8.8.8.8/32', '1.2.3.4/32'], sha256='a' * 64)
+        self.assertEqual(ipi.policy({'ipinsights': feed}, [], NOW),
+                         {'incoming': [], 'outgoing': [], 'c2_ports': []})
+        self.assertEqual(ipi.active_versions({'ipinsights': feed}, NOW), {})
+        snapshot = ipi.ioc_snapshot({'ipinsights': feed}, [], NOW)
+        self.assertEqual(snapshot['addresses'], [])
+        self.assertEqual(snapshot['networks'], [])
+
     def test_expired_last_good_is_not_reapplied(self):
         feed = self.feed(['1.2.3.4/32'])
         feed['expires_unix'] = NOW
-        self.assertEqual(ipi.policy({'ipinsights': feed}, [], NOW)['incoming'], [])
+        self.assertEqual(ipi.policy({'ipsum3': feed}, [], NOW)['incoming'], [])
 
     def test_nft_transaction_is_scoped_and_keeps_counters_on_refresh(self):
         candidate = {'incoming': ['1.2.3.4/32'], 'outgoing': [], 'c2_ports': [('5.6.7.8', 443)]}
@@ -161,14 +170,14 @@ class IntelligenceTests(unittest.TestCase):
     def test_noop_does_not_rebuild_unchanged_sets_but_renews_before_expiry(self):
         feed = self.feed(['1.2.3.4/32'], sha256='a' * 64)
         feed['expires_unix'] = NOW + 7200
-        state = {'feeds': {'ipinsights': feed}, 'apply_success': True, 'last_apply_unix': NOW - 100,
-                 'kernel_expires_unix': NOW + 3500, 'applied_source_versions': {'ipinsights': 'a' * 64}}
+        state = {'feeds': {'ipsum3': feed}, 'apply_success': True, 'last_apply_unix': NOW - 100,
+                 'kernel_expires_unix': NOW + 3500, 'applied_source_versions': {'ipsum3': 'a' * 64}}
         self.assertFalse(ipi.refresh_required(state, NOW))
         self.assertTrue(ipi.refresh_required(state, NOW + 1701))
         state['kernel_expires_unix'] = NOW + 500
         self.assertTrue(ipi.refresh_required(state, NOW))
         state['kernel_expires_unix'] = NOW + 3500
-        state['feeds']['ipinsights']['sha256'] = 'b' * 64
+        state['feeds']['ipsum3']['sha256'] = 'b' * 64
         self.assertTrue(ipi.refresh_required(state, NOW))
 
     def test_failed_apply_or_clock_reversal_never_takes_noop_path(self):
