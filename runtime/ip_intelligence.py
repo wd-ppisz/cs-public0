@@ -5,6 +5,7 @@ Feed data is parsed as data. No provider rule or script is executed. Exploit
 signatures, their journal, NFQUEUE and the Suricata process remain separately owned.
 """
 import argparse
+import base64
 import concurrent.futures
 import datetime as dt
 import email.utils
@@ -15,14 +16,16 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import struct
 import time
 import urllib.parse
 import urllib.request
+import zlib
 
 MAX_BYTES = 16 * 1024 * 1024
 MAX_ENTRIES = 1000000
 TABLE = 'cs_public0_ioc'
-OWNER = 'cs-public0-ip-intelligence-v1'
+OWNER = 'cs-public0-ip-intelligence-v2-ingress-syn'
 SPECIAL = tuple(ipaddress.ip_network(x) for x in (
     '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16',
     '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24', '192.168.0.0/16',
@@ -31,13 +34,13 @@ SOURCES = {
     # INC-2026-11-09: this feed included public resolvers (1.1.1.1, 8.8.8.8).
     # Quarantine it from enforcement; valid syntax/freshness does not qualify an IP for DROP.
     'ipinsights': {'url': 'https://www.ipinsights.io/downloads/blocklist.txt', 'format': 'addresses', 'mode': 'detect', 'interval': 3600, 'age': 86400},
-    'feodo': {'url': 'https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt', 'format': 'addresses', 'mode': 'outbound_drop', 'interval': 300, 'age': 86400},
+    'feodo': {'url': 'https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt', 'format': 'addresses', 'mode': 'detect', 'interval': 300, 'age': 86400},
     'ipsum3': {'url': 'https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt', 'format': 'addresses', 'mode': 'inbound_drop', 'interval': 3600, 'age': 172800,
                'github': ('stamparm/ipsum', 'levels/3.txt')},
     'firehol1': {'url': 'https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset', 'format': 'networks', 'mode': 'detect', 'interval': 3600, 'age': 172800,
                  'github': ('firehol/blocklist-ipsets', 'firehol_level1.netset')},
-    'spamhaus': {'url': 'https://www.spamhaus.org/drop/drop_v4.json', 'format': 'spamhaus', 'mode': 'both_drop', 'interval': 3600, 'age': 172800},
-    'threatfox': {'url': 'https://threatfox-api.abuse.ch/api/v1/', 'format': 'threatfox', 'mode': 'c2_port_drop', 'interval': 3600, 'age': 86400},
+    'spamhaus': {'url': 'https://www.spamhaus.org/drop/drop_v4.json', 'format': 'spamhaus', 'mode': 'inbound_drop', 'interval': 3600, 'age': 172800},
+    'threatfox': {'url': 'https://threatfox-api.abuse.ch/api/v1/', 'format': 'threatfox', 'mode': 'detect', 'interval': 3600, 'age': 86400},
     'otx': {'url': 'https://otx.alienvault.com/api/v1/pulses/subscribed?limit=50', 'format': 'otx', 'mode': 'detect', 'interval': 3600, 'age': 86400},
 }
 
@@ -248,21 +251,19 @@ def policy(feeds, protected, now):
             continue
         mode = SOURCES[name]['mode']
         nets = admitted(data['addresses'], protected)
-        if mode in {'inbound_drop', 'both_drop'}:
+        if mode == 'inbound_drop':
             result['incoming'].extend(nets)
-        if mode in {'outbound_drop', 'both_drop'}:
-            result['outgoing'].extend(nets)
-        if mode == 'c2_port_drop':
-            result['c2_ports'].extend((str(ipaddress.ip_network(addr).network_address), port)
-                                      for addr, port in data['endpoints'] if admitted([addr], protected))
     for name in ('incoming', 'outgoing'):
         result[name] = [str(x) for x in ipaddress.collapse_addresses(result[name])]
     result['c2_ports'] = sorted(set(result['c2_ports']))
     return result
 
 
-def nft_batch(candidate, *, create, ttl):
+def nft_batch(candidate, *, create, ttl, protected):
     require(type(ttl) is int and 60 <= ttl <= 86400, 'bounded kernel timeout required')
+    targets = [str(x) for x in protected_config([str(x) for x in protected])]
+    require(targets and len(targets) <= 64, 'explicit bounded protected targets required')
+    require(not candidate['outgoing'] and not candidate['c2_ports'], 'egress enforcement is prohibited')
     for name in ('incoming', 'outgoing'):
         require(len(candidate[name]) <= MAX_ENTRIES, 'kernel element count exceeds bound')
         for text in candidate[name]:
@@ -276,15 +277,19 @@ def nft_batch(candidate, *, create, ttl):
                 f'add set bridge {TABLE} incoming {{ type ipv4_addr; flags interval,timeout; timeout {ttl}s; auto-merge; }}',
                 f'add set bridge {TABLE} outgoing {{ type ipv4_addr; flags interval,timeout; timeout {ttl}s; auto-merge; }}',
                 f'add set bridge {TABLE} c2_ports {{ type ipv4_addr . inet_service; flags timeout; timeout {ttl}s; }}',
+                f'add set bridge {TABLE} protected {{ type ipv4_addr; flags interval,timeout; timeout {ttl}s; auto-merge; }}',
                 f'add counter bridge {TABLE} incoming_dropped', f'add counter bridge {TABLE} outgoing_dropped',
                 f'add counter bridge {TABLE} c2_dropped',
                 f'add chain bridge {TABLE} public0_forward {{ type filter hook forward priority -250; policy accept; }}']
         prefix = f'add rule bridge {TABLE} public0_forward meta ibrname "public0" meta obrname "public0" ether type ip '
-        out += [prefix + f'ip saddr @incoming counter name incoming_dropped drop comment "{OWNER}:incoming"',
-                prefix + f'ip daddr @outgoing counter name outgoing_dropped drop comment "{OWNER}:outgoing"',
-                prefix + f'meta l4proto {{ tcp, udp }} ip daddr . th dport @c2_ports counter name c2_dropped drop comment "{OWNER}:c2"']
+        # TCP initiation evidence is in this packet. Never infer initiation from
+        # a missing conntrack entry (asymmetric routes, migration, expiry).
+        out += [prefix + 'ip daddr @protected ip saddr @incoming '
+                'tcp flags & (fin | syn | rst | ack) == syn '
+                f'counter name incoming_dropped drop comment "{OWNER}:incoming-syn"']
     else:
-        out += [f'flush set bridge {TABLE} {name}' for name in ('incoming', 'outgoing', 'c2_ports')]
+        out += [f'flush set bridge {TABLE} {name}' for name in ('incoming', 'outgoing', 'c2_ports', 'protected')]
+    out.append(f'add element bridge {TABLE} protected {{ ' + ', '.join(x + f' timeout {ttl}s' for x in targets) + ' }')
     for name in ('incoming', 'outgoing'):
         values = candidate[name]
         # Batches remain one nft transaction; chunks bound the individual parser expression.
@@ -315,7 +320,7 @@ def owned_table(*, terse=False):
     rows = json.loads(result.stdout)['nftables']
     table = [x['table'] for x in rows if 'table' in x]
     require(len(table) == 1 and table[0].get('comment') == OWNER, 'IOC table is not owned')
-    require({x['set']['name'] for x in rows if 'set' in x} == {'incoming', 'outgoing', 'c2_ports'}, 'IOC sets changed')
+    require({x['set']['name'] for x in rows if 'set' in x} == {'incoming', 'outgoing', 'c2_ports', 'protected'}, 'IOC sets changed')
     for row in (x['set'] for x in rows if 'set' in x):
         require(row['type'] == (['ipv4_addr', 'inet_service'] if row['name'] == 'c2_ports' else 'ipv4_addr')
                 and set(row.get('flags', [])) == ({'timeout'} if row['name'] == 'c2_ports' else {'interval', 'timeout'})
@@ -324,17 +329,16 @@ def owned_table(*, terse=False):
     require(len(chains) == 1 and chains[0]['name'] == 'public0_forward' and chains[0]['hook'] == 'forward'
             and chains[0]['prio'] == -250 and chains[0]['policy'] == 'accept', 'IOC chain changed')
     rules = [x['rule'] for x in rows if 'rule' in x]
-    require(len(rules) == 3 and [x.get('comment') for x in rules] == [OWNER + ':incoming', OWNER + ':outgoing', OWNER + ':c2'],
+    require(len(rules) == 1 and [x.get('comment') for x in rules] == [OWNER + ':incoming-syn'],
             'IOC rules changed')
     common = [{'match': {'op': '==', 'left': {'meta': {'key': name}}, 'right': 'public0'}}
               for name in ('ibrname', 'obrname')]
-    expected = [common + [{'match': {'op': '==', 'left': {'payload': {'protocol': 'ip', 'field': field}},
-                                    'right': '@' + name}}, {'counter': name + '_dropped'}, {'drop': None}]
-                for field, name in [('saddr', 'incoming'), ('daddr', 'outgoing')]]
-    expected.append(common + [{'match': {'op': '==', 'left': {'meta': {'key': 'l4proto'}}, 'right': {'set': ['tcp', 'udp']}}},
-                             {'match': {'op': '==', 'left': {'concat': [{'payload': {'protocol': 'ip', 'field': 'daddr'}},
-                                                                     {'payload': {'protocol': 'th', 'field': 'dport'}}]},
-                                        'right': '@c2_ports'}}, {'counter': 'c2_dropped'}, {'drop': None}])
+    expected = [common + [
+        {'match': {'op': '==', 'left': {'payload': {'protocol': 'ip', 'field': 'daddr'}}, 'right': '@protected'}},
+        {'match': {'op': '==', 'left': {'payload': {'protocol': 'ip', 'field': 'saddr'}}, 'right': '@incoming'}},
+        {'match': {'op': '==', 'left': {'&': [{'payload': {'protocol': 'tcp', 'field': 'flags'}},
+                                            ['fin', 'syn', 'rst', 'ack']]}, 'right': 'syn'}},
+        {'counter': 'incoming_dropped'}, {'drop': None}]]
     require([r['expr'] for r in rules] == expected, 'IOC rule expressions changed')
     require({x['counter']['name'] for x in rows if 'counter' in x} ==
             {'incoming_dropped', 'outgoing_dropped', 'c2_dropped'}, 'IOC counters changed')
@@ -356,7 +360,7 @@ def network_interval(value):
     return int(net.network_address), int(net.broadcast_address)
 
 
-def verify_members(rows, candidate):
+def verify_members(rows, candidate, protected):
     """Compare actual kernel members, including nft's automatic interval merging."""
     actual = {}
     for row in (x['set'] for x in rows if 'set' in x):
@@ -378,8 +382,9 @@ def verify_members(rows, candidate):
             else:
                 raise ValueError('unknown kernel interval representation')
         actual[row['name']] = sorted(values) if row['name'] == 'c2_ports' else intervals(values)
-    for name in ('incoming', 'outgoing'):
-        require(actual.get(name) == intervals(network_interval(x) for x in candidate[name]), 'kernel members differ: ' + name)
+    for name in ('incoming', 'outgoing', 'protected'):
+        values = [str(x) for x in protected] if name == 'protected' else candidate[name]
+        require(actual.get(name) == intervals(network_interval(x) for x in values), 'kernel members differ: ' + name)
     require(actual.get('c2_ports') == sorted(tuple(x) for x in candidate['c2_ports']), 'kernel endpoints differ')
 
 
@@ -411,24 +416,27 @@ def metrics(state, now):
 
 
 def ioc_snapshot(feeds, protected, now):
-    """A generated IP snapshot for the existing EVE observer; no domain-coverage claim."""
-    hosts, prefixes, expirations = set(), set(), []
-    for name, feed in feeds.items():
-        # Quarantined scanner data must not label outgoing connections as C2.
-        if name == 'ipinsights' or name not in SOURCES or not feed['fetched_unix'] <= now < feed['expires_unix']:
+    """Bounded packed reputation ranges, including detection-only IPInsights."""
+    sources, expirations = [], []
+    for name, feed in sorted(feeds.items()):
+        if name not in SOURCES or not feed['fetched_unix'] <= now < feed['expires_unix']:
             continue
+        ranges = intervals(network_interval(str(net)) for net in admitted(feed['addresses'], protected))
+        require(len(ranges) <= MAX_ENTRIES, 'observer source range bound exceeded')
+        packed = b''.join(struct.pack('!II', start, finish) for start, finish in ranges)
+        sources.append({'name': name, 'mode': SOURCES[name]['mode'],
+                        'ranges_zlib_b64': base64.b64encode(zlib.compress(packed)).decode('ascii'),
+                        'range_count': len(ranges), 'sha256': feed.get('sha256', sha(packed)),
+                        'fetched_unix': feed['fetched_unix'], 'expires_unix': feed['expires_unix']})
         expirations.append(feed['expires_unix'])
-        for net in admitted(feed['addresses'], protected):
-            if net.prefixlen == 32:
-                hosts.add(str(net.network_address))
-            else:
-                prefixes.add(str(net))
-    require(len(hosts) <= 65536 and len(prefixes) <= 65536, 'observer IOC bound exceeded')
-    content = {'addresses': sorted(hosts), 'networks': sorted(prefixes)}
+    content = {'sources': sources}
+    require(sum(x['range_count'] for x in sources) <= MAX_ENTRIES, 'observer aggregate range bound exceeded')
     digest = sha(json.dumps(content, sort_keys=True, separators=(',', ':')).encode())
-    return {'schema': 'cs-public0-egress-ioc-v2', 'source': 'cs-public0 IP intelligence generated snapshot',
+    result = {'schema': 'cs-public0-egress-ioc-v3', 'source': 'cs-public0 IP reputation observations',
             'version': digest, 'content_sha256': digest, 'published_unix': now, 'fetched_unix': now,
             'expires_unix': min([now + 86400, *expirations]), **content}
+    require(len(encoded(result)) <= 4 * 1024 * 1024, 'observer serialized bound exceeded')
+    return result
 
 
 def active_versions(feeds, now):
@@ -512,13 +520,13 @@ def main():
                                if name in SOURCES and SOURCES[name]['mode'] != 'detect'
                                and x['fetched_unix'] <= now < x['expires_unix'] - 60]
                 ttl = min([3600, *expirations])
-                batch = nft_batch(candidate, create=rows is None, ttl=ttl)
+                batch = nft_batch(candidate, create=rows is None, ttl=ttl, protected=protected)
                 atomic(root / 'pending.nft', batch)
                 nft('--check', '--file', str(root / 'pending.nft'))
                 nft('--file', str(root / 'pending.nft'))
                 rows = owned_table()
                 require(rows is not None, 'IOC table absent after apply')
-                verify_members(rows, candidate)
+                verify_members(rows, candidate, protected)
                 state.update(apply_success=True, last_apply_unix=int(time.time()), policy_sha256=sha(encoded(candidate)))
                 state.pop('apply_error', None)
                 state['applied_source_versions'] = active_versions(state['feeds'], now)
