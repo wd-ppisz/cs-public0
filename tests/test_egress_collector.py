@@ -82,7 +82,9 @@ class EgressCollector(unittest.TestCase):
         self.assertEqual(self.count("observation:c2:high:egress"), 1)
         self.assertEqual(self.scalar("source_fresh"), 1)
         text = pathlib.Path(self.cfg["metrics_file"]).read_text()
-        self.assertEqual(len(text.splitlines()), 86)
+        self.assertEqual(len(text.splitlines()), 148)
+        self.assertIn('cs_public0_egress_observations_v2_total{category="c2",severity="high",direction="egress"} 1', text)
+        self.assertEqual(self.scalar("classification_v2_ready"), 1)
         for sensitive in ("192.0.2.4", "198.51.100.7", "9900001", "flow_id", "secret"):
             self.assertNotIn(sensitive, text)
         state = (self.root / "state/state.sqlite3").read_bytes()
@@ -98,6 +100,38 @@ class EgressCollector(unittest.TestCase):
         self.assertEqual(self.count("record:accepted"), 1)
         self.assertEqual(len(self.details()), 1)
         self.assertGreaterEqual(self.count("record:duplicate"), 1)
+
+    def test_v2_does_not_import_legacy_scan_noise(self):
+        self.append(stats())
+        self.assertTrue(self.run_once()["success"])
+        with sqlite3.connect(self.root / "state/state.sqlite3") as db:
+            db.execute("INSERT INTO counts VALUES (?,?)", ("observation:scan:low:egress", 50000))
+        self.append(alert(), flow())
+        self.assertTrue(self.run_once(NOW + 1)["success"])
+        self.assertEqual(self.count("observation:scan:low:egress"), 50000)
+        self.assertEqual(self.count("observation_v2:scan:low:egress"), 0)
+        self.assertEqual(self.count("observation_v2:c2:high:egress"), 1)
+        self.assertTrue(self.run_once(NOW + 2)["success"])
+        self.assertEqual(self.count("observation_v2:c2:high:egress"), 1)
+
+    def test_pending_ipinsights_egress_is_filtered_but_signature_scan_is_preserved(self):
+        source = {"name": "ipinsights", "expires_unix": NOW + 600}
+        store = c.Store(self.root / "isolated.sqlite3")
+        try:
+            consumer = c.Consumer(store, self.cfg, c.Catalog(self.cat))
+            for index, kind in enumerate(("ioc_contact_observation", "signature_match")):
+                candidate = {"event_id": str(index), "category": "scan", "severity": "low",
+                             "direction": "egress", "observed_unix": NOW,
+                             "limitations": [], "evidence_kind": kind,
+                             "ioc": {"matched_sources": [source], "expires_unix": NOW + 600}}
+                consumer.publish(candidate, alert(), flow(), NOW)
+            rows = [json.loads(row[0]) for row in store.db.execute("SELECT body FROM outbox ORDER BY rowid")]
+            self.assertEqual([row["category"] for row in rows], ["scan"])
+            self.assertTrue(all(row["classification_revision"] == 2 for row in rows))
+            self.assertIsNone(rows[0]['ioc'])
+            self.assertEqual(store.db.execute("SELECT value FROM counts WHERE key='record:ipinsights_non_ingress_filtered'").fetchone()[0], 1)
+        finally:
+            store.db.close()
 
     def test_initial_end_does_not_replay_old_history_or_claim_fresh_stats(self):
         self.cfg["initial_position"] = "end"

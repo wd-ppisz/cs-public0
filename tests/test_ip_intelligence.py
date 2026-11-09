@@ -12,7 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'runtime'))
 import ip_intelligence as ipi
 import policy_inventory as inv
-from egress_model import IOC
+from egress_model import IOC, qualify_feed_roles
 
 NOW = 1794168000
 
@@ -108,6 +108,7 @@ class IntelligenceTests(unittest.TestCase):
         match = IOC(snapshot).match('1.1.1.1', NOW)
         self.assertEqual(match['matched_sources'][0]['name'], 'ipinsights')
         self.assertEqual(match['severity'], 'low')
+        self.assertEqual(match['category'], 'reputation')
         self.assertEqual(match['enforcement'], 'none')
 
     def test_outgoing_threatfox_and_feodo_are_observation_only(self):
@@ -141,6 +142,25 @@ class IntelligenceTests(unittest.TestCase):
         self.assertEqual([x['name'] for x in match['matched_sources']], ['ipinsights', 'spamhaus'])
         self.assertEqual(match['enforcement'], 'none')
         self.assertEqual(match['severity'], 'high')
+        self.assertEqual(match['category'], 'ioc')
+
+    def test_attacker_source_feed_cannot_accuse_an_egress_destination(self):
+        original = {'direction': 'egress', 'category': 'reputation', 'severity': 'low',
+                    'evidence_kind': 'ioc_contact_observation', 'signature': None,
+                    'ioc': {'matched_sources': [{'name': 'ipinsights'}]}}
+        for direction in ('egress', 'unknown'):
+            item = copy.deepcopy(original); item['direction'] = direction
+            self.assertIsNone(qualify_feed_roles(item))
+        inbound = copy.deepcopy(original); inbound['direction'] = 'ingress'
+        self.assertEqual(qualify_feed_roles(inbound)['category'], 'reputation')
+        signature = copy.deepcopy(original)
+        signature.update(category='scan', evidence_kind='signature_match', signature={'sid': 1})
+        self.assertEqual(qualify_feed_roles(signature)['category'], 'scan')
+        self.assertIsNone(signature['ioc'])
+        mixed = copy.deepcopy(original)
+        mixed.update(category='ioc', severity='high')
+        mixed['ioc']['matched_sources'].append({'name': 'threatfox'})
+        self.assertEqual(qualify_feed_roles(mixed)['ioc']['matched_sources'], [{'name': 'threatfox'}])
 
     def test_expired_last_good_is_not_reapplied(self):
         feed = self.feed(['1.2.3.4/32'])
