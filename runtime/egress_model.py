@@ -1,11 +1,16 @@
 """Bounded, pure classification of EVE observations; no enforcement or I/O."""
 from __future__ import annotations
 
+import base64
+import bisect
 import hashlib
 import ipaddress
 import json
 import math
 import re
+import sys
+import zlib
+from array import array
 from datetime import datetime
 
 CATEGORIES = ("c2", "ioc", "scan", "other")
@@ -259,7 +264,7 @@ def direction(event, flow, nets):
 
 class IOC:
     def __init__(self, data):
-        if not isinstance(data, dict) or data.get("schema") not in {"cs-public0-egress-ioc-v1", "cs-public0-egress-ioc-v2"}:
+        if not isinstance(data, dict) or data.get("schema") not in {"cs-public0-egress-ioc-v1", "cs-public0-egress-ioc-v2", "cs-public0-egress-ioc-v3"}:
             raise ValueError("IOC schema")
         self.source = text(data["source"], 256)
         self.version = text(data["version"], 128)
@@ -271,12 +276,54 @@ class IOC:
         self.expires = integer(data["expires_unix"])
         if not self.published <= self.fetched < self.expires <= self.published + 86400:
             raise ValueError("IOC freshness bounds")
-        addresses = data["addresses"]
+        self.source_ranges = []
+        if data['schema'] == 'cs-public0-egress-ioc-v3' and ('addresses' in data or 'networks' in data):
+            raise ValueError('IOC v3 mixed legacy content')
+        addresses = [] if data['schema'] == 'cs-public0-egress-ioc-v3' else data['addresses']
         if not isinstance(addresses, list) or len(addresses) > 65536:
             raise ValueError("IOC address bound")
         self.addresses = frozenset(ipv4(x) for x in addresses)
         self.prefixes = {}
-        if data["schema"] == "cs-public0-egress-ioc-v2":
+        if data['schema'] == 'cs-public0-egress-ioc-v3':
+            sources = data['sources']
+            if not isinstance(sources, list) or len(sources) > 7:
+                raise ValueError('IOC source bound')
+            names, total = [], 0
+            for source in sources:
+                name = text(source['name'], 64)
+                if not re.fullmatch(r'[a-z0-9_]+', name) or source['mode'] not in {'detect', 'inbound_drop'}:
+                    raise ValueError('IOC source metadata')
+                names.append(name)
+                count = integer(source['range_count'], 0, 1000000)
+                total += count
+                if total > 1000000 or not SHA.fullmatch(source['sha256']):
+                    raise ValueError('IOC aggregate range bound or source hash')
+                fetched = integer(source['fetched_unix'])
+                expires = integer(source['expires_unix'])
+                if not fetched <= self.fetched < expires:
+                    raise ValueError('IOC source freshness')
+                encoded = text(source['ranges_zlib_b64'], 4 * 1024 * 1024)
+                compressed = base64.b64decode(encoded, validate=True)
+                decoder = zlib.decompressobj()
+                packed = decoder.decompress(compressed, count * 8 + 1)
+                if (len(packed) != count * 8 or not decoder.eof or
+                        decoder.unconsumed_tail or decoder.unused_data):
+                    raise ValueError('IOC packed ranges size or trailing data')
+                ranges = array('Q')
+                ranges.frombytes(packed)
+                if sys.byteorder == 'little':
+                    ranges.byteswap()
+                previous = -1
+                for item in ranges:
+                    start, finish = item >> 32, item & 0xffffffff
+                    if not previous < start <= finish:
+                        raise ValueError('IOC ranges overlap or noncanonical order')
+                    previous = finish
+                self.source_ranges.append((source, ranges))
+            if names != sorted(set(names)):
+                raise ValueError('IOC source canonical order')
+            canonical = json.dumps({'sources': sources}, sort_keys=True, separators=(',', ':')).encode()
+        elif data["schema"] == "cs-public0-egress-ioc-v2":
             raw_networks = data["networks"]
             if not isinstance(raw_networks, list) or len(raw_networks) > 65536:
                 raise ValueError("IOC prefix bound")
@@ -302,6 +349,26 @@ class IOC:
     def match(self, address, now):
         if not self.fresh(now):
             return None
+        if self.source_ranges:
+            numeric = int(ipaddress.IPv4Address(address))
+            matches = []
+            for source, ranges in self.source_ranges:
+                if not source['fetched_unix'] <= now < source['expires_unix']:
+                    continue
+                index = bisect.bisect_right(ranges, (numeric << 32) | 0xffffffff) - 1
+                if index >= 0 and numeric <= ranges[index] & 0xffffffff:
+                    entry = {k: source[k] for k in ('name', 'mode', 'sha256', 'fetched_unix', 'expires_unix')}
+                    entry['matched_range'] = (str(ipaddress.IPv4Address(ranges[index] >> 32)) + '-' +
+                                              str(ipaddress.IPv4Address(ranges[index] & 0xffffffff)))
+                    matches.append(entry)
+            if not matches:
+                return None
+            untrusted_only = all(x['name'] == 'ipinsights' for x in matches)
+            return {'source': self.source, 'version': self.version,
+                    'content_sha256': self.content_sha256, 'published_unix': self.published,
+                    'fetched_unix': self.fetched, 'expires_unix': self.expires,
+                    'matched_sources': matches, 'category': 'scan' if untrusted_only else 'ioc',
+                    'severity': 'low' if untrusted_only else 'high', 'enforcement': 'none'}
         prefix = None
         if address not in self.addresses:
             numeric = int(ipaddress.IPv4Address(address))
@@ -385,8 +452,10 @@ def observation(event, flow, config, catalog, source_ref, received_unix, rules_s
     sensor = text(config["sensor_id"], 64)
     epoch = text(config["sensor_epoch"], 128)
     identity = ("egress-v1\0" + sensor + "\0" + epoch + "\0" + event_hash).encode()
-    category = match["category"] if match else "ioc" if ioc_match else "other"
-    severity = match["severity"] if match else "high" if ioc_match else "unknown"
+    category = match["category"] if match else ioc_match.get('category', 'ioc') if ioc_match else "other"
+    severity = match["severity"] if match else ioc_match.get('severity', 'high') if ioc_match else "unknown"
+    if ioc_match:
+        limits.append('REPUTATION_MATCH_IS_NOT_PROOF_OF_MALICIOUS_ACTIVITY')
     has_flow = ("flow_id" in event and isinstance(event.get("flow"), dict) and
                 "start" in event["flow"])
     return {"schema": "cs-public0-egress-event-v1",

@@ -1,8 +1,12 @@
 import datetime as dt
+import base64
+import copy
 import json
 from pathlib import Path
 import sys
+import struct
 import unittest
+import zlib
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'runtime'))
@@ -88,29 +92,81 @@ class IntelligenceTests(unittest.TestCase):
                     expires_unix=NOW + 120, **kwargs)
 
     def test_direction_and_protected_overlap(self):
-        feeds = {'ipinsights': self.feed(['1.2.3.4/32', '83.168.93.5/32']),
+        feeds = {'ipsum3': self.feed(['1.2.3.4/32', '83.168.93.5/32']),
                  'spamhaus': self.feed(['5.6.7.0/24']), 'firehol1': self.feed(['9.10.11.12/32'])}
         result = ipi.policy(feeds, ipi.protected_config(['83.168.92.0/22']), NOW)
         self.assertEqual(result['incoming'], ['1.2.3.4/32', '5.6.7.0/24'])
-        self.assertEqual(result['outgoing'], ['5.6.7.0/24'])
+        self.assertEqual(result['outgoing'], [])
+        self.assertEqual(result['c2_ports'], [])
+
+    def test_quarantined_ipinsights_never_blocks_public_resolver_replies(self):
+        feed = self.feed(['1.1.1.1/32', '8.8.8.8/32', '1.2.3.4/32'], sha256='a' * 64)
+        self.assertEqual(ipi.policy({'ipinsights': feed}, [], NOW),
+                         {'incoming': [], 'outgoing': [], 'c2_ports': []})
+        self.assertEqual(ipi.active_versions({'ipinsights': feed}, NOW), {})
+        snapshot = ipi.ioc_snapshot({'ipinsights': feed}, [], NOW)
+        match = IOC(snapshot).match('1.1.1.1', NOW)
+        self.assertEqual(match['matched_sources'][0]['name'], 'ipinsights')
+        self.assertEqual(match['severity'], 'low')
+        self.assertEqual(match['enforcement'], 'none')
+
+    def test_outgoing_threatfox_and_feodo_are_observation_only(self):
+        feeds = {'feodo': self.feed(['1.2.3.4/32']),
+                 'threatfox': dict(self.feed(['5.6.7.8/32']), endpoints=[('5.6.7.8/32', 443)])}
+        self.assertEqual(ipi.policy(feeds, [], NOW), {'incoming': [], 'outgoing': [], 'c2_ports': []})
+        self.assertIsNotNone(IOC(ipi.ioc_snapshot(feeds, [], NOW)).match('5.6.7.8', NOW))
+
+    def test_packed_ioc_rejects_bombs_trailing_streams_and_corrupt_ranges(self):
+        original = ipi.ioc_snapshot({'ipinsights': self.feed(['1.1.1.1/32'])}, [], NOW)
+        cases = [
+            (1, zlib.compress(b'x' * 1000000)),
+            (1, zlib.compress(struct.pack('!II', 1, 1)) + zlib.compress(b'other')),
+            (1, zlib.compress(struct.pack('!II', 9, 1))),
+            (2, zlib.compress(struct.pack('!IIII', 1, 9, 8, 10))),
+        ]
+        for count, packed in cases:
+            with self.subTest(count=count, size=len(packed)), self.assertRaises(ValueError):
+                data = copy.deepcopy(original)
+                data['sources'][0].update(range_count=count, ranges_zlib_b64=base64.b64encode(packed).decode())
+                data['content_sha256'] = ipi.sha(json.dumps({'sources': data['sources']}, sort_keys=True,
+                                                          separators=(',', ':')).encode())
+                IOC(data)
+
+    def test_overlap_keeps_both_source_receipts_and_ipinsights_alone_low(self):
+        feeds = {'ipinsights': self.feed(['1.1.1.1/32', '5.6.7.8/32']),
+                 'spamhaus': self.feed(['5.6.7.0/24'])}
+        ioc = IOC(ipi.ioc_snapshot(feeds, [], NOW))
+        self.assertEqual(ioc.match('1.1.1.1', NOW)['severity'], 'low')
+        match = ioc.match('5.6.7.8', NOW)
+        self.assertEqual([x['name'] for x in match['matched_sources']], ['ipinsights', 'spamhaus'])
+        self.assertEqual(match['enforcement'], 'none')
+        self.assertEqual(match['severity'], 'high')
 
     def test_expired_last_good_is_not_reapplied(self):
         feed = self.feed(['1.2.3.4/32'])
         feed['expires_unix'] = NOW
-        self.assertEqual(ipi.policy({'ipinsights': feed}, [], NOW)['incoming'], [])
+        self.assertEqual(ipi.policy({'ipsum3': feed}, [], NOW)['incoming'], [])
 
     def test_nft_transaction_is_scoped_and_keeps_counters_on_refresh(self):
-        candidate = {'incoming': ['1.2.3.4/32'], 'outgoing': [], 'c2_ports': [('5.6.7.8', 443)]}
-        first = ipi.nft_batch(candidate, create=True, ttl=3600).decode()
+        candidate = {'incoming': ['1.2.3.4/32'], 'outgoing': [], 'c2_ports': []}
+        first = ipi.nft_batch(candidate, create=True, ttl=3600, protected=['83.168.93.0/24']).decode()
         self.assertIn('meta ibrname "public0" meta obrname "public0"', first)
         self.assertIn('priority -250', first)
         self.assertNotIn('flush ruleset', first)
         self.assertIn('timeout 3600s', first)
-        self.assertIn('5.6.7.8 . 443', first)
-        refresh = ipi.nft_batch(candidate, create=False, ttl=3600).decode()
+        self.assertIn('ip daddr @protected ip saddr @incoming tcp flags', first)
+        self.assertIn('(fin | syn | rst | ack) == syn', first)
+        self.assertNotIn('ip daddr @outgoing', first)
+        refresh = ipi.nft_batch(candidate, create=False, ttl=3600, protected=['83.168.93.0/24']).decode()
         self.assertNotIn('add chain', refresh)
         self.assertNotIn('add counter', refresh)
         self.assertNotIn('delete table', refresh)
+
+    def test_kernel_builder_refuses_any_outgoing_enforcement(self):
+        for candidate in ({'incoming': [], 'outgoing': ['1.1.1.1/32'], 'c2_ports': []},
+                          {'incoming': [], 'outgoing': [], 'c2_ports': [('1.1.1.1', 443)]}):
+            with self.assertRaisesRegex(ValueError, 'egress enforcement is prohibited'):
+                ipi.nft_batch(candidate, create=True, ttl=3600, protected=['83.168.93.0/24'])
 
     def test_redirect_and_credential_host_rejected(self):
         for url in ('http://ipinsights.io/x', 'https://evil.example/feed', 'https://user@www.ipinsights.io/x'):
@@ -144,31 +200,31 @@ class IntelligenceTests(unittest.TestCase):
                  'ipinsights': self.feed(['1.2.3.4/32'])}
         result = ipi.ioc_snapshot(feeds, [], NOW)
         ioc = IOC(result)
-        self.assertEqual(ioc.match('5.6.7.99', NOW)['matched_prefix'], '5.6.7.0/24')
+        self.assertEqual(ioc.match('5.6.7.99', NOW)['matched_sources'][0]['matched_range'], '5.6.7.0-5.6.7.255')
         self.assertIsNotNone(ioc.match('9.10.11.12', NOW))
         self.assertIsNone(ioc.match('5.6.8.1', NOW))
-        self.assertIsNone(ioc.match('1.2.3.4', NOW))
+        self.assertEqual(ioc.match('1.2.3.4', NOW)['matched_sources'][0]['name'], 'ipinsights')
         self.assertIsNone(ioc.match('5.6.7.99', NOW + 120))
 
     def test_observer_snapshot_content_hash_and_own_exemptions(self):
         result = ipi.ioc_snapshot({'spamhaus': self.feed(['5.6.7.0/24'])},
                                   ipi.protected_config(['5.6.7.4/32']), NOW)
-        self.assertEqual(result['networks'], [])
-        result['networks'] = ['5.6.7.0/24']
+        self.assertIsNone(IOC(result).match('5.6.7.5', NOW))
+        result['sources'][0]['range_count'] = 1
         with self.assertRaises(ValueError):
             IOC(result)
 
     def test_noop_does_not_rebuild_unchanged_sets_but_renews_before_expiry(self):
         feed = self.feed(['1.2.3.4/32'], sha256='a' * 64)
         feed['expires_unix'] = NOW + 7200
-        state = {'feeds': {'ipinsights': feed}, 'apply_success': True, 'last_apply_unix': NOW - 100,
-                 'kernel_expires_unix': NOW + 3500, 'applied_source_versions': {'ipinsights': 'a' * 64}}
+        state = {'feeds': {'ipsum3': feed}, 'apply_success': True, 'last_apply_unix': NOW - 100,
+                 'kernel_expires_unix': NOW + 3500, 'applied_source_versions': {'ipsum3': 'a' * 64}}
         self.assertFalse(ipi.refresh_required(state, NOW))
         self.assertTrue(ipi.refresh_required(state, NOW + 1701))
         state['kernel_expires_unix'] = NOW + 500
         self.assertTrue(ipi.refresh_required(state, NOW))
         state['kernel_expires_unix'] = NOW + 3500
-        state['feeds']['ipinsights']['sha256'] = 'b' * 64
+        state['feeds']['ipsum3']['sha256'] = 'b' * 64
         self.assertTrue(ipi.refresh_required(state, NOW))
 
     def test_failed_apply_or_clock_reversal_never_takes_noop_path(self):

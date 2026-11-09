@@ -8,7 +8,7 @@
   any_errors_fatal: true
   vars:
     cs_public0_ip_enable: false
-    cs_public0_ip_bundle: /usr/local/libexec/cs-public0-ip-intelligence-v3
+    cs_public0_ip_bundle: /usr/local/libexec/cs-public0-ip-intelligence-v4
     cs_public0_ip_config: /etc/cs-public0/ip-intelligence.json
   tasks:
     - name: Require one explicit host and exact installed configuration/source bytes
@@ -18,6 +18,8 @@
           - target == inventory_hostname
           - ansible_play_hosts_all | length == 1
           - cs_public0_ip_enable is boolean
+          - cs_public0_ip_bundle == '/usr/local/libexec/cs-public0-ip-intelligence-v4'
+          - cs_public0_ip_contract == 'ingress-syn-only-v2'
           - cs_public0_ip_configuration.schema == 'cs-public0-ip-intelligence-v1'
           - cs_public0_ip_configuration.bridge == 'public0'
           - cs_public0_ip_configuration.mode in ['observe', 'apply']
@@ -46,6 +48,13 @@
             import base64, hashlib, json, os, pathlib, stat, subprocess, sys
             pins=json.loads(base64.b64decode(sys.argv[1])); bundle=pathlib.Path(sys.argv[2])
             config=pathlib.Path(sys.argv[3]); expected=sys.argv[4]
+            if not bundle.exists():
+                for unit in ['cs-public0-ip-intelligence.timer','cs-public0-ip-intelligence.service']:
+                    active=subprocess.check_output(['systemctl','show',unit,'-p','ActiveState','--value'],text=True).strip()
+                    enabled=subprocess.run(['systemctl','is-enabled',unit],capture_output=True,text=True).stdout.strip()
+                    if active in ['active','activating','deactivating'] or enabled=='enabled':raise SystemExit('v4 migration requires contained updater')
+                tables=json.loads(subprocess.check_output(['nft','-j','list','tables']))['nftables']
+                if any(x.get('table',{}).get('name')=='cs_public0_ioc' for x in tables):raise SystemExit('v4 migration requires withdrawn old IP table')
             for path in (bundle, config.parent, pathlib.Path('/var/lib/cs-public0-ip-intelligence'), pathlib.Path('/var/lib/node_exporter')):
                 for parent in (path,*path.parents):
                     if not parent.exists(): continue
@@ -91,7 +100,7 @@
         group: root
         mode: "{{ item.mode }}"
       loop:
-        - {path: /usr/local/libexec/cs-public0-ip-intelligence-v3, mode: '0755'}
+        - {path: /usr/local/libexec/cs-public0-ip-intelligence-v4, mode: '0755'}
         - {path: /etc/cs-public0, mode: '0755'}
         - {path: /var/lib/cs-public0-ip-intelligence, mode: '0700'}
 
