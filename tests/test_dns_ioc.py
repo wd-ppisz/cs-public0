@@ -52,7 +52,7 @@ class DNSIOCTests(unittest.TestCase):
             self.assertEqual(self.observe(row), [])
 
     def test_non_ioc_dns_names_are_not_claimed_as_capture_failures(self):
-        for name in ['_dmarc.example.com','_sip._tcp.example.com','localhost','1.1.1.1']:
+        for name in ['', '.', '_dmarc.example.com','_sip._tcp.example.com','localhost','1.1.1.1']:
             row=event();row['dns']['queries'][0]['rrname']=name
             with self.subTest(name=name):self.assertEqual(self.observe(row),[])
 

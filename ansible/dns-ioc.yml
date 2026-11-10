@@ -9,7 +9,7 @@
   any_errors_fatal: true
   vars:
     cs_public0_dns_enable: false
-    cs_public0_dns_bundle: /usr/local/libexec/cs-public0-dns-v1
+    cs_public0_dns_bundle: /usr/local/libexec/cs-public0-dns-v2
     cs_public0_dns_interface: public0
     cs_public0_dns_cluster_id: 97
     cs_public0_dns_log_group: root

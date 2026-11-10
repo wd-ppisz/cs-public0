@@ -101,9 +101,14 @@ def observe_dns(row, config, catalog, source_ref, now):
     for question in questions:
         if not isinstance(question, dict) or question.get('rrname_truncated', False) is not False:
             raise ValueError('DNS question')
-        presented, rrtype = text(question['rrname'], 254), text(question['rrtype'], 16)
+        # EVE v3 presents the DNS root as an empty name. It cannot match a
+        # complete domain IOC, but a legitimate root query is not capture loss.
+        rrtype = text(question['rrtype'], 16)
         if not re.fullmatch(r'[A-Z0-9]+', rrtype):
             raise ValueError('DNS record type')
+        if question.get('rrname') == '':
+            continue
+        presented = text(question['rrname'], 254)
         try:name = domain_name(presented)
         except ValueError:
             # Legal DNS names such as _dmarc, SRV labels or a single local label
