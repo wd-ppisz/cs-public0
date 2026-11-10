@@ -1,0 +1,218 @@
+---
+# Separate passive DNS metadata producer and unprivileged observation reader.
+# Does not modify the inline engine, its YAML, rules, NFQUEUE or nftables.
+- name: Install explicitly selected passive DNS IOC profile
+  hosts: "{{ target | default('cs_public0_no_target') }}"
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    cs_public0_dns_enable: false
+    cs_public0_dns_bundle: /usr/local/libexec/cs-public0-dns-v2
+    cs_public0_dns_interface: public0
+    cs_public0_dns_cluster_id: 97
+    cs_public0_dns_log_group: root
+    cs_public0_dns_log_directory: /var/log/cs-public0-dns
+  tasks:
+    - name: Require one explicit target and exact reviewed source policy
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - target == inventory_hostname
+          - ansible_play_hosts_all | length == 1
+          - cs_public0_dns_enable is boolean
+          - cs_public0_dns_log_group is match('^[a-z_][a-z0-9_-]{0,31}$')
+          - cs_public0_dns_source is defined
+          - cs_public0_dns_pins.keys() | list | sort == ['dns_ioc.py', 'egress_collector.py', 'egress_model.py']
+          - cs_public0_dns_binary is match('^/(opt|usr)/[a-zA-Z0-9_./-]+$')
+          - cs_public0_dns_binary_sha256 is match('^[a-f0-9]{64}$')
+          - cs_public0_dns_bundle is match('^/usr/local/libexec/cs-public0-dns-v[0-9]+$')
+          - cs_public0_dns_interface is match('^[a-zA-Z0-9_.:-]{1,15}$')
+          - cs_public0_dns_cluster_id | int >= 1
+          - cs_public0_dns_cluster_id | int <= 65535
+          - cs_public0_dns_configuration.schema == 'cs-public0-dns-config-v1'
+          - cs_public0_dns_configuration.sensor_id == inventory_hostname.split('.')[0]
+          - cs_public0_dns_configuration.initial_position == 'end'
+          - cs_public0_dns_configuration.eve_file == '/var/log/cs-public0-dns/eve.json'
+          - cs_public0_dns_configuration.state_directory == '/var/lib/cs-public0-dns'
+          - cs_public0_dns_configuration.details_file == '/var/lib/cs-public0-dns-log/events.jsonl'
+          - cs_public0_dns_configuration.updater_state_file == '/var/lib/cs-public0-ip-intelligence/state.json'
+          - cs_public0_dns_configuration.updater_module_file is match('^/usr/local/libexec/cs-public0-ip-intelligence-v[0-9]+/ip_intelligence.py$')
+          - cs_public0_dns_configuration.updater_module_sha256 is match('^[a-f0-9]{64}$')
+          - cs_public0_dns_configuration.metrics_file is match('^/var/lib/[a-zA-Z0-9_/-]+/cs_public0_dns[.]prom$')
+          - cs_public0_dns_config_bytes | from_json == cs_public0_dns_configuration
+          - cs_public0_dns_config_bytes | hash('sha256') == cs_public0_dns_config_sha256
+
+    - name: Render exact owned artifacts for guarded installation
+      ansible.builtin.set_fact:
+        cs_public0_dns_artifacts:
+          - {path: /etc/cs-public0/dns-ioc.json, raw: "{{ cs_public0_dns_config_bytes }}", mode: '0600'}
+          - {path: /etc/cs-public0/passive-dns.yaml, raw: "{{ lookup('ansible.builtin.template', '../config/suricata-dns.yaml.j2') }}", mode: '0600'}
+          - {path: /etc/systemd/system/cs-public0-dns.service, raw: "{{ lookup('ansible.builtin.template', '../config/cs-public0-dns.service.j2') }}", mode: '0644'}
+          - {path: /etc/systemd/system/cs-public0-dns-ioc.service, raw: "{{ lookup('ansible.builtin.template', '../config/cs-public0-dns-ioc.service.j2') }}", mode: '0644'}
+          - {path: /etc/systemd/system/cs-public0-dns-ioc.timer, raw: "{{ lookup('ansible.builtin.file', '../config/cs-public0-dns-ioc.timer', rstrip=false) }}", mode: '0644'}
+          - {path: /etc/logrotate.d/cs-public0-dns, raw: "{{ lookup('ansible.builtin.file', '../config/cs-public0-dns.logrotate', rstrip=false) }}", mode: '0644'}
+          - {path: /etc/cron.d/cs-public0-dns, raw: "*/2 * * * * root /usr/sbin/logrotate --state /var/lib/cs-public0-dns/logrotate.status /etc/logrotate.d/cs-public0-dns\n", mode: '0644'}
+
+    - name: Refuse drift, unsafe ancestors or changed source pins
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import grp,hashlib,json,pathlib,stat,subprocess,sys
+            p=json.load(sys.stdin);cfg=p['config'];bundle=pathlib.Path(p['bundle'])
+            sha=lambda raw:hashlib.sha256(raw).hexdigest()
+            try:system_log_gid=grp.getgrnam('syslog').gr_gid
+            except KeyError:system_log_gid=None
+            def safe_directory(path,info,log_gid):
+                system_log=(path==pathlib.Path('/var/log') and stat.S_IMODE(info.st_mode)==0o775
+                    and log_gid is not None and info.st_gid==log_gid)
+                return stat.S_ISDIR(info.st_mode) and info.st_uid==0 and (not info.st_mode&0o022 or system_log)
+            def read(path,maximum):
+                path=pathlib.Path(path);s=path.lstat()
+                if not stat.S_ISREG(s.st_mode) or s.st_uid!=0 or s.st_nlink!=1 or s.st_mode&0o022 or s.st_size>maximum:
+                    raise SystemExit('unsafe source artifact')
+                return path.read_bytes()
+            if sha(read(p['binary'],64*1024*1024))!=p['binary_sha256']:
+                raise SystemExit('engine pin differs')
+            if sha(read(cfg['updater_module_file'],128*1024))!=cfg['updater_module_sha256']:
+                raise SystemExit('updater parser policy differs')
+            if not pathlib.Path('/sys/class/net',p['interface'],'bridge').is_dir():
+                raise SystemExit('explicit passive bridge does not exist')
+            if not pathlib.Path('/etc/cs-public0').is_dir():
+                raise SystemExit('installed public0 configuration directory required')
+            if subprocess.run(['systemctl','is-active','--quiet','cron.service'],timeout=5).returncode!=0:
+                raise SystemExit('active cron is required for bounded raw DNS retention')
+            directories=[bundle,pathlib.Path('/etc/cs-public0'),pathlib.Path('/var/lib/cs-public0-dns'),
+                pathlib.Path('/var/lib/cs-public0-dns-log'),pathlib.Path('/var/log/cs-public0-dns'),
+                pathlib.Path(cfg['metrics_file']).parent,pathlib.Path('/etc/systemd/system'),
+                pathlib.Path('/etc/logrotate.d'),pathlib.Path('/etc/cron.d')]
+            for path in directories+[pathlib.Path(p['binary']).parent,pathlib.Path(cfg['updater_module_file']).parent]:
+                for a in (path,*path.parents):
+                    try:s=a.lstat()
+                    except FileNotFoundError:continue
+                    if not safe_directory(a,s,system_log_gid):
+                        raise SystemExit('unsafe installation ancestor')
+            active=False
+            for unit in ('cs-public0-dns.service','cs-public0-dns-ioc.service','cs-public0-dns-ioc.timer'):
+                r=subprocess.run(['systemctl','show',unit,'-p','ActiveState','--value'],capture_output=True,timeout=5)
+                if r.returncode not in (0,4):raise SystemExit('unknown DNS unit state')
+                if r.stdout.strip() not in (b'',b'inactive',b'failed'):active=True
+            targets={pathlib.Path(x['path']):sha(x['raw'].encode()) for x in p['artifacts']}
+            targets.update({bundle/n:h for n,h in p['pins'].items()})
+            if bundle.exists() and {x.name for x in bundle.iterdir()}-set(p['pins']):
+                raise SystemExit('foreign DNS bundle inventory')
+            for path,expected in targets.items():
+                if path.exists() or path.is_symlink():
+                    if sha(read(path,4*1024*1024))!=expected:
+                        raise SystemExit('installed DNS artifact differs; explicit migration required')
+                elif active:
+                    raise SystemExit('active DNS profile has incomplete artifacts')
+        stdin: "{{ {'config': cs_public0_dns_configuration, 'bundle': cs_public0_dns_bundle, 'pins': cs_public0_dns_pins, 'artifacts': cs_public0_dns_artifacts, 'binary': cs_public0_dns_binary, 'binary_sha256': cs_public0_dns_binary_sha256, 'interface': cs_public0_dns_interface} | to_json }}"
+      changed_when: false
+
+    - name: Check exact local runtime sources
+      ansible.builtin.stat:
+        path: "{{ cs_public0_dns_source }}/{{ item.key }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      loop: "{{ cs_public0_dns_pins | dict2items }}"
+      register: cs_public0_dns_sources
+
+    - name: Require regular source files matching accepted pins
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+          - not (item.stat.islnk | default(false))
+          - item.stat.checksum == item.item.value
+      loop: "{{ cs_public0_dns_sources.results }}"
+
+    - name: Create only dedicated DNS directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: "{{ item.group | default('root') }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: "{{ cs_public0_dns_bundle }}", mode: '0755'}
+        - {path: /var/lib/cs-public0-dns, mode: '0700'}
+        - {path: /var/lib/cs-public0-dns-log, mode: '0750', group: "{{ cs_public0_dns_log_group }}"}
+        - {path: /var/log/cs-public0-dns, mode: '0750'}
+
+    - name: Install exact immutable runtime files
+      ansible.builtin.copy:
+        src: "{{ cs_public0_dns_source }}/{{ item.key }}"
+        dest: "{{ cs_public0_dns_bundle }}/{{ item.key }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ cs_public0_dns_pins | dict2items }}"
+
+    - name: Install exact owned configuration and service artifacts
+      # Do not use copy/content for a JSON string: older Ansible can reserialize it.
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import base64,hashlib,os,pathlib,secrets,stat,sys
+            p=pathlib.Path(sys.argv[1]);raw=base64.b64decode(sys.argv[2],validate=True)
+            assert hashlib.sha256(raw).hexdigest()==sys.argv[3]
+            mode=int(sys.argv[4],8)
+            try:s=p.lstat()
+            except FileNotFoundError:
+                temporary=p.with_name('.'+p.name+'-'+secrets.token_hex(16))
+                fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,mode)
+                try:
+                    with os.fdopen(fd,'wb') as f:
+                        os.fchmod(f.fileno(),mode);f.write(raw);f.flush();os.fsync(f.fileno())
+                    os.link(temporary,p,follow_symlinks=False)
+                finally:temporary.unlink()
+                fd=os.open(p.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+                try:os.fsync(fd)
+                finally:os.close(fd)
+                print('CREATED')
+            else:
+                assert stat.S_ISREG(s.st_mode) and s.st_uid==0 and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==mode
+                assert p.read_bytes()==raw,'refuse DNS artifact replacement'
+                print('UNCHANGED')
+          - "{{ item.path }}"
+          - "{{ item.raw | b64encode }}"
+          - "{{ item.raw | hash('sha256') }}"
+          - "{{ item.mode }}"
+      register: cs_public0_dns_artifact_install
+      changed_when: "'CREATED' in cs_public0_dns_artifact_install.stdout"
+      loop: "{{ cs_public0_dns_artifacts }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Validate passive profile before any service activation
+      ansible.builtin.command:
+        argv: ["{{ cs_public0_dns_binary }}", '-T', '-c', /etc/cs-public0/passive-dns.yaml, '--disable-detection', '-l', /var/log/cs-public0-dns]
+      changed_when: false
+
+    - name: Verify dedicated systemd units
+      ansible.builtin.command:
+        argv: [systemd-analyze, verify, /etc/systemd/system/cs-public0-dns.service, /etc/systemd/system/cs-public0-dns-ioc.service, /etc/systemd/system/cs-public0-dns-ioc.timer]
+      changed_when: false
+
+    - name: Enable only the explicitly accepted passive producer
+      ansible.builtin.systemd_service:
+        name: cs-public0-dns.service
+        daemon_reload: true
+        enabled: "{{ cs_public0_dns_enable }}"
+        state: "{{ 'started' if cs_public0_dns_enable else 'stopped' }}"
+
+    - name: Enable only the explicitly accepted observation timer
+      ansible.builtin.systemd_service:
+        name: cs-public0-dns-ioc.timer
+        enabled: "{{ cs_public0_dns_enable }}"
+        state: "{{ 'started' if cs_public0_dns_enable else 'stopped' }}"
