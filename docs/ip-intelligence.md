@@ -28,7 +28,7 @@ context; the IP observer does not claim DNS or TLS coverage from them.
 The withdrawn v3 updater matched source or destination addresses without proving
 who initiated the connection. IPInsights contained public resolver addresses,
 including `1.1.1.1` and `8.8.8.8`, so source-only blocking also dropped legitimate
-replies. Keep that deployment withdrawn. The immutable v4 bundle implements
+replies. Keep that deployment withdrawn. The immutable v5 bundle retains the v4
 `ingress-syn-only-v2`: `ip daddr @protected ip saddr @incoming tcp flags &
 (fin | syn | rst | ack) == syn`. Both bridge names must still be `public0`.
 
@@ -54,7 +54,9 @@ The scheduler runs every five minutes but respects provider intervals: Feodo
 five minutes, the other providers at least one hour. Failed attempts also count
 towards that interval. Spamhaus explicitly requires at least an hour between
 automated downloads. A source growing by more than 50 percent, above a small
-initial threshold, requires investigation; its last good snapshot is retained.
+initial threshold, requires investigation while its last good nonempty snapshot
+is still valid. An empty or expired snapshot cannot pin that growth ceiling
+indefinitely; recovery still passes the same parser, size and address guards.
 Retrieval receipts and cache are persisted before policy construction, and the
 apply intent is persisted before kernel operations. A killed process therefore
 cannot erase the provider retry interval or claim a completed deployment. The
@@ -67,6 +69,24 @@ expired sources are excluded from the next candidate. The kernel elements
 also have timeouts, at most an hour and bounded by the contributing sources'
 remaining validity. Thus a stopped updater cannot leave permanent IP bans.
 The eight existing exploit DROP rules have their independent lifecycle.
+
+Only a blocking source with more than 20 minutes remaining contributes to a
+new kernel candidate. A nearly expired source stays available for detection
+until expiry, but cannot shorten another source's installed protection to a
+few seconds. Content, source-version receipts and TTL use the same eligibility
+rule. The shared TTL is bounded by the earliest contributing expiry minus a
+300-second apply reserve, with a one-hour maximum. Policy construction and
+syntax checking must finish within 210 seconds; native apply has a 90-second
+timeout. The expiry receipt starts before apply, so readback time cannot make
+the reported kernel lifetime longer than the actual transaction permits.
+
+Migrate an initialized v4 installation explicitly to a fresh immutable v5
+directory. The operator migration keeps the original bundle, provider cache,
+SQLite database, cursor and counters, and changes the updater unit plus the
+DNS parser attestation and its config pin. It does not fetch lists or restart
+packet capture. A partial committed migration leaves both consumer timers
+stopped for inspection. A successful migration resumes them and requires a
+natural updater cycle and effective kernel readback before acceptance.
 
 An update is one native nft transaction. It flushes only the four owned sets,
 repopulates them and preserves the chains and named counters. Check syntax

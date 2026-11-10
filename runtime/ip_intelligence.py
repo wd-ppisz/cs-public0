@@ -24,6 +24,9 @@ import zlib
 
 MAX_BYTES = 16 * 1024 * 1024
 MAX_ENTRIES = 1000000
+# Leave time for the 300 s timer, a bounded updater invocation and nft apply.
+MIN_ENFORCEMENT_REMAINING = 1200
+APPLY_RESERVE_SECONDS = 300
 TABLE = 'cs_public0_ioc'
 OWNER = 'cs-public0-ip-intelligence-v2-ingress-syn'
 SPECIAL = tuple(ipaddress.ip_network(x) for x in (
@@ -244,15 +247,30 @@ def admitted(entries, protected):
     return result
 
 
+def blocking_sources(feeds, now):
+    """Use one eligibility rule for content, version receipts and kernel TTL."""
+    return {name: data for name, data in feeds.items()
+            if name in SOURCES and SOURCES[name]['mode'] == 'inbound_drop'
+            and data['fetched_unix'] <= now < data['expires_unix'] - MIN_ENFORCEMENT_REMAINING}
+
+
+def kernel_ttl(feeds, now):
+    return min([3600, *[data['expires_unix'] - now - APPLY_RESERVE_SECONDS
+                        for data in blocking_sources(feeds, now).values()]])
+
+
+def guard_source_growth(previous, fetched, now):
+    # An expired or empty observation cannot permanently pin the growth ceiling.
+    if (previous and previous['addresses']
+            and previous['fetched_unix'] <= now < previous['expires_unix']):
+        require(len(fetched['addresses']) <= max(100, len(previous['addresses']) * 1.5),
+                'unexpected source growth; previous policy retained')
+
+
 def policy(feeds, protected, now):
     result = {'incoming': [], 'outgoing': [], 'c2_ports': []}
-    for name, data in feeds.items():
-        if name not in SOURCES or not data['fetched_unix'] <= now < data['expires_unix'] - 60:
-            continue
-        mode = SOURCES[name]['mode']
-        nets = admitted(data['addresses'], protected)
-        if mode == 'inbound_drop':
-            result['incoming'].extend(nets)
+    for data in blocking_sources(feeds, now).values():
+        result['incoming'].extend(admitted(data['addresses'], protected))
     for name in ('incoming', 'outgoing'):
         result[name] = [str(x) for x in ipaddress.collapse_addresses(result[name])]
     result['c2_ports'] = sorted(set(result['c2_ports']))
@@ -440,8 +458,7 @@ def ioc_snapshot(feeds, protected, now):
 
 
 def active_versions(feeds, now):
-    return {n: x['sha256'] for n, x in feeds.items() if n in SOURCES and SOURCES[n]['mode'] != 'detect'
-            and x['fetched_unix'] <= now < x['expires_unix'] - 60}
+    return {n: x['sha256'] for n, x in blocking_sources(feeds, now).items()}
 
 
 def refresh_required(state, now):
@@ -490,8 +507,7 @@ def main():
                 try:
                     fetched = future.result()
                     previous = state['feeds'].get(name)
-                    require(not previous or len(fetched['addresses']) <= max(100, len(previous['addresses']) * 1.5),
-                            'unexpected source growth; previous policy retained')
+                    guard_source_growth(previous, fetched, int(time.time()))
                     state['feeds'][name] = fetched
                     state['status'][name] = {'result': 'OK', 'attempted_unix': now}
                 except Exception as error:
@@ -515,14 +531,15 @@ def main():
                 if not state.get('last_apply_unix'):
                     require(all(n in state['feeds'] and state['feeds'][n]['fetched_unix'] <= now < state['feeds'][n]['expires_unix']
                                 for n in config['required_sources']), 'required initial sources are not fresh')
+                policy_started = time.monotonic()
                 candidate = policy(state['feeds'], protected, now)
-                expirations = [x['expires_unix'] - now for name, x in state['feeds'].items()
-                               if name in SOURCES and SOURCES[name]['mode'] != 'detect'
-                               and x['fetched_unix'] <= now < x['expires_unix'] - 60]
-                ttl = min([3600, *expirations])
+                ttl = kernel_ttl(state['feeds'], now)
                 batch = nft_batch(candidate, create=rows is None, ttl=ttl, protected=protected)
                 atomic(root / 'pending.nft', batch)
                 nft('--check', '--file', str(root / 'pending.nft'))
+                require(time.monotonic() - policy_started <= APPLY_RESERVE_SECONDS - 90,
+                        'policy build/check exceeded the reserved apply envelope')
+                apply_started_unix = int(time.time())
                 nft('--file', str(root / 'pending.nft'))
                 rows = owned_table()
                 require(rows is not None, 'IOC table absent after apply')
@@ -530,7 +547,7 @@ def main():
                 state.update(apply_success=True, last_apply_unix=int(time.time()), policy_sha256=sha(encoded(candidate)))
                 state.pop('apply_error', None)
                 state['applied_source_versions'] = active_versions(state['feeds'], now)
-                state['kernel_expires_unix'] = int(time.time()) + ttl
+                state['kernel_expires_unix'] = apply_started_unix + ttl
                 state['counts'] = {x['set']['name']: len(x['set'].get('elem', [])) for x in rows if 'set' in x}
             if rows is not None:
                 state['counters'] = {x['counter']['name']: x['counter']['packets'] for x in rows if 'counter' in x}
