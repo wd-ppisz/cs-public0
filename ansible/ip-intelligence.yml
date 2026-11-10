@@ -8,7 +8,7 @@
   any_errors_fatal: true
   vars:
     cs_public0_ip_enable: false
-    cs_public0_ip_bundle: /usr/local/libexec/cs-public0-ip-intelligence-v4
+    cs_public0_ip_bundle: /usr/local/libexec/cs-public0-ip-intelligence-v5
     cs_public0_ip_config: /etc/cs-public0/ip-intelligence.json
   tasks:
     - name: Require one explicit host and exact installed configuration/source bytes
@@ -18,7 +18,7 @@
           - target == inventory_hostname
           - ansible_play_hosts_all | length == 1
           - cs_public0_ip_enable is boolean
-          - cs_public0_ip_bundle == '/usr/local/libexec/cs-public0-ip-intelligence-v4'
+          - cs_public0_ip_bundle == '/usr/local/libexec/cs-public0-ip-intelligence-v5'
           - cs_public0_ip_contract == 'ingress-syn-only-v2'
           - cs_public0_ip_configuration.schema == 'cs-public0-ip-intelligence-v1'
           - cs_public0_ip_configuration.bridge == 'public0'
@@ -100,7 +100,7 @@
         group: root
         mode: "{{ item.mode }}"
       loop:
-        - {path: /usr/local/libexec/cs-public0-ip-intelligence-v4, mode: '0755'}
+        - {path: /usr/local/libexec/cs-public0-ip-intelligence-v5, mode: '0755'}
         - {path: /etc/cs-public0, mode: '0755'}
         - {path: /var/lib/cs-public0-ip-intelligence, mode: '0700'}
 

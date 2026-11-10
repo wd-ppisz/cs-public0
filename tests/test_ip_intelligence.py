@@ -94,6 +94,8 @@ class IntelligenceTests(unittest.TestCase):
     def test_direction_and_protected_overlap(self):
         feeds = {'ipsum3': self.feed(['1.2.3.4/32', '83.168.93.5/32']),
                  'spamhaus': self.feed(['5.6.7.0/24']), 'firehol1': self.feed(['9.10.11.12/32'])}
+        for feed in feeds.values():
+            feed['expires_unix'] = NOW + 7200
         result = ipi.policy(feeds, ipi.protected_config(['83.168.92.0/22']), NOW)
         self.assertEqual(result['incoming'], ['1.2.3.4/32', '5.6.7.0/24'])
         self.assertEqual(result['outgoing'], [])
@@ -166,6 +168,38 @@ class IntelligenceTests(unittest.TestCase):
         feed = self.feed(['1.2.3.4/32'])
         feed['expires_unix'] = NOW
         self.assertEqual(ipi.policy({'ipsum3': feed}, [], NOW)['incoming'], [])
+
+    def test_short_source_cannot_expire_a_still_valid_source_between_timer_ticks(self):
+        long = self.feed(['1.2.3.4/32'], sha256='a' * 64)
+        long['expires_unix'] = NOW + 7200
+        short = self.feed(['5.6.7.0/24'], sha256='b' * 64)
+        feeds = {'ipsum3': long, 'spamhaus': short}
+        for elapsed in (0, 121, 300, 600):
+            with self.subTest(elapsed=elapsed):
+                now = NOW + elapsed
+                self.assertEqual(ipi.policy(feeds, [], now)['incoming'], ['1.2.3.4/32'])
+                self.assertEqual(ipi.active_versions(feeds, now), {'ipsum3': 'a' * 64})
+                self.assertEqual(ipi.kernel_ttl(feeds, now), 3600)
+        # The short feed remains available for passive observation until expiry.
+        self.assertIsNotNone(IOC(ipi.ioc_snapshot(feeds, [], NOW)).match('5.6.7.4', NOW))
+
+    def test_enforcement_lifetime_boundary_has_timer_and_runtime_margin(self):
+        feed = self.feed(['1.2.3.4/32'], sha256='a' * 64)
+        feed['expires_unix'] = NOW + ipi.MIN_ENFORCEMENT_REMAINING + 1
+        self.assertEqual(ipi.kernel_ttl({'ipsum3': feed}, NOW), 901)
+        self.assertEqual(ipi.policy({'ipsum3': feed}, [], NOW)['incoming'], ['1.2.3.4/32'])
+        self.assertEqual(ipi.policy({'ipsum3': feed}, [], NOW + 1)['incoming'], [])
+        self.assertEqual(ipi.active_versions({'ipsum3': feed}, NOW + 1), {})
+
+    def test_growth_guard_recovers_after_empty_or_expired_snapshot(self):
+        fetched = self.feed(['5.6.7.8/32'] * 201)
+        for previous in (None, self.feed([]), dict(self.feed(['1.2.3.4/32']), expires_unix=NOW)):
+            with self.subTest(previous=previous):
+                ipi.guard_source_growth(previous, fetched, NOW)
+        # An ongoing valid nonempty source still retains the anomaly guard.
+        with self.assertRaisesRegex(ValueError, 'unexpected source growth'):
+            ipi.guard_source_growth(self.feed(['1.2.3.4/32']), fetched, NOW)
+        ipi.guard_source_growth(self.feed(['1.2.3.4/32'] * 200), fetched, NOW)
 
     def test_nft_transaction_is_scoped_and_keeps_counters_on_refresh(self):
         candidate = {'incoming': ['1.2.3.4/32'], 'outgoing': [], 'c2_ports': []}
