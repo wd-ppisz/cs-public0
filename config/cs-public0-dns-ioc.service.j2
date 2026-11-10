@@ -1,0 +1,37 @@
+[Unit]
+Description=cs-public0 independent DNS IOC observations
+After=cs-public0-dns.service
+
+[Service]
+Type=oneshot
+User=root
+Group={{ cs_public0_dns_log_group }}
+WorkingDirectory=/
+ExecStart=/usr/bin/python3 -E -s -B {{ cs_public0_dns_bundle }}/dns_ioc.py --config /etc/cs-public0/dns-ioc.json --config-sha256 {{ cs_public0_dns_config_sha256 }}
+UMask=0027
+CPUQuota=100%
+MemoryMax=384M
+MemorySwapMax=0
+TasksMax=4
+TimeoutStartSec=8s
+TimeoutStopSec=1s
+KillMode=control-group
+Restart=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/var/lib/cs-public0-dns /var/lib/cs-public0-dns-log {{ cs_public0_dns_configuration.metrics_file | dirname }}
+StandardOutput=journal
+StandardError=journal

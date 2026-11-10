@@ -1,0 +1,59 @@
+%YAML 1.1
+---
+# Separate passive producer. Never add NFQUEUE, copy-mode, copy-iface or rules.
+vars:
+  address-groups:
+    HOME_NET: "any"
+default-log-dir: {{ cs_public0_dns_log_directory | to_json }}
+af-packet:
+  - interface: {{ cs_public0_dns_interface | to_json }}
+    threads: 1
+    cluster-id: {{ cs_public0_dns_cluster_id | int }}
+    cluster-type: cluster_flow
+    defrag: yes
+    use-mmap: yes
+    ring-size: 1024
+    block-size: 32768
+    block-timeout: 10
+    bpf-filter: "ip and (udp port 53 or tcp port 53)"
+app-layer:
+  protocols:
+    dns:
+      enabled: yes
+stats:
+  enabled: yes
+  interval: 5
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - dns:
+            version: 3
+            requests: yes
+            responses: yes
+        - stats:
+            totals: yes
+            threads: no
+            deltas: no
+            null-values: yes
+flow:
+  hash-size: 4096
+  prealloc: 256
+  memcap: 16mb
+stream:
+  memcap: 16mb
+  checksum-validation: yes
+  inline: no
+  reassembly:
+    memcap: 16mb
+defrag:
+  memcap: 8mb
+unix-command:
+  enabled: no
+logging:
+  default-log-level: notice
+  outputs:
+    - console:
+        enabled: yes

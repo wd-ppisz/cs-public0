@@ -1,0 +1,11 @@
+[Unit]
+Description=Read passive DNS observations every five seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+Unit=cs-public0-dns-ioc.service
+
+[Install]
+WantedBy=timers.target

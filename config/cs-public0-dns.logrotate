@@ -1,0 +1,15 @@
+/var/log/cs-public0-dns/eve.json {
+    size 8M
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    sharedscripts
+    postrotate
+        if /usr/bin/systemctl is-active --quiet cs-public0-dns.service; then
+            /usr/bin/systemctl kill -s HUP --kill-who=main cs-public0-dns.service
+        fi
+    endscript
+}

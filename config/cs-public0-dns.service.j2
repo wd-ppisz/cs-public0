@@ -1,0 +1,39 @@
+[Unit]
+Description=cs-public0 passive plain-DNS metadata producer
+# Independent from the inline sensor, NFQUEUE, rules and feed updater.
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/
+ExecStart={{ cs_public0_dns_binary }} -c /etc/cs-public0/passive-dns.yaml --af-packet={{ cs_public0_dns_interface }} --runmode=workers --disable-detection --set sensor-name=${INVOCATION_ID}
+UMask=0027
+CPUQuota=50%
+MemoryMax=256M
+MemorySwapMax=0
+TasksMax=32
+LimitFSIZE=64M
+TimeoutStopSec=15s
+KillMode=control-group
+Restart=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_PACKET AF_INET AF_UNIX AF_NETLINK
+ReadWritePaths=/var/log/cs-public0-dns
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
