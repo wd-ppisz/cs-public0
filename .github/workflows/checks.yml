@@ -26,15 +26,46 @@ jobs:
   dataplane:
     # This VM has its own kernel; namespaces do not alter its root firewall.
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Install test dependencies
+      - name: Install test and build dependencies
+        timeout-minutes: 8
         run: |
-          sudo add-apt-repository -y ppa:oisf/suricata-stable
-          sudo apt-get update
-          sudo apt-get install -y suricata nftables iproute2 curl
-          sudo systemctl disable --now suricata.service
+          # Ten sam podpisany zbiór Ubuntu; mirror niezależny od DNS Canonical.
+          test -f /etc/apt/apt-mirrors.txt
+          test -f /etc/apt/sources.list.d/ubuntu.sources
+          printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o APT::Update::Error-Mode=any update
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends build-essential autoconf automake libtool pkg-config rustc cargo python3 libpcap-dev libpcre2-dev libyaml-dev zlib1g-dev libnet1-dev libjansson-dev libcap-ng-dev libmagic-dev libnetfilter-queue-dev libnfnetlink-dev libnss3-dev liblz4-dev libhyperscan-dev nftables iproute2 curl
+      - name: Build pinned stock Suricata for dataplane tests
+        env:
+          CARGO_NET_OFFLINE: "true"
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          # Archiwum i pin są wspólne z tools/build_nfq_engine.py; bez opcjonalnych patchy.
+          # Budowa nie zależy od API/PPA Launchpada i nie pomija testów dataplane.
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 2 --max-time 120 --max-filesize 67108864 -o "$RUNNER_TEMP/suricata.tar.gz" https://www.openinfosecfoundation.org/download/suricata-8.0.7.tar.gz
+          echo "a9d46a9c8f40e81f8a6df3ecc2c5a9a8e8da985876299108d92da547c013ba8c  $RUNNER_TEMP/suricata.tar.gz" | sha256sum --check -
+          python3 - "$RUNNER_TEMP/suricata.tar.gz" "$RUNNER_TEMP/suricata-source" <<'PY'
+          import sys
+          from pathlib import Path
+          from tools.build_nfq_engine import extract_source
+          destination = Path(sys.argv[2])
+          destination.mkdir()
+          extract_source(Path(sys.argv[1]), destination)
+          PY
+          cd "$RUNNER_TEMP/suricata-source/suricata-8.0.7"
+          rustc --version
+          ./configure --enable-nfqueue --enable-gccprotect --enable-pie --disable-unittests --disable-gccmarch-native --disable-python --prefix=/usr --sysconfdir=/etc --localstatedir=/var
+          make -j2
+          sudo make install
+          # Jak w pakiecie i tools/build_nfq_engine.py: bez symboli debugowania.
+          stat --format='%n %s bytes before strip' /usr/bin/suricata
+          sudo strip --strip-unneeded /usr/bin/suricata
+          stat --format='%n %s bytes after strip' /usr/bin/suricata
+          sudo make install-conf
+          sudo ldconfig
           suricata --build-info
           uname -r
       - name: Namespace smoke

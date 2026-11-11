@@ -110,17 +110,23 @@ It contains per-source packed IPv4 intervals (zlib/base64, no address expansion)
 upstream SHA256, retrieval/expiry times and the source's detect/inbound policy.
 The observer bounds the file at 4 MiB and all sources together at one million
 intervals, validates decompression size, ordering, overlap and trailing data,
-and uses binary search. Upgrade the observer to its immutable v3 bundle before
-publishing the new format. Preserve its database, cursor and log history.
-An IPInsights-only match is low-severity scan context with `enforcement=none`.
+and uses binary search. Upgrade the observer to an explicitly reviewed immutable
+bundle supporting the format before publishing it. Project release versions,
+local bundle directory names and IOC schema versions are separate identifiers.
+Preserve the database, cursor and log history. In classification revision 2 an
+IPInsights-only match is low-severity `reputation` context for a qualified ingress
+flow, with `enforcement=none`; it is not evidence of scanning. IPInsights-only
+egress and unknown-direction candidates are omitted after flow correlation.
+Independently qualified signatures and other IOC sources retain their evidence.
 A reputation match is an observation, not proof of compromise. The generated
 snapshot time is distinct from each upstream feed's publication time in the
 updater state. The snapshot contains no secret or tenant identifier.
 
 If EVE only emits alert/flow/stats, domains in ThreatFox/OTX do not establish
-domain detection. DNS logging, TLS metadata and DNS RPZ/sinkholing require a
-separate accepted deployment. Full IPv6 and physical capacity/latency testing
-also remain separate; passing the private fixture does not close G6.
+domain detection. Release 1.1 provides a separately activated [passive DNS IOC
+module](dns-ioc.md) for ThreatFox. TLS payload inspection and DNS RPZ/sinkholing
+remain outside that module. Full IPv6 and physical capacity/latency testing also
+remain separate; passing the private fixture does not close G6.
 
 ## Acceptance
 
@@ -142,8 +148,8 @@ attack cases and ten benign cases; it does not prove full-CVE exploitation or
 full KEV coverage. The latest qualification produced nine SID results: four
 passed and five also matched benign traffic (`BENIGN_MATCH`), so the latter
 were not promoted. Four existing baseline SIDs plus those four admitted SIDs
-give eight active DROP rules on each of sda-sde. Remaining signatures keep
-their existing ALERT action.
+gave eight active DROP rules in that dated operator deployment, not a fixed
+release-wide count. Remaining signatures kept their existing ALERT action.
 
 Promotion also requires KEV membership, EPSS >= 0.1, matching engine/rules/corpus
 identities and complete loss-free replay accounting. The configured batch

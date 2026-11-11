@@ -1,6 +1,7 @@
 # Egress security: observation without enforcement
 
-Status: implementation contract; not a claim of LAB, canary or production acceptance.
+Status: optional component released in [1.1](releases/v1.1.0.md). Installation
+does not establish site-specific LAB, canary or production acceptance.
 
 The optional collector reads the existing Suricata EVE file outside the packet
 forwarding path. It writes bounded JSON details and a node_exporter textfile.
@@ -97,7 +98,7 @@ URLs, credentials, file contents or full PCAP into the normal output. A source
 reference does not promise that rotated source bytes remain archived forever.
 Downstream consumers must deduplicate by event ID within their own retention.
 
-## Proposed metric contract before implementation
+## Metric contract in 1.1
 
 The family prefix is `cs_public0_egress_`, alongside existing `cs_public0_*`
 producers. Sensor identity comes from scrape labels or a configured bounded ID.
@@ -107,6 +108,7 @@ identity must never become metric labels.
 | Metric suffix | Type and meaning |
 |---|---|
 | `observations_total{category,severity,direction}` | Committed observations, not unique attacks or compromised guests |
+| `observations_v2_total{category,severity,direction}` | Revision 2 observations; separate `reputation` context from security categories |
 | `records_total{outcome}` | Processing-stage counters from a closed enumeration; stages can overlap and are not an exclusive input denominator |
 | `collection_gaps_total{reason}` | Detected rotation/truncation/cursor/retention discontinuities |
 | `collector_up` | Last run completed successfully; always gate by publication freshness |
@@ -124,12 +126,14 @@ identity must never become metric labels.
 | `backlog_bytes` | Unprocessed bytes remaining in the current source file |
 | `source_fresh` / `lag_known` | Advancing heartbeat with no observed backlog / known latest record time |
 
-Closed categories: `c2`, `ioc`, `scan`, `other`; severity: `high`, `medium`,
-`low`, `unknown`; direction: `egress`, `ingress`, `unknown`. This yields at most
-48 observation series per sensor. Reserve at most 15 processing outcomes, 8 gap reasons
-and 15 scalar series: at most 86 application series per sensor, 430 for five
-sensors, excluding node_exporter/scrape-added bookkeeping. Keep IOC versions in
-details rather than labels. Validate the actual exporter against this budget.
+Closed categories: `c2`, `ioc`, `scan`, `other`, `reputation`; severity: `high`,
+`medium`, `low`, `unknown`; direction: `egress`, `ingress`, `unknown`. Legacy
+observations retain 48 series; revision 2 adds up to 60, including reputation.
+Together with processing, gap and scalar metrics, the collector enforces at most
+148 application series per sensor, 740 for five sensors, excluding node_exporter
+and scrape-added bookkeeping. These are bounded series, not attack counts.
+Keep IOC versions in details rather than labels. Validate the actual exporter
+against this budget.
 
 Repeated packets, multiple signatures on a flow and multiple sensors can create
 multiple observations. Cursor persistence and bounded event-ID deduplication stop
