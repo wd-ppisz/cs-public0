@@ -1,10 +1,10 @@
 # cs-public0
 
-> **Version 1.0 — known security limitation:** queue pressure can cause fail-open
+> **Version 1.1 — known security limitation:** queue pressure can cause fail-open
 > forwarding without inspection, including cases with zero exported Drops.
 > A larger netlink receive buffer does not solve packet-queue saturation.
 > Read [Known vulnerabilities and limitations](#known-vulnerabilities-and-limitations)
-> before activation. Version 1.0 is a versioned baseline, not a universal capacity
+> before activation. Version 1.1 is a versioned baseline, not a universal capacity
 > or loss-free inspection certification.
 
 Read [performance pitfalls](docs/performance-pitfalls.md) for lessons from the
@@ -32,6 +32,22 @@ Tabs are allowed within a line. Escape literal semicolons as `\;`, including in
 quoted option values. Option keywords are checked without case sensitivity, and
 `bypass` is rejected in every case. Full Suricata syntax validation still runs
 before activation.
+
+## Wydanie 1.1
+
+Użyj tagu **`v1.1.0`** i [opisu wydania](docs/releases/v1.1.0.md), aby odtworzyć
+konkretną wersję. Domyślna instalacja nadal wymaga jawnej aktywacji. Opcjonalne
+funkcje mają osobne konfiguracje, piny i odbiór na każdym hoście:
+
+| Funkcja | Dokumentacja |
+|---|---|
+| Kwalifikacja ALERT → DROP z CISA KEV/FIRST EPSS, replay i profilem technologicznym | [Automatyczna polityka exploitów](docs/automatic-exploit-policy.md) |
+| Feed IP, blokada wyłącznie początkowego SYN ingress, inwentarz i daty aktualizacji | [IP intelligence](docs/ip-intelligence.md) |
+| Obserwacja egress, kierunek przepływu i IPInsights wyłącznie jako reputacja ingress | [Egress security](docs/egress-security.md) |
+| Pasywne zapytania DNS, dokładne dopasowanie ThreatFox i dowody oryginałów EVE | [DNS IOC](docs/dns-ioc.md) |
+
+Pełna kwalifikacja wydajnościowa i kompletność inspekcji pozostają osobnymi
+warunkami [G6](docs/g6-acceptance.md). Numer wydania nie zamyka tej bramki.
 
 ## Traffic path
 
@@ -95,7 +111,7 @@ remain encrypted. No universal throughput or latency guarantee is implied.
 
 ## Known vulnerabilities and limitations
 
-**Unresolved inspection bypass under NFQUEUE pressure affects version 1.0.**
+**Unresolved inspection bypass under NFQUEUE pressure affects versions 1.0 and 1.1.**
 With fail-open enabled, a full packet queue can accept packets without sending
 them through Suricata. This can happen before an NFQUEUE packet ID is assigned
 and without incrementing the queue kernel/user drop counters. Separately, a full
@@ -118,7 +134,8 @@ fix: that can trade incomplete inspection for forwarding delay or outage.
 The [2026-10-28 latency incident](docs/inline-latency-advisory.md) additionally
 demonstrated why an arbitrary stock engine/offload combination must not be assumed
 safe. GSO operation requires a compatible, pinned and locally qualified engine.
-See [version 1.0 release notes](docs/releases/v1.0.0.md) and [SECURITY.md](SECURITY.md).
+See [version 1.1 release notes](docs/releases/v1.1.0.md), the historical
+[version 1.0 release notes](docs/releases/v1.0.0.md) and [SECURITY.md](SECURITY.md).
 
 ## Tests
 

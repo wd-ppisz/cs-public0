@@ -36,6 +36,7 @@ Use Python **3.12+**. The dependency file pins supported Ansible Core **2.20.x**
 ```sh
 git clone https://github.com/wd-ppisz/cs-public0.git
 cd cs-public0
+git checkout --detach v1.1.0
 git rev-parse HEAD
 python3 --version
 python3 -m venv .venv
@@ -46,6 +47,13 @@ ansible-playbook --version
 
 Record the deployed commit. For subsequent installations, select your reviewed
 release or commit before deployment; do not change the checkout during a rollout.
+
+Wydanie 1.1 dodaje osobne, opcjonalne moduły dnia drugiego:
+[automatyczną kwalifikację DROP](automatic-exploit-policy.md),
+[feedy IP i inwentarz](ip-intelligence.md), [obserwację egress](egress-security.md)
+oraz [pasywny DNS IOC](dns-ioc.md). Nie są automatycznie aktywowane przez ten
+podstawowy przewodnik. [Opis wydania](releases/v1.1.0.md) zawiera kolejność
+aktualizacji i granice odbioru istniejącej instalacji.
 
 ## 3. Inspect and prepare the target
 

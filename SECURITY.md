@@ -2,11 +2,12 @@
 
 This project changes the packet path when explicitly activated. Review
 [the threat model](docs/threat-model.md) and validate each host class before use.
-Version 1.0.0 is the first tagged baseline. The current `main` branch carries
+Version 1.1.0 is the current tagged baseline; 1.0.0 remains a historical baseline.
+Read the [1.1 release notes](docs/releases/v1.1.0.md). The current `main` branch carries
 ongoing fixes; no long-term support window or universal throughput guarantee is
 promised by the tag.
 
-## Known issue in version 1.0
+## Known issue in versions 1.0 and 1.1
 
 NFQUEUE saturation with fail-open enabled can forward packets without inspection,
 even when exported kernel/user Drops remain zero. Socket receive-buffer exhaustion

@@ -1,7 +1,8 @@
 # Wykrywanie DNS IOC bez blokowania
 
-Stan: implementacja i testy LAB. Wdrożenie na hosty, pomiary kosztu, log transport
-i odbiór centralny są osobnymi etapami. Dokument nie deklaruje ich ukończenia.
+Stan: opcjonalny moduł wydania [1.1](releases/v1.1.0.md), z implementacją i testami
+LAB. Instalacja pakietu nie jest odbiorem konkretnego środowiska. Aktywacja,
+pomiary kosztu, log transport i odbiór centralny wymagają osobnego potwierdzenia.
 
 ## Źródło i znaczenie danych
 
