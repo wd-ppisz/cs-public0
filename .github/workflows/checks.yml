@@ -60,6 +60,10 @@ jobs:
           ./configure --enable-nfqueue --enable-gccprotect --enable-pie --disable-unittests --disable-gccmarch-native --disable-python --prefix=/usr --sysconfdir=/etc --localstatedir=/var
           make -j2
           sudo make install
+          # Jak w pakiecie i tools/build_nfq_engine.py: bez symboli debugowania.
+          stat --format='%n %s bytes before strip' /usr/bin/suricata
+          sudo strip --strip-unneeded /usr/bin/suricata
+          stat --format='%n %s bytes after strip' /usr/bin/suricata
           sudo make install-conf
           sudo ldconfig
           suricata --build-info
