@@ -158,8 +158,23 @@ fingerprint mismatch marks a gap. Copytruncate can lose bytes between observatio
 without a detectable size decrease; expose this residual uncertainty. Never label
 the absence of detected gaps as proof of lossless rotation or complete traffic.
 
-Candidate engineering bounds: 64 KiB per record, 2 MiB/1000 records per run,
-5-second inactive timer, 4-second cooperative work budget and 8-second systemd
+The reader drains a retained, uncompressed `eve.json.1` through `eve.json.7`
+before following the current file. It checks both the previously consumed
+boundary and a stored initial prefix, retains archive progress transactionally
+across process restarts, and reports archived plus live bytes as backlog. A
+snapshot of the next generation also allows a retained intermediate rotation to
+be recovered. It never selects an archive from its timestamp or size alone.
+
+Recovery does not clear historical gap counters. Copytruncate still records a
+gap because writes between copying and truncation cannot be proven retained.
+Compressed, removed or unmatched archives are not silently treated as consumed;
+the discontinuity stays explicit when the reader resumes the live source. A torn
+final archive line is recorded as partial and invalidates continuity. Operators
+must retain uncompressed generations long enough for their measured worst-case
+backlog, and must keep alerting on gaps even after current backlog reaches zero.
+
+Candidate engineering bounds: 64 KiB per record, 32 MiB/50000 records per run,
+2-second inactive timer (compatible with the default 5 starts per 10 seconds), 4-second cooperative work budget and 8-second systemd
 deadline (including publication margin), 4096 catalog entries, 4096 pending joins,
 24-hour/10000-ID deduplication horizon and a 32 MiB SQLite database. Each of
 the flow, pending and outbox tables also has a 2 MiB serialized-byte budget,
