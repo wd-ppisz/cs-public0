@@ -3,7 +3,7 @@ Description=Read bounded public0 egress observations independently
 
 [Timer]
 OnBootSec=30s
-OnUnitInactiveSec=1s
+OnUnitInactiveSec=2s
 AccuracySec=1s
 Persistent=false
 Unit=cs-public0-egress.service

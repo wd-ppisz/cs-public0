@@ -174,7 +174,7 @@ must retain uncompressed generations long enough for their measured worst-case
 backlog, and must keep alerting on gaps even after current backlog reaches zero.
 
 Candidate engineering bounds: 64 KiB per record, 32 MiB/50000 records per run,
-1-second inactive timer, 4-second cooperative work budget and 8-second systemd
+2-second inactive timer (compatible with the default 5 starts per 10 seconds), 4-second cooperative work budget and 8-second systemd
 deadline (including publication margin), 4096 catalog entries, 4096 pending joins,
 24-hour/10000-ID deduplication horizon and a 32 MiB SQLite database. Each of
 the flow, pending and outbox tables also has a 2 MiB serialized-byte budget,
