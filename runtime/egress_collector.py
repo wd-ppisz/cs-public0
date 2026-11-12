@@ -5,6 +5,7 @@ No sensor control, network calls or enforcement. Run by a separate oneshot timer
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -19,8 +20,8 @@ from egress_model import (CATEGORIES, DIRECTIONS, MAX_RECORD, SEVERITIES, Catalo
                           IOC, direction, flow_key, integer, networks, observation, qualify_feed_roles,
                           strict_json, timestamp, validate_config)
 
-MAX_BYTES = 2 * 1024 * 1024
-MAX_ROWS = 1000
+MAX_BYTES = 32 * 1024 * 1024
+MAX_ROWS = 50000
 MAX_JOIN = 4096
 MAX_SEEN = 10000
 MAX_TABLE_BYTES = 2 * 1024 * 1024
@@ -89,6 +90,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, accepted REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS seen_age ON seen(accepted);
             CREATE TABLE IF NOT EXISTS flows (id TEXT PRIMARY KEY, received REAL NOT NULL, body TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS flows_age ON flows(received);
             CREATE TABLE IF NOT EXISTS pending (id TEXT PRIMARY KEY, flow_key TEXT NOT NULL,
                 received REAL NOT NULL, body TEXT NOT NULL, reference TEXT NOT NULL, epoch TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS pending_flow_key ON pending(flow_key);
@@ -413,8 +415,9 @@ def deliver(store, log_path, deadline=None):
 
 
 def fingerprint(f, offset):
-    f.seek(max(0, offset - 128))
-    return digest(f.read(min(128, offset)))
+    # Bypass Python's read buffer: copytruncate may have replaced bytes that
+    # were prefetched earlier in this same input transaction.
+    return digest(os.pread(f.fileno(), min(128, offset), max(0, offset - 128)))
 
 
 def source_cursor(store, f, info, config, now):
@@ -436,6 +439,94 @@ def source_cursor(store, f, info, config, now):
         # Regrown copytruncate: reset all three fields, including during cursor hold.
         cursor.update(offset=0, fingerprint=digest(b""), discarding=False)
     return cursor
+
+
+def checkpoint(f, cursor):
+    """Bind both the consumed boundary and the producer's initial prefix."""
+    cursor["fingerprint"] = fingerprint(f, cursor["offset"])
+    head = os.pread(f.fileno(), 128, 0)
+    cursor["head_length"] = len(head)
+    cursor["head_sha256"] = digest(head)
+    return cursor
+
+
+def cursor_matches(f, info, cursor, *, copied=False):
+    if not copied and (cursor["device"], cursor["inode"]) != (info.st_dev, info.st_ino):
+        return False
+    offset = cursor["offset"]
+    if info.st_size < offset or fingerprint(f, offset) != cursor["fingerprint"]:
+        return False
+    head_length = cursor.get("head_length", 0)
+    if head_length:
+        if digest(os.pread(f.fileno(), head_length, 0)) != cursor["head_sha256"]:
+            return False
+    # An empty consumed prefix cannot identify a copy of an old generation.
+    return not copied or bool(offset or head_length)
+
+
+@contextlib.contextmanager
+def source_stream(store, config, now):
+    """Drain a retained uncompressed rotation before following the live EVE.
+
+    Only adjacent numeric archives are considered. Recovery checks the stored
+    prefix and consumed boundary; it never guesses from timestamps or size.
+    Copytruncate still records a gap: bytes written between copy and truncate
+    cannot be proven present even when the retained tail can be recovered.
+    """
+    with contextlib.ExitStack() as handles:
+        live = handles.enter_context(plain_file(config["eve_file"]))
+        live_info = os.fstat(live.fileno())
+        cursor = store.get("cursor")
+        if cursor is None:
+            cursor = source_cursor(store, live, live_info, config, now)
+            yield live, live_info, cursor, live, False
+            return
+        if cursor_matches(live, live_info, cursor):
+            yield live, live_info, cursor, live, False
+            return
+        old = cursor.copy()
+        for number in range(1, 8):
+            path = pathlib.Path(str(config["eve_file"]) + "." + str(number))
+            try:
+                archive = plain_file(path)
+            except FileNotFoundError:
+                continue
+            with archive:
+                info = os.fstat(archive.fileno())
+                # An already selected archive must retain its inode. Matching
+                # another copy would replay a different generation after loss.
+                if not cursor_matches(archive, info, old, copied=not old.get("archive", False)):
+                    continue
+                if not old.get("archive", False):
+                    reason = ("inode_change" if (old["device"], old["inode"]) !=
+                              (live_info.st_dev, live_info.st_ino) else
+                              "truncated" if live_info.st_size < old["offset"] else "fingerprint_changed")
+                    store.gap(reason, now)
+                    cursor["next_cursor"] = checkpoint(live, {
+                        "device": live_info.st_dev, "inode": live_info.st_ino,
+                        "offset": 0, "fingerprint": digest(b""), "discarding": False})
+                cursor.update(device=info.st_dev, inode=info.st_ino, archive=True)
+                yield archive, info, cursor, live, True
+                return
+        # Retention may already have removed/compressed the required generation.
+        # Preserve the historical gap and resume the current source explicitly.
+        cursor = source_cursor(store, live, live_info, config, now)
+        if (cursor["device"], cursor["inode"], cursor["offset"]) == (
+                old["device"], old["inode"], old["offset"]):
+            # The stored head may reveal a regrown generation even if repeated
+            # records happen to reproduce the old trailing fingerprint.
+            store.gap("fingerprint_changed", now)
+            cursor.update(offset=0, fingerprint=digest(b""), discarding=False)
+        cursor.pop("archive", None)
+        cursor.pop("next_cursor", None)
+        cursor.pop("head_length", None)
+        cursor.pop("head_sha256", None)
+        yield live, live_info, cursor, live, False
+
+
+def source_backlog(f, cursor, live, archived):
+    return max(0, os.fstat(f.fileno()).st_size - cursor["offset"]) + (
+        os.fstat(live.fileno()).st_size if archived else 0)
 
 
 def run(config, now=None):
@@ -544,13 +635,13 @@ def _run_locked(config, state_dir, now, live_clock=False):
                 # qualified current catalog is installed. A finite rotated
                 # source may still lose bytes; health never claims coverage.
                 s.db.commit()
-                with plain_file(config["eve_file"]) as f:
-                    info = os.fstat(f.fileno())
-                    hold_config = {**config, "initial_position": config.get("initial_position", "end")
+                hold_config = {**config, "initial_position": config.get("initial_position", "end")
                                    if config.get("initial_position", "end") in ("begin", "end") else "end"}
-                    cursor = source_cursor(s, f, info, hold_config, now)
+                with source_stream(s, hold_config, now) as source:
+                    f, info, cursor, live, archived = source
+                    checkpoint(f, cursor)
                     s.put("cursor", cursor)
-                    s.put("backlog_bytes", max(0, info.st_size - cursor["offset"]))
+                    s.put("backlog_bytes", source_backlog(f, cursor, live, archived))
                     available = True
                 s.db.commit()
                 error = ("ConfigInvalid" if not config_valid else
@@ -564,9 +655,9 @@ def _run_locked(config, state_dir, now, live_clock=False):
             # commit every row while leaving the old cursor. Keep data, sensor
             # epoch and cursor inside one explicit input-batch transaction.
             s.db.execute("BEGIN")
-            with plain_file(config["eve_file"]) as f:
-                info = os.fstat(f.fileno())
-                cursor = source_cursor(s, f, info, config, now)
+            with source_stream(s, config, now) as source:
+                f, info, cursor, live, archived = source
+                boundary = checkpoint(f, cursor.copy())
                 transition = s.get("ruleset_transition")
                 if s.get("pending_ruleset_transition", False) or (transition is not None and
                         (transition["device"], transition["inode"]) != (info.st_dev, info.st_ino)):
@@ -593,8 +684,14 @@ def _run_locked(config, state_dir, now, live_clock=False):
                         s.put("last_invalid", now)
                     elif not raw.endswith(b"\n"):
                         if len(raw) <= MAX_RECORD:
-                            f.seek(offset)
                             s.count("record:partial")
+                            if archived and f.tell() >= os.fstat(f.fileno()).st_size:
+                                # A closed archive cannot complete a torn line.
+                                # Keep its loss explicit and continue next run.
+                                s.put("last_invalid", now)
+                                s.gap("truncated", now)
+                            else:
+                                f.seek(offset)
                             break
                     else:
                         ref = {"device": info.st_dev, "inode": info.st_ino, "offset": offset,
@@ -619,12 +716,25 @@ def _run_locked(config, state_dir, now, live_clock=False):
                                 s.db.execute("RELEASE input_record")
                     cursor["offset"] = f.tell()
                 cursor["offset"] = f.tell()
-                cursor["fingerprint"] = fingerprint(f, cursor["offset"])
-                s.put("cursor", cursor)
-                if transition is not None and cursor["offset"] >= transition["end"]:
+                after = os.fstat(f.fileno())
+                if after.st_size < cursor["offset"] or not cursor_matches(f, after, boundary):
+                    # Roll back data and cursor together; a following run can
+                    # recover the previous boundary from the retained archive.
+                    raise ValueError("source generation changed during input batch")
+                checkpoint(f, cursor)
+                backlog = source_backlog(f, cursor, live, archived)
+                if archived and cursor["offset"] >= os.fstat(f.fileno()).st_size:
+                    # The next producer generation can itself have rotated
+                    # while this archive was being drained. Retain its original
+                    # prefix so the next run can find that intermediate archive.
+                    cursor = cursor["next_cursor"]
+                    if transition is not None:
+                        s.put("pending_ruleset_transition", True)
+                elif not archived and transition is not None and cursor["offset"] >= transition["end"]:
                     s.put("ruleset_transition", None)
                     s.put("ruleset_transition_keys", [])
-                s.put("backlog_bytes", max(0, os.fstat(f.fileno()).st_size - cursor["offset"]))
+                s.put("cursor", cursor)
+                s.put("backlog_bytes", backlog)
                 s.put("last_read", now)
                 available = True
             success = error is None and ready

@@ -219,6 +219,146 @@ class EgressCollector(unittest.TestCase):
         self.run_once(NOW + 1)
         self.assertEqual(self.count("gap:truncated"), 1)
 
+    def test_retained_copytruncate_tail_is_drained_before_new_live_records(self):
+        self.append(stats(), alert(), flow())
+        with mock.patch.object(c, "MAX_ROWS", 1):
+            self.assertTrue(self.run_once()["success"])
+        archive = self.root / "eve.json.1"
+        shutil.copyfile(self.eve, archive)
+        self.eve.write_bytes(wire(stats(2)))
+        with mock.patch.object(c, "MAX_ROWS", 1):
+            self.assertTrue(self.run_once(NOW + 1)["success"])
+        self.assertGreater(self.scalar("backlog_bytes"), self.eve.stat().st_size)
+        with sqlite3.connect(self.root / "state/state.sqlite3") as db:
+            cursor = json.loads(db.execute("SELECT value FROM kv WHERE key='cursor'").fetchone()[0])
+        self.assertTrue(cursor["archive"])
+        self.assertTrue(self.run_once(NOW + 2)["success"])
+        self.assertEqual(self.count("record:accepted"), 1)
+        self.assertEqual(self.details()[0]["source_ref"]["inode"], archive.stat().st_ino)
+        self.assertEqual(self.scalar("backlog_bytes"), self.eve.stat().st_size)
+        self.assertTrue(self.run_once(NOW + 3)["success"])
+        self.assertEqual(self.scalar("backlog_bytes"), 0)
+        self.assertEqual(self.count("record:stats"), 2)
+        self.assertEqual(self.count("record:accepted"), 1)
+        self.assertEqual(self.count("gap:fingerprint_changed") + self.count("gap:truncated"), 1)
+
+    def test_retained_rename_tail_survives_process_restarts(self):
+        self.append(stats(), alert(), flow())
+        with mock.patch.object(c, "MAX_ROWS", 1): self.run_once()
+        self.eve.rename(self.root / "eve.json.1")
+        self.eve.write_bytes(wire(stats(2)))
+        with mock.patch.object(c, "MAX_ROWS", 1): self.run_once(NOW + 1)
+        self.run_once(NOW + 2)
+        self.run_once(NOW + 3)
+        self.assertEqual(self.count("record:accepted"), 1)
+        self.assertEqual(self.count("record:stats"), 2)
+        self.assertEqual(self.count("gap:inode_change"), 1)
+        self.assertEqual(self.scalar("backlog_bytes"), 0)
+
+    def test_second_rotation_does_not_skip_a_retained_intermediate_generation(self):
+        self.append(stats(), alert(), flow())
+        with mock.patch.object(c, "MAX_ROWS", 1): self.run_once()
+        archive = self.root / "eve.json.1"
+        shutil.copyfile(self.eve, archive)
+        a2, f2 = alert(), flow()
+        a2["flow_id"] = f2["flow_id"] = 123456
+        self.eve.write_bytes(wire(stats(2)) + wire(a2) + wire(f2))
+        with mock.patch.object(c, "MAX_ROWS", 1): self.run_once(NOW + 1)
+        archive.rename(self.root / "eve.json.2")
+        shutil.copyfile(self.eve, archive)
+        self.eve.write_bytes(wire(stats(3)))
+        for index in range(2, 7): self.assertTrue(self.run_once(NOW + index)["success"])
+        self.assertEqual(self.count("record:accepted"), 2)
+        self.assertEqual(self.count("record:stats"), 3)
+        self.assertEqual(self.scalar("backlog_bytes"), 0)
+
+    def test_rotation_during_catalog_hold_preserves_the_unread_archive(self):
+        self.append(stats(), alert(), flow())
+        with mock.patch.object(c, "MAX_ROWS", 1): self.run_once()
+        shutil.copyfile(self.eve, self.root / "eve.json.1")
+        self.eve.write_bytes(wire(stats(2)))
+        original = self.catalog_file.read_bytes()
+        self.catalog_file.write_bytes(b"invalid")
+        self.assertFalse(self.run_once(NOW + 1)["success"])
+        self.assertGreater(self.scalar("backlog_bytes"), self.eve.stat().st_size)
+        self.catalog_file.write_bytes(original)
+        self.assertTrue(self.run_once(NOW + 2)["success"])
+        self.assertEqual(self.count("record:accepted"), 1)
+        self.run_once(NOW + 3)
+        self.assertEqual(self.scalar("backlog_bytes"), 0)
+
+    def test_rotated_symlink_is_rejected_without_losing_the_old_cursor(self):
+        self.append(stats(), alert(), flow())
+        with mock.patch.object(c, "MAX_ROWS", 1): self.run_once()
+        self.eve.write_bytes(wire(stats(2)))
+        (self.root / "eve.json.1").symlink_to(self.rules)
+        with sqlite3.connect(self.root / "state/state.sqlite3") as db:
+            before = db.execute("SELECT value FROM kv WHERE key='cursor'").fetchone()[0]
+        self.assertFalse(self.run_once(NOW + 1)["success"])
+        with sqlite3.connect(self.root / "state/state.sqlite3") as db:
+            self.assertEqual(db.execute("SELECT value FROM kv WHERE key='cursor'").fetchone()[0], before)
+
+    def test_unrelated_archive_cannot_be_used_as_the_old_generation(self):
+        self.append(stats(), alert(), flow())
+        with mock.patch.object(c, "MAX_ROWS", 1): self.run_once()
+        (self.root / "eve.json.1").write_bytes(wire(stats(99)) + wire(alert()) + wire(flow()))
+        self.eve.write_bytes(wire(stats(2)))
+        self.assertTrue(self.run_once(NOW + 1)["success"])
+        self.assertEqual(self.count("record:accepted"), 0)
+        self.assertEqual(self.count("gap:fingerprint_changed") + self.count("gap:truncated"), 1)
+
+    def test_partial_closed_archive_does_not_hold_new_live_eve_forever(self):
+        self.append(stats(), alert())
+        with self.eve.open("ab") as f: f.write(b'{"interrupted":')
+        with mock.patch.object(c, "MAX_ROWS", 1): self.run_once()
+        shutil.copyfile(self.eve, self.root / "eve.json.1")
+        self.eve.write_bytes(wire(stats(2)))
+        self.assertTrue(self.run_once(NOW + 1)["success"])
+        self.assertGreater(self.count("record:partial"), 0)
+        self.assertEqual(self.scalar("collection_continuity_known"), 0)
+        self.assertTrue(self.run_once(NOW + 2)["success"])
+        self.assertEqual(self.scalar("backlog_bytes"), 0)
+        self.assertEqual(self.count("record:stats"), 2)
+
+    def test_byte_budget_cut_inside_archive_line_rewinds_instead_of_losing_it(self):
+        self.append(stats(), alert(), flow())
+        with mock.patch.object(c, "MAX_ROWS", 1): self.run_once()
+        shutil.copyfile(self.eve, self.root / "eve.json.1")
+        self.eve.write_bytes(wire(stats(2)))
+        with mock.patch.object(c, "MAX_BYTES", len(wire(alert())) // 2):
+            self.assertTrue(self.run_once(NOW + 1)["success"])
+        self.assertEqual(self.count("record:invalid"), 0)
+        self.assertTrue(self.run_once(NOW + 2)["success"])
+        self.assertEqual(self.count("record:accepted"), 1)
+        self.run_once(NOW + 3)
+        self.assertEqual(self.scalar("backlog_bytes"), 0)
+
+    def test_copytruncate_during_buffered_read_rolls_back_then_recovers_tail(self):
+        self.append(stats(), alert(), flow())
+        with mock.patch.object(c, "MAX_ROWS", 1): self.run_once()
+        real = c.Consumer.accept
+        rotated = []
+        def rotate(consumer, row, ref, now):
+            result = real(consumer, row, ref, now)
+            if not rotated:
+                shutil.copyfile(self.eve, self.root / "eve.json.1")
+                self.eve.write_bytes(wire(stats(2)))
+                rotated.append(True)
+            return result
+        with mock.patch.object(c.Consumer, "accept", rotate):
+            self.assertFalse(self.run_once(NOW + 1)["success"])
+        self.assertEqual(self.count("record:accepted"), 0)
+        self.assertTrue(self.run_once(NOW + 2)["success"])
+        self.assertEqual(self.count("record:accepted"), 1)
+        self.run_once(NOW + 3)
+        self.assertEqual(self.scalar("backlog_bytes"), 0)
+
+    def test_default_read_budget_can_drain_more_than_one_thousand_records(self):
+        self.append(*[stats(i + 1) for i in range(2000)])
+        self.assertTrue(self.run_once()["success"])
+        self.assertEqual(self.count("record:stats"), 2000)
+        self.assertEqual(self.scalar("backlog_bytes"), 0)
+
     def test_missing_flow_expires_as_unknown_not_as_egress(self):
         self.append(stats(), alert())
         self.run_once()
