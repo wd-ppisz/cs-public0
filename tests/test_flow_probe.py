@@ -208,6 +208,7 @@ class Dns(unittest.TestCase):
         self.assertIn('_Static_assert(sizeof(struct dns_record) == 160', SRC)
         self.assertIn('flow_dns', fp.MAPS)
         self.assertIn('emit_dns(skb, ip, l4)', SRC)
+        self.assertIn('asm volatile("" : "+r"(n));', SRC)  # bound survives for older verifiers
 
     def test_parse_query_name(self):
         self.assertEqual(fp.parse_qname(dns_query('Bad.Example')), 'bad.example')

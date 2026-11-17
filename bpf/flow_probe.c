@@ -211,8 +211,10 @@ static __always_inline void emit_dns(struct __sk_buff *skb, struct iphdr *ip, vo
 		n = DNS_CAP;
 	off = (__u32)((void *)(udp + 1) - data);
 	__builtin_memset(&rec, 0, sizeof(rec));
-	/* Bounded, non-zero length for the verifier. */
-	n &= 0xff;
+	/* Hide n from the optimiser so the explicit range check survives: older
+	 * verifiers (6.17) do not infer the lower bound and reject a possibly
+	 * zero-sized bpf_skb_load_bytes(); newer ones (7.0) accept either form. */
+	asm volatile("" : "+r"(n));
 	if (n < 13 || n > DNS_CAP)
 		return;
 	if (bpf_skb_load_bytes(skb, off, rec.payload, n))
