@@ -23,6 +23,45 @@ jobs:
         run: |
           pip install pip-audit
           pip-audit -r requirements-dev.txt
+  flow:
+    # Builds the read-only flow probe object and exercises TCX attach, record
+    # and detach on a disposable veth/namespace pair of the runner kernel.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev iproute2
+          sudo apt-get install -y --no-install-recommends "linux-tools-$(uname -r)" || sudo apt-get install -y --no-install-recommends linux-tools-azure linux-tools-common
+          clang --version | head -1
+          bpftool version
+          uname -r
+      - name: Build flow_probe.o
+        run: |
+          mkdir -p flow-out
+          clang -O2 -g -Wall -Werror -target bpf -D__TARGET_ARCH_x86 \
+            -I/usr/include/x86_64-linux-gnu -c bpf/flow_probe.c -o flow-out/flow_probe.o
+          llvm-objdump -h flow-out/flow_probe.o | grep -E ' (tc|\.maps|license)'
+          (cd flow-out && sha256sum flow_probe.o > flow_probe.o.sha256 && cat flow_probe.o.sha256)
+          printf '{"source_commit":"%s","clang":"%s","kernel":"%s"}\n' "$GITHUB_SHA" \
+            "$(clang --version | head -1)" "$(uname -r)" > flow-out/build.json
+      - name: Flow probe namespace smoke
+        run: |
+          set +e
+          sudo FLOW_OBJECT="$PWD/flow-out/flow_probe.o" python3 -B tests/integration/flow.py
+          result=$?
+          if [ "$result" -eq 77 ]; then
+            echo '::error::Flow probe prerequisites unavailable; smoke was not validated.'
+            exit 1
+          fi
+          exit "$result"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flow-probe-object
+          path: flow-out/
+          retention-days: 30
   dataplane:
     # This VM has its own kernel; namespaces do not alter its root firewall.
     runs-on: ubuntu-24.04

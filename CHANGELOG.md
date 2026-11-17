@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-Brak dodatkowych zmian po wydaniu 1.1.0.
+- Kandydat sondy flow (etap E0, nieaktywny domyślnie): obiekt eBPF TCX tylko do
+  odczytu na tapach gości i uplinku, rekordy SYN z ISN do korelacji SNAT,
+  detektory zachowania w trybie observe. [Opis](docs/flow-probe.md).
 
 ## 1.1.0 — 2026-11-11
 
