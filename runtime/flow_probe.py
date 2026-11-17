@@ -335,32 +335,91 @@ def tap_map(state_dir='/run/libvirt/qemu'):
     return out
 
 
+class _Recent:
+    """Distinct keys last seen within a window, bounded to `cap` entries.
+
+    Insertion order follows the last sighting, so the oldest entry is evicted
+    first. A full structure means "at least cap distinct keys" - enough for a
+    threshold comparison - while memory stays constant under a flood."""
+    __slots__ = ('cap', 'seen')
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.seen = {}
+
+    def add(self, key, ts):
+        seen = self.seen
+        if key in seen:
+            del seen[key]
+        elif len(seen) >= self.cap:
+            del seen[next(iter(seen))]
+        seen[key] = ts
+
+    def prune(self, cutoff):
+        seen = self.seen
+        for key in [k for k, ts in seen.items() if ts < cutoff]:
+            del seen[key]
+        return len(seen)
+
+
+class _VmState:
+    __slots__ = ('per_second', 'dsts', 'fanout')
+
+    def __init__(self, cap):
+        self.per_second = {}
+        self.dsts = _Recent(cap)
+        self.fanout = {}
+
+
 class Window:
-    """Per-VM sliding behaviour state over records (observe-only detectors)."""
-    def __init__(self, seconds=60):
+    """Per-VM sliding behaviour state (observe-only detectors D1-D3).
+
+    Memory per VM is bounded independently of the record rate: per-second
+    counters for D1 and capped recent-destination sets for D2 and D3, so a SYN
+    flood costs constant memory and constant evaluation time."""
+    def __init__(self, seconds=60, cap=4096, service_ports=None):
         self.seconds = seconds
+        self.cap = cap
+        self.service_ports = frozenset(service_ports if service_ports is not None
+                                       else DEFAULTS['thresholds']['service_ports'])
         self.rows = {}
 
     def add(self, vm, ts_s, dst, dport):
-        self.rows.setdefault(vm, []).append((ts_s, dst, dport))
+        st = self.rows.get(vm)
+        if st is None:
+            st = self.rows[vm] = _VmState(self.cap)
+        sec = int(ts_s)
+        st.per_second[sec] = st.per_second.get(sec, 0) + 1
+        st.dsts.add(dst, ts_s)
+        if dport in self.service_ports:
+            fan = st.fanout.get(dport)
+            if fan is None:
+                fan = st.fanout[dport] = _Recent(self.cap)
+            fan.add(dst, ts_s)
 
     def evaluate(self, now_s, thresholds):
         events = []
-        for vm, rows in list(self.rows.items()):
-            rows = [r for r in rows if r[0] >= now_s - self.seconds]
-            self.rows[vm] = rows
-            if not rows:
+        cutoff = now_s - self.seconds
+        ports = set(thresholds.get('service_ports', ()))
+        for vm, st in list(self.rows.items()):
+            for sec in [s for s in st.per_second if s < int(cutoff)]:
+                del st.per_second[sec]
+            count = sum(st.per_second.values())
+            distinct = st.dsts.prune(cutoff)
+            fan = 0
+            for port, recent in list(st.fanout.items()):
+                n = recent.prune(cutoff)
+                if not n:
+                    del st.fanout[port]
+                elif port in ports:
+                    fan = max(fan, n)
+            if not st.per_second and not distinct:
                 del self.rows[vm]
                 continue
-            dsts = {r[1] for r in rows}
-            fanout = {}
-            for _, d, p in rows:
-                fanout.setdefault(p, set()).add(d)
             checks = {
-                'D1_new_conn_rate': len(rows) / self.seconds,
-                'D2_distinct_dst': len(dsts),
-                'D3_service_fanout': max((len(v) for p, v in fanout.items()
-                                          if p in thresholds.get('service_ports', ())), default=0),
+                'D1_new_conn_rate': count / self.seconds,
+                'D2_distinct_dst': distinct,
+                'D3_service_fanout': fan,
             }
             for name, value in checks.items():
                 limit = thresholds.get(name)
@@ -539,7 +598,10 @@ class Probe:
             self.close()
             raise
         self.offset = tai_offset_ns()
-        self.window = Window()
+        th = cfg['thresholds']
+        # Sets only need to prove "threshold reached"; a margin keeps the exact value visible.
+        cap = 2 * max(int(th.get('D2_distinct_dst', 500)), int(th.get('D3_service_fanout', 100)), 1)
+        self.window = Window(cap=cap, service_ports=th.get('service_ports', ()))
         self.cooldown = Cooldown(cfg['event_cooldown_seconds'])
         self.records_total = 0
         self.spool_dropped = 0

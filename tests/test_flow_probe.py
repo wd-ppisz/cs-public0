@@ -109,6 +109,28 @@ class Detectors(unittest.TestCase):
         self.assertEqual(w.evaluate(200, self.T), [])
         self.assertNotIn('vm-b', w.rows)
 
+    def test_flood_state_is_bounded(self):
+        # G4: 50 000 SYN/s for 60 s must not grow the window with the record count.
+        w = fp.Window(60, cap=100, service_ports=[22])
+        for i in range(300_000):
+            w.add('vm-f', 1000 + i / 5000, f'10.{i >> 16 & 255}.{i >> 8 & 255}.{i & 255}', 22)
+        st = w.rows['vm-f']
+        self.assertLessEqual(len(st.dsts.seen), 100)
+        self.assertLessEqual(len(st.fanout[22].seen), 100)
+        self.assertLessEqual(len(st.per_second), 61)
+        ev = {e['detector']: e['value'] for e in w.evaluate(1060, self.T)}
+        self.assertEqual(ev['D1_new_conn_rate'], 5000.0)
+        self.assertEqual(ev['D2_distinct_dst'], 100)  # capped: proves ">= threshold" only
+        self.assertIn('D3_service_fanout', ev)
+
+    def test_recent_keeps_latest_and_expires(self):
+        r = fp._Recent(3)
+        for k, ts in (('a', 1), ('b', 2), ('c', 3), ('a', 4), ('d', 5)):
+            r.add(k, ts)
+        self.assertEqual(list(r.seen), ['c', 'a', 'd'])  # 'b' was the oldest sighting
+        self.assertEqual(r.prune(4), 2)
+        self.assertEqual(list(r.seen), ['a', 'd'])
+
 
 class Config(unittest.TestCase):
     def test_defaults_and_rejections(self):
