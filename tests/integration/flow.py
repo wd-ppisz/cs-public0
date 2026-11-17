@@ -43,6 +43,10 @@ def cleanup():
 
 def inner(tmp):
     """Runs inside NS_HOST (own /sys/class/net view)."""
+    # `ip netns exec` mounts a fresh sysfs in a private mount namespace, without
+    # the bpffs that hosts normally have at /sys/fs/bpf. Mount it for the test.
+    if not os.path.ismount('/sys/fs/bpf'):
+        sh('mount', '-t', 'bpf', 'bpf', '/sys/fs/bpf')
     cfg = fp.load_config(tmp / 'flow.json')
     assert fp.load_object(cfg) == 'loaded'
     idx = int(Path(f'/sys/class/net/{TAP}/ifindex').read_text())
