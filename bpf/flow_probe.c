@@ -199,7 +199,8 @@ static __always_inline void emit_dns(struct __sk_buff *skb, struct iphdr *ip, vo
 	void *end = (void *)(long)skb->data_end;
 	struct udphdr *udp = l4;
 	struct dns_record rec;
-	__u32 off, n;
+	__u64 n;	/* 64-bit: range check and helper argument share one register */
+	__u32 off;
 
 	if ((void *)(udp + 1) > end || udp->dest != bpf_htons(53))
 		return;
@@ -217,7 +218,7 @@ static __always_inline void emit_dns(struct __sk_buff *skb, struct iphdr *ip, vo
 	asm volatile("" : "+r"(n));
 	if (n < 13 || n > DNS_CAP)
 		return;
-	if (bpf_skb_load_bytes(skb, off, rec.payload, n))
+	if (bpf_skb_load_bytes(skb, off, rec.payload, (__u32)n))
 		return;
 	rec.ts_tai_ns = bpf_ktime_get_tai_ns();
 	rec.ifindex = skb->ifindex;
