@@ -53,8 +53,19 @@ dołączenie samo.
 | D2 | liczba różnych adresów docelowych | rekordy w oknie 60 s |
 | D3 | fan-out na porty usług (22, 23, 25, 445, 3389, 5900) | rekordy w oknie 60 s |
 | D4 | odsetek nieudanych prób | liczniki `syn_out` vs `synack_in`/`rst_in` (następny etap) |
+| D7 | DNS IOC per VM | pytania DNS gościa (UDP 53, pierwsze 128 B) porównane z kwalifikowanym katalogiem ThreatFox modułu DNS IOC (`dns_catalog_file`, ta sama klasa `DomainCatalog`); zapisywane wyłącznie trafienia, pozostałe nazwy odrzucane w pamięci; katalog nieaktualny = D7 wstrzymany (`dns_catalog_fresh=0`) |
 
 Progi domyślne są wyłącznie punktem startu; zdarzenie nie jest werdyktem.
+
+## Zegar i korelacja
+
+Demon odczytuje stan zegara jądra (`adjtimex`, tylko odczyt) i publikuje
+`cs_public0_flow_clock_synced` oraz `cs_public0_flow_clock_maxerror_seconds`.
+Brak synchronizacji albo błąd większy niż `clock_max_error_ms` zeruje
+`continuity_known`. Funkcja `correlate()` jest referencją dla centralnego
+korelatora: klucz `(dst_ip, dst_port, isn)` + TTL −1 + okno czasowe, wybór rekordu
+najbliższego w czasie (retransmisje SYN mają ten sam ISN), estymacja stałego
+rozjazdu zegarów jako mediany opóźnień i flaga niejednoznaczności.
 
 ## Testy
 

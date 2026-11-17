@@ -55,6 +55,25 @@ struct flow_record {
 };
 _Static_assert(sizeof(struct flow_record) == 40, "flow_record ABI");
 
+/* DNS question capture for the guest DNS IOC detector (D7). Userspace parses
+ * the name, compares it with the qualified domain catalog and discards it;
+ * only catalog matches are retained. */
+#define DNS_CAP 128
+
+struct dns_record {
+	__u64 ts_tai_ns;
+	__u32 ifindex;
+	__u32 saddr;	/* network byte order */
+	__u32 daddr;	/* network byte order */
+	__u16 sport;	/* host byte order */
+	__u16 dport;	/* host byte order */
+	__u16 len;	/* copied payload bytes */
+	__u16 pad;
+	__u8 payload[DNS_CAP];
+	__u32 pad2;
+};
+_Static_assert(sizeof(struct dns_record) == 160, "dns_record ABI");
+
 struct if_counters {
 	__u64 packets_out;
 	__u64 bytes_out;
@@ -78,10 +97,17 @@ struct {
 	__type(value, struct if_counters);
 } flow_counters SEC(".maps");
 
-/* [0] records lost on a full queue, [1] parse skipped (non-IPv4/short) */
+struct {
+	__uint(type, BPF_MAP_TYPE_QUEUE);
+	__uint(max_entries, 16384);
+	__type(value, struct dns_record);
+} flow_dns SEC(".maps");
+
+/* [0] records lost on a full queue, [1] parse skipped (non-IPv4/short),
+ * [2] DNS records lost on a full queue */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 2);
+	__uint(max_entries, 3);
 	__type(key, __u32);
 	__type(value, __u64);
 } flow_stats SEC(".maps");
@@ -167,6 +193,41 @@ static __always_inline void emit(struct iphdr *ip, struct tcphdr *tcp,
 		stat_inc(0);
 }
 
+static __always_inline void emit_dns(struct __sk_buff *skb, struct iphdr *ip, void *l4)
+{
+	void *data = (void *)(long)skb->data;
+	void *end = (void *)(long)skb->data_end;
+	struct udphdr *udp = l4;
+	struct dns_record rec;
+	__u32 off, n;
+
+	if ((void *)(udp + 1) > end || udp->dest != bpf_htons(53))
+		return;
+	n = bpf_ntohs(udp->len);
+	if (n <= sizeof(*udp) + 12)
+		return;
+	n -= sizeof(*udp);
+	if (n > DNS_CAP)
+		n = DNS_CAP;
+	off = (__u32)((void *)(udp + 1) - data);
+	__builtin_memset(&rec, 0, sizeof(rec));
+	/* Bounded, non-zero length for the verifier. */
+	n &= 0xff;
+	if (n < 13 || n > DNS_CAP)
+		return;
+	if (bpf_skb_load_bytes(skb, off, rec.payload, n))
+		return;
+	rec.ts_tai_ns = bpf_ktime_get_tai_ns();
+	rec.ifindex = skb->ifindex;
+	rec.saddr = ip->saddr;
+	rec.daddr = ip->daddr;
+	rec.sport = bpf_ntohs(udp->source);
+	rec.dport = 53;
+	rec.len = n;
+	if (bpf_map_push_elem(&flow_dns, &rec, BPF_ANY))
+		stat_inc(2);
+}
+
 static __always_inline int observe_out(struct __sk_buff *skb, __u8 side)
 {
 	void *end = (void *)(long)skb->data_end;
@@ -188,6 +249,8 @@ static __always_inline int observe_out(struct __sk_buff *skb, __u8 side)
 	if (ip->protocol == IPPROTO_UDP) {
 		if (c)
 			__sync_fetch_and_add(&c->udp_out, 1);
+		if (side == SIDE_GUEST)
+			emit_dns(skb, ip, l4);
 		return TCX_NEXT;
 	}
 	if (ip->protocol != IPPROTO_TCP)

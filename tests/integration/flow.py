@@ -82,6 +82,25 @@ def inner(tmp):
         assert ctr['svc_syn']['ssh'] >= 1 and ctr['svc_syn']['smtp'] >= 1, ctr
         prom = Path(cfg['metrics_file']).read_text(encoding='utf-8')
         assert 'cs_public0_flow_attachments 2' in prom and GUEST_IP not in prom, prom
+        assert 'cs_public0_flow_clock_synced' in prom and 'cs_public0_flow_dns_catalog_fresh 1' in prom, prom
+
+        # D7: guest DNS questions; only the catalog match is retained.
+        for name in ('bad.example', 'good.example', 'Bad.Example'):
+            qname = b''.join(bytes([len(x)]) + x.encode() for x in name.split('.')) + bytes([0, 0, 1, 0, 1])
+            packet = bytes.fromhex('123401000001000000000000') + qname
+            sh('ip', 'netns', 'exec', NS_GUEST, sys.executable, '-c',
+               'import socket,sys; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)'
+               '.sendto(bytes.fromhex(sys.argv[1]), (sys.argv[2], 53))', packet.hex(), HOST_IP)
+        time.sleep(0.2)
+        probe.cycle()
+        ev_path = spool / 'events.jsonl'
+        events = [json.loads(x) for x in ev_path.read_text(encoding='utf-8').splitlines()] if ev_path.exists() else []
+        d7 = [e for e in events if e['detector'] == 'D7_dns_ioc']
+        assert [e['domain'] for e in d7] == ['bad.example'], events  # 2nd hit suppressed by cooldown
+        assert d7[0]['ioc']['source'] == 'threatfox' and d7[0]['iface'] == TAP, d7
+        spool_text = ''.join(f.read_text(encoding='utf-8') for f in spool.glob('records-*.jsonl'))
+        assert 'good.example' not in spool_text and 'good.example' not in ev_path.read_text(encoding='utf-8')
+        assert probe.dns_total == 3 and probe.dns_matches == 1, (probe.dns_total, probe.dns_matches)
 
         # Stale removal: once the tap no longer matches the prefix, reconcile detaches it.
         probe.cfg = dict(cfg, guest_prefix='nomatch')
@@ -113,7 +132,13 @@ def main():
         'pin_dir': PIN, 'object': str(Path(obj).resolve()), 'guest_prefix': 'vnettest',
         'uplink': '', 'state_dir': str(tmp / 'libvirt'), 'spool_dir': str(tmp / 'spool'),
         'metrics_file': str(tmp / 'flow.prom'), 'sensor_id': 'ci',
+        'dns_catalog_file': str(tmp / 'domain-catalog.json'),
     }), encoding='utf-8')
+    now = int(time.time())
+    (tmp / 'domain-catalog.json').write_text(json.dumps({'catalog': {
+        'schema': 'cs-public0-domain-catalog-v1', 'source': 'threatfox', 'domains': ['bad.example'],
+        'sha256': 'a' * 64, 'fetched_unix': now - 60, 'published_unix': now - 120,
+        'expires_unix': now + 3600}}), encoding='utf-8')
     try:
         sh('ip', 'netns', 'add', NS_HOST)
         sh('ip', 'netns', 'add', NS_GUEST)

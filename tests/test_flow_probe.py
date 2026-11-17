@@ -1,6 +1,7 @@
 """Offline checks of the flow probe: kernel ABI layouts, decoding, libvirt
 mapping, observe-only detectors and configuration bounds."""
 from pathlib import Path
+import json
 import os
 import re
 import struct
@@ -188,6 +189,163 @@ class Spool(unittest.TestCase):
                 p.write_text(bad, encoding='utf-8')
                 with self.assertRaises(ValueError, msg=bad):
                     fp.load_config(p)
+
+
+def dns_query(name, flags=0x0100, qd=1):
+    body = b''.join(bytes([len(x)]) + x.encode() for x in name.split('.')) + b'\x00\x00\x01\x00\x01'
+    return b'\x12\x34' + flags.to_bytes(2, 'big') + qd.to_bytes(2, 'big') + b'\x00' * 6 + body
+
+
+def catalog_value(now, domains=('bad.example',), expires_in=3600):
+    return {'schema': 'cs-public0-domain-catalog-v1', 'source': 'threatfox', 'domains': sorted(domains),
+            'sha256': 'a' * 64, 'fetched_unix': now - 60, 'published_unix': now - 120,
+            'expires_unix': now + expires_in}
+
+
+class Dns(unittest.TestCase):
+    def test_dns_record_layout(self):
+        self.assertEqual(fp.DNS_RECORD.size, 160)
+        self.assertIn('_Static_assert(sizeof(struct dns_record) == 160', SRC)
+        self.assertIn('flow_dns', fp.MAPS)
+        self.assertIn('emit_dns(skb, ip, l4)', SRC)
+
+    def test_parse_query_name(self):
+        self.assertEqual(fp.parse_qname(dns_query('Bad.Example')), 'bad.example')
+        self.assertEqual(fp.parse_qname(dns_query('a.b.c.example')), 'a.b.c.example')
+
+    def test_reject_response_opcode_compression_and_garbage(self):
+        self.assertIsNone(fp.parse_qname(dns_query('bad.example', flags=0x8180)))  # response
+        self.assertIsNone(fp.parse_qname(dns_query('bad.example', flags=0x2800)))  # UPDATE opcode
+        self.assertIsNone(fp.parse_qname(dns_query('bad.example', qd=0)))
+        compressed = dns_query('x.example')[:12] + b'\xc0\x0c\x00\x01\x00\x01'
+        self.assertIsNone(fp.parse_qname(compressed))
+        self.assertIsNone(fp.parse_qname(dns_query('a' * 64 + '.example')))
+        self.assertIsNone(fp.parse_qname(dns_query('bad.example')[:20]))  # truncated
+        self.assertIsNone(fp.parse_qname(b'\x00' * 5))
+
+    def test_decode_dns_record(self):
+        payload = dns_query('bad.example')
+        saddr = struct.unpack('<I', bytes([10, 0, 0, 5]))[0]
+        daddr = struct.unpack('<I', bytes([10, 0, 0, 1]))[0]
+        raw = fp.DNS_RECORD.pack(2_000_000_000, 7, saddr, daddr, 53000, 53, len(payload), 0,
+                                 payload.ljust(128, b'\x00'), 0)
+        q = fp.decode_dns(raw, 1_000_000_000)
+        self.assertEqual((q['ts_ns'], q['src_ip'], q['dst_ip'], q['qname']),
+                         (1_000_000_000, '10.0.0.5', '10.0.0.1', 'bad.example'))
+
+    def test_catalog_shared_contract(self):
+        now = int(fp.time.time())
+        with tempfile.TemporaryDirectory() as d:
+            wrapped = Path(d, 'domain-catalog.json')
+            wrapped.write_text(json.dumps({'identity': [1], 'policy': 'x', 'catalog': catalog_value(now)}),
+                               encoding='utf-8')
+            cat = fp.load_domain_catalog(wrapped)
+            self.assertTrue(cat.fresh(now))
+            self.assertIn('bad.example', cat.names)
+            bare = Path(d, 'bare.json')
+            bare.write_text(json.dumps(catalog_value(now, expires_in=-1)), encoding='utf-8')
+            expired = fp.load_domain_catalog(bare)  # well-formed but past expiry: D7 pauses
+            self.assertFalse(expired.fresh(now))
+            bad = Path(d, 'bad.json')
+            bad.write_text(json.dumps(catalog_value(now, domains=('Bad.Example',))), encoding='utf-8')
+            with self.assertRaises(ValueError):
+                fp.load_domain_catalog(bad)
+
+    def test_config_catalog_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d, 'c.json')
+            p.write_text('{"dns_catalog_file": "relative.json"}', encoding='utf-8')
+            with self.assertRaises(ValueError):
+                fp.load_config(p)
+            p.write_text('{"dns_catalog_file": "/var/lib/cs-public0-dns/domain-catalog.json"}', encoding='utf-8')
+            self.assertTrue(fp.load_config(p)['dns_catalog_file'].endswith('domain-catalog.json'))
+
+
+class Clock(unittest.TestCase):
+    @staticmethod
+    def timex(maxerror_us, status):
+        return struct.pack('<I4xqqqqi', 0, 0, 0, maxerror_us, 100, status).ljust(256, b'\x00')
+
+    def test_synced(self):
+        self.assertEqual(fp.decode_timex(0, self.timex(12_000, 0x2001)), (True, 0.012, 0.0001))
+
+    def test_unsynced_by_state_or_flag(self):
+        self.assertFalse(fp.decode_timex(fp.TIME_ERROR, self.timex(16_000_000, 0x0041))[0])
+        self.assertFalse(fp.decode_timex(0, self.timex(5_000, fp.STA_UNSYNC))[0])
+
+
+class Correlation(unittest.TestCase):
+    @staticmethod
+    def rec(side, ts, isn, src='10.0.0.5', sport=40000, dst='198.51.100.9', ttl=None):
+        return {'side': side, 'ts_ns': int(ts * 1e9), 'isn': isn, 'src_ip': src, 'src_port': sport,
+                'dst_ip': dst, 'dst_port': 443, 'ttl': ttl if ttl is not None else (64 if side == 'g' else 63)}
+
+    def test_constant_clock_skew_is_tolerated(self):
+        guest = [self.rec('g', 100 + i, 1000 + i) for i in range(10)]
+        uplink = [self.rec('u', 100 + i + 1.2, 1000 + i, src='203.0.113.1') for i in range(10)]
+        pairs, skew = fp.correlate(guest, uplink, window_s=2.0, max_dt_s=0.05)
+        self.assertAlmostEqual(skew, 1.2, places=3)
+        self.assertTrue(all(p['confident'] for p in pairs))
+
+    def test_retransmission_pairs_with_nearest_record(self):
+        guest = [self.rec('g', 100.0, 7), self.rec('g', 101.0, 7), self.rec('g', 50.0, 99)]
+        uplink = [self.rec('u', 100.0003, 7, src='203.0.113.1'), self.rec('u', 101.0004, 7, src='203.0.113.1'),
+                  self.rec('u', 50.0003, 99, src='203.0.113.1')]
+        pairs, _ = fp.correlate(guest, uplink)
+        self.assertEqual([round(p['dt_s'], 4) for p in pairs], [0.0003, 0.0004, 0.0003])
+        self.assertTrue(all(p['confident'] and not p['ambiguous'] for p in pairs))
+
+    def test_skew_with_retransmissions_assigns_one_to_one(self):
+        # reviewer scenario: true skew 1.2 s, three transmissions of one SYN
+        guest = [self.rec('g', t, 7) for t in (100, 101, 102)] + [self.rec('g', 50 + i, 500 + i) for i in range(3)]
+        uplink = [self.rec('u', t + 1.2, 7, src='203.0.113.1') for t in (100, 101, 102)] +                  [self.rec('u', 50 + i + 1.2, 500 + i, src='203.0.113.1') for i in range(3)]
+        pairs, skew = fp.correlate(guest, uplink)
+        self.assertAlmostEqual(skew, 1.2, places=3)
+        self.assertEqual([round(p['dt_s'], 3) for p in pairs[:3]], [1.2, 1.2, 1.2])
+        used = [id(p['uplink']) for p in pairs if p['uplink']]
+        self.assertEqual(len(used), len(set(used)))
+        self.assertTrue(all(p['confident'] for p in pairs))
+
+    def test_competing_guests_under_one_key_are_ambiguous(self):
+        # reviewer scenario: two VMs, same (dst, port, isn); router passes only one
+        anchor_g = [self.rec('g', 50.0, 1)]
+        anchor_u = [self.rec('u', 50.0001, 1, src='203.0.113.1')]
+        guest = anchor_g + [self.rec('g', 100.0, 7, src='10.0.0.5'), self.rec('g', 100.001, 7, src='10.0.0.6')]
+        uplink = anchor_u + [self.rec('u', 100.002, 7, src='203.0.113.1')]
+        pairs, _ = fp.correlate(guest, uplink)
+        hits = [p for p in pairs[1:] if p['uplink']]
+        self.assertEqual(len(hits), 1)
+        self.assertTrue(hits[0]['ambiguous'] and not hits[0]['confident'])
+        self.assertTrue(pairs[0]['confident'])
+
+    def test_no_unambiguous_anchor_means_no_confidence(self):
+        guest = [self.rec('g', 100.0, 7), self.rec('g', 101.0, 7)]
+        uplink = [self.rec('u', 100.0003, 7, src='203.0.113.1'), self.rec('u', 101.0004, 7, src='203.0.113.1')]
+        pairs, _ = fp.correlate(guest, uplink)
+        self.assertTrue(all(p['uplink'] is not None and not p['confident'] for p in pairs))
+
+    def test_older_pins_refused_and_unload_needs_no_maps(self):
+        with tempfile.TemporaryDirectory() as d:
+            for sub, names in (('progs', fp.PROGRAMS), ('maps', ('flow_records', 'flow_counters', 'flow_stats'))):
+                Path(d, sub).mkdir()
+                for n in names:
+                    Path(d, sub, n).write_text('', encoding='utf-8')
+            with self.assertRaises(RuntimeError):
+                fp.load_object(dict(fp.DEFAULTS, pin_dir=d))
+
+    def test_ambiguous_collision_is_never_confident(self):
+        guest = [self.rec('g', 100.0, 5)]
+        uplink = [self.rec('u', 100.0002, 5, src='203.0.113.1'), self.rec('u', 100.0003, 5, src='203.0.113.2')]
+        pairs, _ = fp.correlate(guest, uplink)
+        self.assertTrue(pairs[0]['ambiguous'])
+        self.assertFalse(pairs[0]['confident'])
+
+    def test_wrong_hop_or_outside_window_is_unmatched(self):
+        guest = [self.rec('g', 100.0, 9), self.rec('g', 200.0, 10)]
+        uplink = [self.rec('u', 100.0001, 9, src='203.0.113.1', ttl=64),
+                  self.rec('u', 205.0, 10, src='203.0.113.1')]
+        pairs, _ = fp.correlate(guest, uplink, window_s=2.0)
+        self.assertEqual([p['uplink'] for p in pairs], [None, None])
 
 
 if __name__ == '__main__':

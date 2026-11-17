@@ -40,13 +40,14 @@ TCX_INGRESS = 46
 TCX_EGRESS = 47
 
 PROGRAMS = ('flow_guest_out', 'flow_guest_in', 'flow_uplink')
-MAPS = ('flow_records', 'flow_counters', 'flow_stats')
+MAPS = ('flow_records', 'flow_counters', 'flow_stats', 'flow_dns')
 
 RECORD = struct.Struct('<QIIIIHHHBBII')  # struct flow_record, 40 bytes, no padding
 COUNTER_FIELDS = ('packets_out', 'bytes_out', 'syn_out', 'udp_out', 'synack_in', 'rst_in')
 SVC_NAMES = ('other', 'ssh', 'telnet', 'smtp', 'smb', 'rdp', 'vnc')
 COUNTERS = struct.Struct('<' + 'Q' * (len(COUNTER_FIELDS) + len(SVC_NAMES)))
 SIDES = {1: 'guest', 2: 'uplink'}
+DNS_RECORD = struct.Struct('<QIIIHHHH128sI')  # struct dns_record, 160 bytes
 
 _libc = None
 
@@ -170,6 +171,136 @@ def decode_counters(raw):
     return out
 
 
+def parse_qname(payload):
+    """First question name of an ordinary DNS query, lower-case, no trailing dot.
+
+    Returns None for responses, non-QUERY opcodes, compression in the question,
+    truncated or oversized names. The name is used only for an in-memory
+    catalog comparison and is never written unless it matches."""
+    if len(payload) < 13:
+        return None
+    flags = int.from_bytes(payload[2:4], 'big')
+    qdcount = int.from_bytes(payload[4:6], 'big')
+    if flags & 0x8000 or (flags >> 11) & 0xF or qdcount < 1:
+        return None
+    labels, i = [], 12
+    while True:
+        if i >= len(payload):
+            return None
+        n = payload[i]
+        if n == 0:
+            break
+        if n & 0xC0 or n > 63 or i + 1 + n > len(payload):
+            return None
+        label = payload[i + 1:i + 1 + n]
+        try:
+            labels.append(label.decode('ascii').lower())
+        except UnicodeDecodeError:
+            return None
+        i += 1 + n
+    name = '.'.join(labels)
+    return name if 0 < len(name) <= 253 else None
+
+
+def decode_dns(raw, offset_ns):
+    ts, ifindex, saddr, daddr, sport, dport, length, _, payload, _ = DNS_RECORD.unpack(raw)
+    return {'ts_ns': ts - offset_ns, 'ifindex': ifindex, 'src_ip': ip4(saddr), 'dst_ip': ip4(daddr),
+            'src_port': sport, 'dst_port': dport, 'qname': parse_qname(payload[:min(length, 128)])}
+
+
+def load_domain_catalog(path):
+    """Qualified ThreatFox domain catalog shared with the DNS IOC module.
+
+    Accepts the DNS IOC cache wrapper ({"catalog": {...}}) or a bare catalog and
+    validates it with the same DomainCatalog contract (freshness, expiry, form)."""
+    from dns_ioc import DomainCatalog
+    value = json.loads(Path(path).read_text(encoding='utf-8'))
+    if isinstance(value, dict) and 'catalog' in value:
+        value = value['catalog']
+    return DomainCatalog(value)
+
+
+# --- clock (G7) --------------------------------------------------------------
+TIME_ERROR = 5
+STA_UNSYNC = 0x0040
+
+
+def decode_timex(ret, raw):
+    """(synced, maxerror_seconds, esterror_seconds) from adjtimex(2) output."""
+    _modes, _offset, _freq, maxerror, esterror, status = struct.unpack_from('<I4xqqqqi', raw, 0)
+    synced = ret != TIME_ERROR and not status & STA_UNSYNC
+    return synced, maxerror / 1e6, esterror / 1e6
+
+
+def clock_state():
+    buf = ctypes.create_string_buffer(256)  # struct timex, modes=0: read only
+    ret = _sys().adjtimex(buf)
+    if ret < 0:
+        return False, float('inf'), float('inf')
+    return decode_timex(ret, buf.raw)
+
+
+# --- reference correlation (input to the central correlator) -----------------
+def correlate(guest, uplink, window_s=2.0, max_dt_s=0.05):
+    """Join guest SYN records with uplink records of the same SYN.
+
+    Key: (dst_ip, dst_port, isn) with TTL decremented by exactly one hop and a
+    time window. SYN retransmissions share the ISN, so a key can carry several
+    records on both sides. The constant clock offset between hosts is first
+    estimated as the median delay of keys with exactly one record per side; then
+    records are assigned one-to-one, nearest to the skew-corrected time first,
+    so an uplink record is never used twice. A key whose uplink records name
+    more than one public source, or guest records of more than one connection,
+    is ambiguous and never confident."""
+    def key(r):
+        return (r['dst_ip'], r['dst_port'], r['isn'])
+
+    gk, uk = {}, {}
+    for i, g in enumerate(guest):
+        gk.setdefault(key(g), []).append(i)
+    for j, u in enumerate(uplink):
+        uk.setdefault(key(u), []).append(j)
+
+    def ok(g, u):
+        return u['ttl'] == g['ttl'] - 1 and abs(u['ts_ns'] - g['ts_ns']) <= window_s * 1e9
+
+    unique = sorted((uplink[uk[k][0]]['ts_ns'] - guest[gi[0]]['ts_ns']) / 1e9
+                    for k, gi in gk.items() if len(gi) == 1 and len(uk.get(k, [])) == 1
+                    and ok(guest[gi[0]], uplink[uk[k][0]]))
+    skew = unique[len(unique) // 2] if unique else 0.0
+
+    edges = []
+    for k, gi in gk.items():
+        for i in gi:
+            for j in uk.get(k, []):
+                if ok(guest[i], uplink[j]):
+                    dt = (uplink[j]['ts_ns'] - guest[i]['ts_ns']) / 1e9
+                    edges.append((abs(dt - skew), i, j, dt))
+    edges.sort()
+    used_g, used_u, best = set(), set(), {}
+    for cost, i, j, dt in edges:
+        if i in used_g or j in used_u:
+            continue
+        used_g.add(i)
+        used_u.add(j)
+        best[i] = (j, dt)
+    pairs = []
+    for i, g in enumerate(guest):
+        if i not in best:
+            pairs.append({'guest': g, 'uplink': None, 'ambiguous': False, 'confident': False})
+            continue
+        j, dt = best[i]
+        sources = {(uplink[x]['src_ip'], uplink[x]['src_port']) for x in uk[key(g)] if ok(g, uplink[x])}
+        # Competing guests: different connections (source tuple or tap) under the
+        # same key within the window. Retransmissions of one connection share it.
+        rivals = {(guest[y]['src_ip'], guest[y]['src_port'], guest[y].get('iface'), guest[y].get('vm_uuid'))
+                  for y in gk[key(g)] if abs(guest[y]['ts_ns'] - g['ts_ns']) <= 2 * window_s * 1e9}
+        amb = len(sources) > 1 or len(rivals) > 1
+        pairs.append({'guest': g, 'uplink': uplink[j], 'ambiguous': amb, 'dt_s': dt,
+                      'confident': not amb and bool(unique) and abs(dt - skew) <= max_dt_s})
+    return pairs, skew
+
+
 SYSTEM_VM = re.compile(r'^[rsv]-\d+-VM$')
 
 
@@ -255,11 +386,14 @@ DEFAULTS = {
     'file_max_bytes': 256 * 1024 ** 2,
     'events_max_bytes': 16 * 1024 ** 2,
     'event_cooldown_seconds': 300,
+    'dns_catalog_file': '',
+    'dns_budget_per_cycle': 5000,
+    'clock_max_error_ms': 500,
     'thresholds': {'D1_new_conn_rate': 50, 'D2_distinct_dst': 500, 'D3_service_fanout': 100,
                    'service_ports': [22, 23, 25, 445, 3389, 5900]},
 }
 POSITIVE = ('record_budget_per_cycle', 'spool_max_files', 'spool_max_bytes', 'file_max_bytes',
-            'events_max_bytes', 'event_cooldown_seconds')
+            'events_max_bytes', 'event_cooldown_seconds', 'dns_budget_per_cycle', 'clock_max_error_ms')
 
 
 def load_config(path):
@@ -280,6 +414,9 @@ def load_config(path):
     for k in POSITIVE:
         if not isinstance(out[k], int) or isinstance(out[k], bool) or out[k] <= 0:
             raise ValueError(k)
+    if not isinstance(out['dns_catalog_file'], str) or (out['dns_catalog_file']
+                                                       and not out['dns_catalog_file'].startswith('/')):
+        raise ValueError('dns_catalog_file must be empty or absolute')
     if out['file_max_bytes'] > out['spool_max_bytes']:
         raise ValueError('file_max_bytes exceeds spool_max_bytes')
     return out
@@ -387,14 +524,17 @@ def interfaces():
 
 
 class Probe:
-    def __init__(self, cfg):
+    def __init__(self, cfg, maps=True):
         self.cfg = cfg
         self._fds = []
         try:
             pin = Path(cfg['pin_dir'])
-            self.prog_fd = {p: self._open(pin / 'progs' / p) for p in PROGRAMS}
+            # Programs of an older object stay detachable: unload opens only the
+            # programs that are actually pinned and never needs the maps.
+            names = PROGRAMS if maps else tuple(p for p in PROGRAMS if (pin / 'progs' / p).exists())
+            self.prog_fd = {p: self._open(pin / 'progs' / p) for p in names}
             self.prog_ids = {p: prog_id(fd) for p, fd in self.prog_fd.items()}
-            self.map_fd = {m: self._open(pin / 'maps' / m) for m in MAPS}
+            self.map_fd = {m: self._open(pin / 'maps' / m) for m in MAPS} if maps else {}
         except Exception:
             self.close()
             raise
@@ -407,6 +547,12 @@ class Probe:
         self.events_total = {}
         self.taps = {}
         self.taps_at = 0.0
+        self.dns_total = 0
+        self.dns_matches = 0
+        self.dns_cooldown = Cooldown(cfg['event_cooldown_seconds'])
+        self.catalog = None
+        self.catalog_key = None
+        self.prev_lost = None
 
     def _open(self, path):
         fd = obj_get(path)
@@ -435,6 +581,8 @@ class Probe:
         found = set()
         for _, idx in (ifaces or interfaces()).items():
             for prog, at in ALL_ATTACH:
+                if prog not in self.prog_ids:
+                    continue
                 try:
                     if self.prog_ids[prog] in tcx_query(idx, at):
                         found.add((idx, prog, at))
@@ -533,7 +681,7 @@ class Probe:
 
     def stats(self):
         out = []
-        for i in (0, 1):
+        for i in (0, 1, 2):
             key = ctypes.create_string_buffer(struct.pack('<I', i), 4)
             val = ctypes.create_string_buffer(8)
             attr = struct.pack('<I4xQQQ', self.map_fd['flow_stats'], ctypes.addressof(key),
@@ -541,6 +689,47 @@ class Probe:
             bpf(CMD_MAP_LOOKUP, attr)
             out.append(struct.unpack('<Q', val.raw)[0])
         return out
+
+    def refresh_catalog(self):
+        path = self.cfg['dns_catalog_file']
+        if not path:
+            self.catalog = None
+            return
+        try:
+            st = os.stat(path)
+            key = (st.st_ino, st.st_size, st.st_mtime_ns)
+            if key != self.catalog_key:
+                self.catalog = load_domain_catalog(path)
+                self.catalog_key = key
+        except (OSError, ValueError, KeyError, TypeError):
+            self.catalog, self.catalog_key = None, None
+
+    def drain_dns(self, now):
+        """Compare guest DNS questions with the catalog; keep only matches."""
+        names = {idx: name for name, idx in interfaces().items()}
+        events, n = [], 0
+        fresh = self.catalog is not None and self.catalog.fresh(now)
+        while n < self.cfg['dns_budget_per_cycle']:
+            raw = map_pop(self.map_fd['flow_dns'], DNS_RECORD.size)
+            if raw is None:
+                break
+            n += 1
+            q = decode_dns(raw, self.offset)
+            name = q.pop('qname')
+            if not fresh or not name or name not in self.catalog.names:
+                continue
+            iface = names.get(q['ifindex'], '')
+            meta = self.taps.get(iface, {})
+            vm = meta.get('vm_uuid')
+            if meta.get('system_vm') or not self.dns_cooldown.allow((vm, iface, name), now):
+                continue
+            self.dns_matches += 1
+            events.append({'detector': 'D7_dns_ioc', 'vm_uuid': vm, 'domain': name,
+                           'iface': iface, 'src_ip': q['src_ip'],
+                           'resolver_ip': q['dst_ip'], 'observed_ns': q['ts_ns'],
+                           'ioc': {**self.catalog.receipt, 'match': 'exact'}})
+        self.dns_total += n
+        return events, n
 
     def write_events(self, d, events, now):
         ev = d / 'events.jsonl'
@@ -574,7 +763,11 @@ class Probe:
                     self.spool_dropped += 1
         prune_spool(d, path, self.cfg['spool_max_files'], self.cfg['spool_max_bytes'])
         self.records_total += n
-        events = []
+        self.refresh_catalog()
+        events, dns_n = self.drain_dns(now)
+        for e in events:
+            e.update(ts=int(now), mode='observe', sensor=self.cfg['sensor_id'])
+            self.events_total[e['detector']] = self.events_total.get(e['detector'], 0) + 1
         for e in self.window.evaluate(now, self.cfg['thresholds']):
             if self.cooldown.allow((e['vm_uuid'], e['detector']), now):
                 e.update(ts=int(now), mode='observe', sensor=self.cfg['sensor_id'])
@@ -582,10 +775,16 @@ class Probe:
                 self.events_total[e['detector']] = self.events_total.get(e['detector'], 0) + 1
         if events:
             self.write_events(d, events, now)
-        lost, skipped = self.stats()
+        lost, skipped, dns_lost = self.stats()
+        loss_free = self.prev_lost is not None and (lost, dns_lost) == self.prev_lost
+        self.prev_lost = (lost, dns_lost)
         guests = sum(1 for name in interfaces() if name.startswith(self.cfg['guest_prefix']))
+        synced, maxerr, _esterr = clock_state()
+        clock_ok = synced and maxerr * 1000 <= self.cfg['clock_max_error_ms']
+        catalog_fresh = int(self.catalog is not None and self.catalog.fresh(now))
         continuity = int(missing == 0 and errors == 0 and self.spool_dropped == dropped_before
-                         and n < self.cfg['record_budget_per_cycle'])
+                         and n < self.cfg['record_budget_per_cycle']
+                         and dns_n < self.cfg['dns_budget_per_cycle'] and clock_ok and loss_free)
         m = {
             'up': ('gauge', 'Last cycle completed', 1),
             'last_cycle_unix_seconds': ('gauge', 'Last completed cycle', int(now)),
@@ -600,6 +799,13 @@ class Probe:
             'parse_skipped_total': ('counter', 'Packets not parsed (non-IPv4 or short)', skipped),
             'continuity_known': ('gauge', 'No known loss in the last cycle', continuity),
             'events_total': ('counter', 'Observe-only detector events', self.events_total or {'none': 0}),
+            'dns_queries_total': ('counter', 'Guest DNS questions compared with the catalog', self.dns_total),
+            'dns_ioc_matches_total': ('counter', 'Guest DNS questions matching the catalog', self.dns_matches),
+            'dns_records_lost_total': ('counter', 'DNS records lost on a full kernel queue', dns_lost),
+            'dns_catalog_fresh': ('gauge', 'Qualified domain catalog loaded and current (D7 active)', catalog_fresh),
+            'clock_synced': ('gauge', 'Kernel clock reports NTP synchronisation', int(synced)),
+            'clock_maxerror_seconds': ('gauge', 'Kernel clock maximum error estimate',
+                                       round(maxerr, 6) if maxerr != float('inf') else -1),
         }
         write_atomic(self.cfg['metrics_file'], metrics_text(m))
         return m
@@ -608,6 +814,11 @@ class Probe:
 def load_object(cfg):
     pin = Path(cfg['pin_dir'])
     if (pin / 'progs' / PROGRAMS[0]).exists():
+        missing = [m for m in MAPS if not (pin / 'maps' / m).exists()] + \
+                  [p for p in PROGRAMS if not (pin / 'progs' / p).exists()]
+        if missing:
+            raise RuntimeError(f'pinned object is an older or partial ABI (missing {missing}); '
+                               'run unload, then load')
         return 'already-loaded'
     (pin / 'maps').mkdir(parents=True, exist_ok=True)
     subprocess.run(['bpftool', 'prog', 'loadall', cfg['object'], str(pin / 'progs'),
@@ -624,7 +835,7 @@ def unload(cfg):
         foreign = present - names
         if foreign:
             raise RuntimeError(f'foreign objects in {pin / sub}: {sorted(foreign)}; nothing removed')
-    with Probe(cfg) as probe:
+    with Probe(cfg, maps=False) as probe:
         detached, failures = probe.detach_all()
         remaining = probe.owned(strict=True)
     if failures or remaining:
