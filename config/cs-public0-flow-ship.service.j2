@@ -1,0 +1,25 @@
+[Unit]
+Description=cs-public0 flow spool shipper (ClickHouse over verified TLS)
+Documentation=https://github.com/wd-ppisz/cs-public0/blob/main/docs/flow-probe.md
+After=network-online.target cs-public0-flow.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{ cs_public0_flow_bundle }}
+ExecStart=/usr/bin/python3 -I -B {{ cs_public0_flow_bundle }}/flow_ship.py run --config {{ cs_public0_flow_ship_config_file }}
+Restart=always
+RestartSec=10
+CPUQuota={{ cs_public0_flow_cpu_quota }}
+MemoryMax={{ cs_public0_flow_memory_max }}
+TasksMax=16
+UMask=0022
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths={{ cs_public0_flow_ship_configuration.state_file | dirname }} {{ cs_public0_flow_ship_configuration.metrics_file | dirname }}
+ReadOnlyPaths=-{{ cs_public0_flow_configuration.spool_dir }}
+
+[Install]
+WantedBy=multi-user.target
