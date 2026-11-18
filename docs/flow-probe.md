@@ -67,6 +67,32 @@ korelatora: klucz `(dst_ip, dst_port, isn)` + TTL −1 + okno czasowe, wybór re
 najbliższego w czasie (retransmisje SYN mają ten sam ISN), estymacja stałego
 rozjazdu zegarów jako mediany opóźnień i flaga niejednoznaczności.
 
+## Wysyłka do ClickHouse (`flow_ship.py`)
+
+Osobny proces (tylko biblioteka standardowa) czyta pliki `records-*.jsonl` od
+zapisanego przesunięcia i wysyła pełne linie partiami (`INSERT ... FORMAT
+JSONEachRow`) do tabel `syn_vnet` (strona gościa) i `syn_public0` (uplink)
+przez HTTPS. Przesunięcie rośnie dopiero po potwierdzeniu wstawienia.
+
+- **Deduplikacja:** każda partia ma deterministyczny `insert_deduplication_token`
+  z (sensor, plik, zakres bajtów, tabela). Zakres jest zapisywany w stanie *przed*
+  wysłaniem, więc po awarii ponawiany jest dokładnie ten sam zakres, a serwer
+  odrzuca duplikat. Wymaga po stronie serwera: `non_replicated_deduplication_window`
+  na tabelach (także docelowych widoków zmaterializowanych), `async_insert = 0`
+  i `deduplicate_blocks_in_dependent_materialized_views = 1` dla konta piszącego.
+- **TLS:** weryfikacja certyfikatu zawsze, także przy łączeniu po adresie IP
+  (nazwa z `server_name` jako SNI); lista `endpoints` próbowana po kolei,
+  odmowa uwierzytelnionego serwera (HTTP ≠ 200) nie jest ponawiana na innym węźle.
+- **Konto:** tylko `INSERT` na tabelach wejściowych; hasło w pliku dostępnym
+  wyłącznie dla roota (`password_file`).
+- **Straty:** plik usunięty przez retencję sondy przed wysłaniem całości zwiększa
+  `cs_public0_flow_ship_unshipped_files_total`; metryki `cs_public0_flow_ship_*`
+  w osobnym pliku textfile.
+
+```sh
+python3 runtime/flow_ship.py once --config /etc/cs-public0/flow-ship.json
+```
+
 ## Testy
 
 ```sh
