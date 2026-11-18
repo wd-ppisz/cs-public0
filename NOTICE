@@ -5,3 +5,7 @@ This distribution contains original automation, configuration templates, tests
 and documentation. It does not include the Suricata engine or third-party rule
 feeds. Apache CloudStack, Suricata, Ansible, Prometheus and Grafana names identify
 external projects; no affiliation or endorsement is implied.
+
+The eBPF program in bpf/ is licensed GPL-2.0-only OR BSD-2-Clause, as
+required for loading GPL-compatible kernel programs; the rest of the
+repository remains under the Apache License 2.0.

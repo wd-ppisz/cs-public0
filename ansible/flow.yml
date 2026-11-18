@@ -1,0 +1,224 @@
+---
+# Flow probe (observe only) and its ClickHouse shipper on one explicitly selected host.
+# Attaches read-only TCX programs to guest taps and an optional uplink; never blocks,
+# redirects or modifies packets. Stopping the probe unit detaches every own program.
+# Disabled by default: cs_public0_flow_enable=true installs AND starts both units.
+- name: Install the flow probe and shipper on one explicit host
+  hosts: "{{ target | default('cs_public0_no_target') }}"
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    cs_public0_flow_enable: false
+    cs_public0_flow_bundle: /usr/local/libexec/cs-public0-flow-v1
+    cs_public0_flow_config_file: /etc/cs-public0/flow.json
+    cs_public0_flow_ship_config_file: /etc/cs-public0/flow-ship.json
+    cs_public0_flow_password_file: /etc/cs-public0/clickhouse-probe-writer
+    cs_public0_flow_cpu_quota: 25%
+    cs_public0_flow_memory_max: 256M
+  tasks:
+    - name: Require one explicit target and exact reviewed source pins
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - target == inventory_hostname
+          - ansible_play_hosts_all | length == 1
+          - cs_public0_flow_enable is boolean
+          - cs_public0_flow_source is defined
+          # = flow_probe.BUNDLE_FILES (dns_ioc imports egress_model)
+          - cs_public0_flow_pins.keys() | list | sort == ['dns_ioc.py', 'egress_model.py', 'flow_probe.o', 'flow_probe.py', 'flow_ship.py']
+          - cs_public0_flow_pins.values() | select('match', '^[a-f0-9]{64}$') | list | length == 5
+          - cs_public0_flow_bundle is match('^/usr/local/libexec/cs-public0-flow-v[0-9]+$')
+          - cs_public0_flow_configuration.object == cs_public0_flow_bundle + '/flow_probe.o'
+          - cs_public0_flow_configuration.sensor_id == inventory_hostname.split('.')[0]
+          - cs_public0_flow_configuration.guest_prefix is match('^[a-zA-Z0-9_.-]{1,12}$')
+          - cs_public0_flow_configuration.metrics_file is match('^/var/lib/[a-zA-Z0-9_/-]+/cs_public0_flow[.]prom$')
+          - cs_public0_flow_ship_configuration.spool_dir == cs_public0_flow_configuration.spool_dir
+          - cs_public0_flow_ship_configuration.password_file == cs_public0_flow_password_file
+          - cs_public0_flow_ship_configuration.server_name is match('^[a-z0-9.-]+$')
+          - cs_public0_flow_ship_configuration.endpoints | length >= 1
+          - cs_public0_flow_ship_configuration.metrics_file is match('^/var/lib/[a-zA-Z0-9_/-]+/cs_public0_flow_ship[.]prom$')
+          - cs_public0_flow_ship_configuration.state_file is match('^/var/lib/[a-zA-Z0-9_-]+/state[.]json$')
+          - cs_public0_flow_ship_password is defined
+          - cs_public0_flow_ship_password | length >= 20
+
+    - name: Check exact local sources against the accepted pins
+      ansible.builtin.stat:
+        path: "{{ cs_public0_flow_source }}/{{ item.key }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      loop: "{{ cs_public0_flow_pins | dict2items }}"
+      register: cs_public0_flow_sources
+
+    - name: Require regular source files matching accepted pins
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+          - not (item.stat.islnk | default(false))
+          - item.stat.checksum == item.item.value
+      loop: "{{ cs_public0_flow_sources.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    - name: Refuse unsupported kernels, missing tools and foreign bundle files
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import json, os, pathlib, shutil, sys
+            p = json.load(sys.stdin)
+            major, minor = (int(x) for x in os.uname().release.split('.')[:2])
+            if (major, minor) < (6, 6):
+                raise SystemExit('TCX requires Linux >= 6.6')
+            if not shutil.which('bpftool'):
+                raise SystemExit('bpftool is required to load the object')
+            if not os.path.ismount('/sys/fs/bpf'):
+                raise SystemExit('bpffs must be mounted at /sys/fs/bpf')
+            if not pathlib.Path('/sys/kernel/btf/vmlinux').exists():
+                raise SystemExit('kernel BTF is required')
+            uplink = p['uplink']
+            if uplink and not pathlib.Path('/sys/class/net', uplink).exists():
+                raise SystemExit('configured uplink interface does not exist')
+            bundle = pathlib.Path(p['bundle'])
+            if bundle.exists() and {x.name for x in bundle.iterdir()} - set(p['pins']):
+                raise SystemExit('foreign files in the flow bundle')
+        stdin: "{{ {'bundle': cs_public0_flow_bundle, 'pins': cs_public0_flow_pins, 'uplink': cs_public0_flow_configuration.uplink | default('')} | to_json }}"
+      changed_when: false
+
+    - name: Create dedicated directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: "{{ cs_public0_flow_bundle }}", mode: '0755'}
+        - {path: /etc/cs-public0, mode: '0755'}
+        - {path: "{{ cs_public0_flow_ship_configuration.state_file | dirname }}", mode: '0700'}
+
+    - name: Install exact pinned runtime files and object
+      ansible.builtin.copy:
+        src: "{{ cs_public0_flow_source }}/{{ item.key }}"
+        dest: "{{ cs_public0_flow_bundle }}/{{ item.key }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ cs_public0_flow_pins | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      notify: Restart flow units
+
+    # copy's own `checksum` is SHA-1; the pins are SHA-256, so verify them on the host.
+    - name: Read installed file digests
+      ansible.builtin.stat:
+        path: "{{ cs_public0_flow_bundle }}/{{ item.key }}"
+        checksum_algorithm: sha256
+      loop: "{{ cs_public0_flow_pins | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      register: cs_public0_flow_installed
+
+    - name: Require installed files to match the pins
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+          - item.stat.checksum == item.item.value
+      loop: "{{ cs_public0_flow_installed.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    - name: Install probe and shipper configuration
+      ansible.builtin.copy:
+        content: "{{ item.content | to_nice_json }}\n"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: '0600'
+      loop:
+        - {dest: "{{ cs_public0_flow_config_file }}", content: "{{ cs_public0_flow_configuration }}"}
+        - {dest: "{{ cs_public0_flow_ship_config_file }}", content: "{{ cs_public0_flow_ship_configuration }}"}
+      loop_control:
+        label: "{{ item.dest }}"
+      notify: Restart flow units
+
+    - name: Install the ClickHouse INSERT-only password
+      ansible.builtin.copy:
+        content: "{{ cs_public0_flow_ship_password }}\n"
+        dest: "{{ cs_public0_flow_password_file }}"
+        owner: root
+        group: root
+        mode: '0600'
+      no_log: true
+      notify: Restart flow units
+
+    - name: Install systemd units
+      ansible.builtin.template:
+        src: "../config/{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop:
+        - cs-public0-flow.service
+        - cs-public0-flow-ship.service
+      notify: Restart flow units
+
+    - name: Apply the requested unit state
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        daemon_reload: true
+        enabled: "{{ cs_public0_flow_enable }}"
+        state: "{{ 'started' if cs_public0_flow_enable else 'stopped' }}"
+      loop:
+        - cs-public0-flow.service
+        - cs-public0-flow-ship.service
+
+    - name: Flush handlers before acceptance
+      ansible.builtin.meta: flush_handlers
+
+    - name: Require positive evidence from the enabled probe
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import json, pathlib, subprocess, sys, time
+            p = json.load(sys.stdin)
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                active = all(subprocess.run(['systemctl', 'is-active', '--quiet', u]).returncode == 0
+                             for u in ('cs-public0-flow.service', 'cs-public0-flow-ship.service'))
+                try:
+                    text = pathlib.Path(p['metrics']).read_text(encoding='utf-8')
+                except OSError:
+                    text = ''
+                vals = dict(l.split(' ', 1) for l in text.splitlines() if l and not l.startswith('#') and ' ' in l)
+                if active and vals.get('cs_public0_flow_attachments', '0').strip() not in ('', '0') \
+                        and vals.get('cs_public0_flow_attachments_missing', '1').strip() == '0':
+                    print(json.dumps({'attachments': vals['cs_public0_flow_attachments'].strip()}))
+                    break
+                time.sleep(3)
+            else:
+                raise SystemExit('probe did not report attachments within 60 s')
+        stdin: "{{ {'metrics': cs_public0_flow_configuration.metrics_file} | to_json }}"
+      changed_when: false
+      when: cs_public0_flow_enable
+
+  handlers:
+    - name: Restart flow units
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        daemon_reload: true
+        state: restarted
+      loop:
+        - cs-public0-flow.service
+        - cs-public0-flow-ship.service
+      when: cs_public0_flow_enable

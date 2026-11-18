@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-Brak dodatkowych zmian po wydaniu 1.1.0.
+- Kandydat sondy flow (etap E0, nieaktywny domyślnie): obiekt eBPF TCX tylko do
+  odczytu na tapach gości i uplinku, rekordy SYN z ISN do korelacji SNAT,
+  detektory zachowania w trybie observe. [Opis](docs/flow-probe.md).
+- Sonda flow: stan okna detektorów D1–D3 ograniczony niezależnie od tempa
+  rekordów (zalew SYN nie zwiększa pamięci ani czasu oceny).
+- `flow_ship.py`: wysyłka spoolu sondy do ClickHouse po HTTPS z weryfikacją
+  certyfikatu i deterministycznym tokenem deduplikacji partii.
 
 ## 1.1.0 — 2026-11-11
 

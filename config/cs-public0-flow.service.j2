@@ -1,0 +1,26 @@
+[Unit]
+Description=cs-public0 flow probe (read-only TCX, observe)
+Documentation=https://github.com/wd-ppisz/cs-public0/blob/main/docs/flow-probe.md
+After=network-online.target libvirtd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{ cs_public0_flow_bundle }}
+# load pins the programs and maps; run attaches/detaches as taps appear and vanish.
+ExecStartPre=/usr/bin/python3 -I -B {{ cs_public0_flow_bundle }}/flow_probe.py load --config {{ cs_public0_flow_config_file }}
+ExecStart=/usr/bin/python3 -I -B {{ cs_public0_flow_bundle }}/flow_probe.py run --config {{ cs_public0_flow_config_file }}
+# Stopping the probe always detaches every own program (no effect on VM traffic).
+ExecStopPost=/usr/bin/python3 -I -B {{ cs_public0_flow_bundle }}/flow_probe.py unload --config {{ cs_public0_flow_config_file }}
+Restart=on-failure
+RestartSec=10
+CPUQuota={{ cs_public0_flow_cpu_quota }}
+MemoryMax={{ cs_public0_flow_memory_max }}
+TasksMax=32
+UMask=0022
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
