@@ -39,6 +39,9 @@ CMD_MAP_LOOKUP_AND_DELETE = 21
 TCX_INGRESS = 46
 TCX_EGRESS = 47
 
+# Exactly the files installed next to this module (ansible/flow.yml pins). dns_ioc
+# (D7 catalog contract) imports egress_model; both must ship with the probe.
+BUNDLE_FILES = ('flow_probe.py', 'flow_ship.py', 'dns_ioc.py', 'egress_model.py', 'flow_probe.o')
 PROGRAMS = ('flow_guest_out', 'flow_guest_in', 'flow_uplink')
 MAPS = ('flow_records', 'flow_counters', 'flow_stats', 'flow_dns')
 

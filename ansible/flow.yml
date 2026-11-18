@@ -26,8 +26,9 @@
           - ansible_play_hosts_all | length == 1
           - cs_public0_flow_enable is boolean
           - cs_public0_flow_source is defined
-          - cs_public0_flow_pins.keys() | list | sort == ['dns_ioc.py', 'flow_probe.o', 'flow_probe.py', 'flow_ship.py']
-          - cs_public0_flow_pins.values() | select('match', '^[a-f0-9]{64}$') | list | length == 4
+          # = flow_probe.BUNDLE_FILES (dns_ioc imports egress_model)
+          - cs_public0_flow_pins.keys() | list | sort == ['dns_ioc.py', 'egress_model.py', 'flow_probe.o', 'flow_probe.py', 'flow_ship.py']
+          - cs_public0_flow_pins.values() | select('match', '^[a-f0-9]{64}$') | list | length == 5
           - cs_public0_flow_bundle is match('^/usr/local/libexec/cs-public0-flow-v[0-9]+$')
           - cs_public0_flow_configuration.object == cs_public0_flow_bundle + '/flow_probe.o'
           - cs_public0_flow_configuration.sensor_id == inventory_hostname.split('.')[0]

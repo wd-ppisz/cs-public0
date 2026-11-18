@@ -275,13 +275,19 @@ class Dns(unittest.TestCase):
                 fp.load_domain_catalog(bad)
 
     def test_catalog_import_works_in_isolated_mode(self):
-        # Production runs `python3 -I`: the bundle directory is not on sys.path.
+        # Production runs `python3 -I` from the installed bundle: only BUNDLE_FILES
+        # are present and the bundle directory is not on sys.path.
+        import shutil
         import subprocess
         now = int(fp.time.time())
-        with tempfile.TemporaryDirectory() as d:
+        runtime = Path(fp.__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as bundle:
+            for name in fp.BUNDLE_FILES:
+                if name.endswith('.py'):
+                    shutil.copy(runtime / name, Path(bundle, name))
             p = Path(d, 'domain-catalog.json')
             p.write_text(json.dumps({'catalog': catalog_value(now)}), encoding='utf-8')
-            script = Path(fp.__file__).resolve()
+            script = Path(bundle, 'flow_probe.py')
             code = ('import importlib.util,sys;'
                     f'spec=importlib.util.spec_from_file_location("fp", {str(script)!r});'
                     'm=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);'
