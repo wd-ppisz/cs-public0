@@ -93,6 +93,22 @@ przez HTTPS. Przesunięcie rośnie dopiero po potwierdzeniu wstawienia.
 python3 runtime/flow_ship.py once --config /etc/cs-public0/flow-ship.json
 ```
 
+## Instalacja na hoście (`ansible/flow.yml`)
+
+Jeden jawny host (`-e target=<host>`), domyślnie wyłączone (`cs_public0_flow_enable`).
+Playbook wymaga pinów SHA-256 dokładnie plików z `BUNDLE_FILES` (`flow_probe.py`,
+`flow_ship.py`, `dns_ioc.py`, `egress_model.py`, `flow_probe.o`) i sprawdza je przed
+kopiowaniem i po instalacji; odmawia przy jądrze < 6.6, braku `bpftool`, bpffs lub BTF,
+nieistniejącym uplinku i obcych plikach w katalogu pakietu. Instaluje dwie usługi:
+
+- `cs-public0-flow.service` — `load` przed startem, `run`, `unload` po zatrzymaniu
+  (zatrzymanie zawsze odpina wszystkie własne programy); `python3 -I`, limity CPU/pamięci;
+- `cs-public0-flow-ship.service` — wysyłka spoolu, `ProtectSystem=strict`, spool tylko do odczytu.
+
+Odbiór w playbooku wymaga dowodu pozytywnego: obie usługi aktywne, `cs_public0_flow_attachments`
+> 0 i `cs_public0_flow_attachments_missing` = 0. Obiekt eBPF z CI trzeba wcześniej załadować
+na jądrze docelowym (weryfikatory różnych wersji jądra różnią się).
+
 ## Testy
 
 ```sh
