@@ -274,6 +274,48 @@ class Dns(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fp.load_domain_catalog(bad)
 
+    def test_catalog_import_works_in_isolated_mode(self):
+        # Production runs `python3 -I`: the bundle directory is not on sys.path.
+        import subprocess
+        now = int(fp.time.time())
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d, 'domain-catalog.json')
+            p.write_text(json.dumps({'catalog': catalog_value(now)}), encoding='utf-8')
+            script = Path(fp.__file__).resolve()
+            code = ('import importlib.util,sys;'
+                    f'spec=importlib.util.spec_from_file_location("fp", {str(script)!r});'
+                    'm=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);'
+                    f'print(len(m.load_domain_catalog({str(p)!r}).names))')
+            r = subprocess.run([sys.executable, '-I', '-c', code], capture_output=True, text=True, cwd=d)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), '1')
+
+    def test_missing_catalog_module_pauses_d7_not_probe(self):
+        import builtins
+        real = builtins.__import__
+
+        def no_dns_ioc(name, *a, **k):
+            if name == 'dns_ioc':
+                raise ImportError('simulated')
+            return real(name, *a, **k)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d, 'domain-catalog.json')
+            p.write_text(json.dumps({'catalog': catalog_value(int(fp.time.time()))}), encoding='utf-8')
+            saved = sys.modules.pop('dns_ioc', None)
+            builtins.__import__ = no_dns_ioc
+            try:
+                with self.assertRaises(ValueError):
+                    fp.load_domain_catalog(p)
+                probe = fp.Probe.__new__(fp.Probe)
+                probe.cfg = {'dns_catalog_file': str(p)}
+                probe.catalog, probe.catalog_key = object(), ('x',)
+                probe.refresh_catalog()  # must not raise
+                self.assertIsNone(probe.catalog)
+            finally:
+                builtins.__import__ = real
+                if saved is not None:
+                    sys.modules['dns_ioc'] = saved
+
     def test_config_catalog_path(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d, 'c.json')

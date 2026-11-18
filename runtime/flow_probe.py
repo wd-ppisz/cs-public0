@@ -212,8 +212,18 @@ def load_domain_catalog(path):
     """Qualified ThreatFox domain catalog shared with the DNS IOC module.
 
     Accepts the DNS IOC cache wrapper ({"catalog": {...}}) or a bare catalog and
-    validates it with the same DomainCatalog contract (freshness, expiry, form)."""
-    from dns_ioc import DomainCatalog
+    validates it with the same DomainCatalog contract (freshness, expiry, form).
+
+    The probe runs as `python3 -I` (isolated: the script directory is not on
+    sys.path), so the sibling module is imported from the bundle explicitly. A
+    missing module is a catalog error (D7 paused), never a probe crash."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        from dns_ioc import DomainCatalog
+    except ImportError as e:
+        raise ValueError(f'dns_ioc module unavailable: {e}') from e
     value = json.loads(Path(path).read_text(encoding='utf-8'))
     if isinstance(value, dict) and 'catalog' in value:
         value = value['catalog']
