@@ -88,6 +88,15 @@ przez HTTPS. Przesunięcie rośnie dopiero po potwierdzeniu wstawienia.
 - **Straty:** plik usunięty przez retencję sondy przed wysłaniem całości zwiększa
   `cs_public0_flow_ship_unshipped_files_total`; metryki `cs_public0_flow_ship_*`
   w osobnym pliku textfile.
+- **Zdarzenia detektorów:** `events.jsonl` (D1–D3, D7; tryb observe) trafia do
+  tabeli `public0_events` z `source = 'flow'`, `category` = nazwa detektora, SID
+  z kontraktu zdarzeń (D1–D7 = 100321–100327) i `vm_uuid` znanym sondzie z tapu
+  (`attribution = 'vm'`, bez VM: `unresolved`). `event_id` to SHA-256 kanonicznej
+  postaci zdarzenia, `record_sha256` — skrót dokładnej linii ze spoolu (referencja
+  dowodu). Przesunięcie jest związane z i-węzłem pliku: po rotacji
+  (`events.jsonl` → `events.jsonl.1`) najpierw wysyłana jest reszta starego pliku;
+  utracona rotacja zwiększa ten sam licznik strat. Licznik wysłanych:
+  `cs_public0_flow_ship_events_total`.
 
 ```sh
 python3 runtime/flow_ship.py once --config /etc/cs-public0/flow-ship.json

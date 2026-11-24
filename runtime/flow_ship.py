@@ -44,6 +44,12 @@ DEFAULTS = {
     'metrics_file': '',
 }
 TABLES = {'guest': 'syn_vnet', 'uplink': 'syn_public0'}
+EVENTS_FILE = 'events.jsonl'
+EVENTS_TABLE = 'public0_events'
+# Wazuh SIDs from the event contract (behaviour detectors of the flow probe).
+DETECTOR_SID = {'D1_new_conn_rate': 100321, 'D2_distinct_dst': 100322, 'D3_service_fanout': 100323,
+                'D4': 100324, 'D5': 100325, 'D6': 100326, 'D7_dns_ioc': 100327}
+ZERO_IP = '0.0.0.0'
 
 
 def load_config(path):
@@ -84,19 +90,64 @@ def to_row(rec):
     return table, row
 
 
+def _ts_ns(ns):
+    """Integer nanoseconds -> 'YYYY-MM-DD hh:mm:ss.ffffff' (truncated to µs, no float)."""
+    ns = int(ns)
+    return (time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ns // 1_000_000_000))
+            + '.%06d' % (ns % 1_000_000_000 // 1000))
+
+
+def event_row(raw, sensor_hint=''):
+    """Probe detector event (one events.jsonl line) -> flow.public0_events row.
+
+    event_id is the SHA-256 of the canonical event, so a resent or re-read event
+    collapses in the ReplacingMergeTree; record_sha256 is the hash of the exact
+    spool line (evidence reference). The probe knows the VM from the tap
+    interface, so attribution needs no NAT correlation."""
+    ev = json.loads(raw)
+    detector = ev.get('detector', '')
+    sid = DETECTOR_SID.get(detector)
+    if sid is None:
+        return None
+    observed_ns = int(ev['observed_ns']) if 'observed_ns' in ev else int(ev['ts']) * 1_000_000_000
+    vm = ev.get('vm_uuid') or None
+    src_ip, dst_ip, dst_port = ZERO_IP, ZERO_IP, 0
+    if detector == 'D7_dns_ioc':
+        src_ip, dst_ip, dst_port = ev.get('src_ip') or ZERO_IP, ev.get('resolver_ip') or ZERO_IP, 53
+    canon = json.dumps(ev, sort_keys=True, separators=(',', ':')).encode()
+    return {
+        'event_id': hashlib.sha256(canon).hexdigest(),
+        'observed_at': _ts_ns(observed_ns),
+        'host': ev.get('sensor') or sensor_hint,
+        'source': 'flow',
+        'category': detector,
+        'direction': 'egress',
+        'src_ip': src_ip, 'src_port': 0,
+        'dst_ip': dst_ip, 'dst_port': dst_port,
+        'sid': sid,
+        'record_sha256': hashlib.sha256(raw).hexdigest(),
+        'vm_uuid': vm,
+        'attribution': 'vm' if vm else 'unresolved',
+    }
+
+
 def read_batch(path, offset, max_lines):
     """Complete lines from `offset`; returns (lines, end_offset)."""
-    lines = []
     with open(path, 'rb') as f:
-        f.seek(offset)
-        end = offset
-        for raw in f:
-            if not raw.endswith(b'\n'):
-                break  # line still being written by the probe
-            lines.append(raw)
-            end += len(raw)
-            if len(lines) >= max_lines:
-                break
+        return _batch_from(f, offset, max_lines)
+
+
+def _batch_from(f, offset, max_lines):
+    lines = []
+    f.seek(offset)
+    end = offset
+    for raw in f:
+        if not raw.endswith(b'\n'):
+            break  # line still being written by the probe
+        lines.append(raw)
+        end += len(raw)
+        if len(lines) >= max_lines:
+            break
     return lines, end
 
 
@@ -222,6 +273,100 @@ def ship_once(cfg, client, state, sensor_hint=''):
     return sent
 
 
+def _ino(path):
+    try:
+        return path.stat().st_ino
+    except FileNotFoundError:
+        return None
+
+
+def ship_events(cfg, client, state, sensor_hint=''):
+    """Ship probe detector events (events.jsonl) to flow.public0_events.
+
+    The probe rotates events.jsonl to events.jsonl.1 by rename, so the offset is
+    bound to the file's inode: after a rotation the remainder of the old inode
+    is read from events.jsonl.1 before the new file starts at 0. The same
+    pending-range rule as for records makes a crash resend an identical batch
+    with an identical deduplication token."""
+    spool = Path(cfg['spool_dir'])
+    cur, old = spool / EVENTS_FILE, spool / (EVENTS_FILE + '.1')
+    if 'events' not in state:
+        # First run (also: upgrade of a running probe): an existing rotated file is
+        # shipped in full before the current one, so nothing waits to be overwritten.
+        state['events'] = {'ino': _ino(old), 'offset': 0}
+    es = state['events']
+    sent = 0
+    cur_ino = _ino(cur)
+    if es['ino'] is not None and cur_ino != es['ino']:
+        old_ino = _ino(old)
+        if old_ino == es['ino']:
+            sent += _ship_events_file(cfg, client, state, old, es['ino'], sensor_hint)
+        else:
+            # Rotated twice (or removed) before the remainder was shipped: counted, not skipped.
+            state['unshipped_files'] = state.get('unshipped_files', 0) + 1
+            state['events_pending'] = None
+            if old_ino is not None and old_ino != cur_ino:
+                # The newer rotated file is still on disk: ship it whole before it goes too.
+                es.update(ino=old_ino, offset=0)
+                save_state(cfg['state_file'], state)
+                sent += _ship_events_file(cfg, client, state, old, old_ino, sensor_hint)
+        es.update(ino=None, offset=0)
+        state['events_pending'] = None
+        save_state(cfg['state_file'], state)
+    if cur_ino is None:
+        return sent
+    if es['ino'] is None:
+        es.update(ino=cur_ino, offset=0)
+    sent += _ship_events_file(cfg, client, state, cur, cur_ino, sensor_hint)
+    return sent
+
+
+def _ship_events_file(cfg, client, state, path, ino, sensor_hint):
+    """Ship from one open descriptor whose inode was verified: a rename by the
+    probe during the inserts cannot switch the file under the saved offset."""
+    try:
+        f = open(path, 'rb')
+    except FileNotFoundError:
+        return 0
+    with f:
+        if os.fstat(f.fileno()).st_ino != ino:
+            return 0  # rotated between stat and open; the next pass ships it from .1
+        return _ship_events_fd(cfg, client, state, f, ino, sensor_hint)
+
+
+def _ship_events_fd(cfg, client, state, f, ino, sensor_hint):
+    es = state['events']
+    sent = 0
+    while True:
+        pending = state.get('events_pending')
+        if pending and pending['ino'] == ino:
+            start, end = pending['start'], pending['end']
+            f.seek(start)
+            data = f.read(end - start)
+            if len(data) != end - start or not data.endswith(b'\n'):
+                raise RuntimeError('events: pending range no longer readable')
+            lines = data.splitlines(keepends=True)
+        else:
+            start = es['offset']
+            lines, end = _batch_from(f, start, cfg['batch_lines'])
+            if not lines:
+                return sent
+            state['events_pending'] = {'ino': ino, 'start': start, 'end': end}
+            save_state(cfg['state_file'], state)
+        rows = [r for r in (event_row(raw, sensor_hint) for raw in lines) if r]
+        if rows:
+            # Inode numbers can be reused after a rotation was deleted: the batch
+            # content hash keeps a token unique to these bytes (and identical on resend).
+            body = hashlib.sha256(b''.join(lines)).hexdigest()
+            client.insert(EVENTS_TABLE, rows,
+                          token(rows[0]['host'], f'events:{ino}:{body}', start, end, EVENTS_TABLE))
+            sent += len(rows)
+        es['offset'] = end
+        state['events_pending'] = None
+        state['shipped_events'] = state.get('shipped_events', 0) + len(rows)
+        save_state(cfg['state_file'], state)
+
+
 def read_range(path, start, end):
     """Exactly the bytes [start, end) as lines; the range was complete when recorded."""
     with open(path, 'rb') as f:
@@ -238,6 +383,8 @@ def write_metrics(cfg, state, ok, last_error):
     lines = [
         '# TYPE cs_public0_flow_ship_rows_total counter',
         f"cs_public0_flow_ship_rows_total {state.get('shipped_rows', 0)}",
+        '# TYPE cs_public0_flow_ship_events_total counter',
+        f"cs_public0_flow_ship_events_total {state.get('shipped_events', 0)}",
         '# TYPE cs_public0_flow_ship_unshipped_files_total counter',
         f"cs_public0_flow_ship_unshipped_files_total {state.get('unshipped_files', 0)}",
         '# TYPE cs_public0_flow_ship_up gauge',
@@ -263,6 +410,7 @@ def main(argv=None):
         ok, err = True, ''
         try:
             n = ship_once(cfg, client, state)
+            n += ship_events(cfg, client, state)
             state['last_success'] = int(time.time())
             save_state(cfg['state_file'], state)
             if a.command == 'once':
