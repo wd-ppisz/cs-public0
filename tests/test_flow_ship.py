@@ -98,6 +98,133 @@ class Ship(unittest.TestCase):
         fs.ship_once(self.cfg, FakeClient(), st)
         self.assertEqual(st['unshipped_files'], 1)
 
+    # --- detector events -> flow.public0_events ---------------------------------
+    D1 = {'detector': 'D1_new_conn_rate', 'vm_uuid': REC['vm_uuid'], 'value': 61.2, 'threshold': 50,
+          'window_s': 60, 'ts': 1794946521, 'mode': 'observe', 'sensor': 'lab'}
+    D7 = {'detector': 'D7_dns_ioc', 'vm_uuid': None, 'domain': 'bad.example', 'iface': 'vnet9',
+          'src_ip': '198.51.100.12', 'resolver_ip': '192.0.2.53', 'observed_ns': 1794946521500000000,
+          'ioc': {'source': 'threatfox', 'match': 'exact'}, 'ts': 1794946522, 'mode': 'observe',
+          'sensor': 'lab'}
+
+    def ev(self, *events):
+        return ''.join(json.dumps(e) + '\n' for e in events).encode()  # bytes: no CRLF on Windows
+
+    def test_event_row_mapping(self):
+        raw = json.dumps(self.D1).encode() + b'\n'
+        row = fs.event_row(raw)
+        self.assertEqual((row['source'], row['category'], row['sid']), ('flow', 'D1_new_conn_rate', 100321))
+        self.assertEqual((row['vm_uuid'], row['attribution'], row['host']), (REC['vm_uuid'], 'vm', 'lab'))
+        self.assertEqual(row['observed_at'], '2026-11-17 20:15:21.000000')
+        self.assertEqual((row['src_ip'], row['dst_ip'], row['dst_port']), ('0.0.0.0', '0.0.0.0', 0))
+        self.assertEqual(len(row['event_id']), 64)
+        self.assertEqual(row['record_sha256'], __import__('hashlib').sha256(raw).hexdigest())
+        # Same event, different key order -> same event_id (canonical form).
+        reordered = json.dumps(dict(reversed(list(self.D1.items())))).encode() + b'\n'
+        self.assertEqual(fs.event_row(reordered)['event_id'], row['event_id'])
+        d7 = fs.event_row(json.dumps(self.D7).encode() + b'\n')
+        self.assertEqual((d7['sid'], d7['attribution'], d7['vm_uuid']), (100327, 'unresolved', None))
+        self.assertEqual((d7['src_ip'], d7['dst_ip'], d7['dst_port']), ('198.51.100.12', '192.0.2.53', 53))
+        self.assertEqual(d7['observed_at'], '2026-11-17 20:15:21.500000')
+        self.assertIsNone(fs.event_row(json.dumps({'detector': 'X', 'ts': 1}).encode()))
+
+    def test_events_ship_incrementally_with_token(self):
+        f = self.spool / fs.EVENTS_FILE
+        f.write_bytes(self.ev(self.D1, self.D7, dict(self.D1, value=70)))
+        st = fs.load_state(self.cfg['state_file'])
+        c = FakeClient()
+        self.assertEqual(fs.ship_events(self.cfg, c, st), 3)  # batch_lines=2 -> two inserts
+        self.assertEqual([(t, n) for t, n, _ in c.calls], [('public0_events', 2), ('public0_events', 1)])
+        ino = f.stat().st_ino
+        body = __import__('hashlib').sha256(self.ev(self.D1, self.D7)).hexdigest()
+        self.assertEqual(c.calls[0][2], fs.token('lab', f'events:{ino}:{body}', 0, len(self.ev(self.D1, self.D7)),
+                                                 'public0_events'))
+        self.assertEqual(fs.ship_events(self.cfg, FakeClient(), st), 0)
+        self.assertEqual(st['shipped_events'], 3)
+
+    def test_events_crash_resends_identical_range(self):
+        f = self.spool / fs.EVENTS_FILE
+        f.write_bytes(self.ev(self.D1))
+        st = fs.load_state(self.cfg['state_file'])
+        with self.assertRaises(ConnectionError):
+            fs.ship_events(self.cfg, FakeClient(fail_after=0), st)
+        with f.open('ab') as h:
+            h.write(self.ev(self.D7))
+        st = fs.load_state(self.cfg['state_file'])
+        c = FakeClient()
+        fs.ship_events(self.cfg, c, st)
+        end = len(self.ev(self.D1))
+        self.assertEqual(c.calls[0][1], 1)
+        body = __import__('hashlib').sha256(self.ev(self.D1)).hexdigest()
+        self.assertEqual(c.calls[0][2], fs.token('lab', f'events:{f.stat().st_ino}:{body}', 0, end,
+                                                 'public0_events'))
+        self.assertEqual(sum(n for _, n, _ in c.calls), 2)
+
+    def test_events_rotation_ships_remainder_then_new_file(self):
+        f = self.spool / fs.EVENTS_FILE
+        f.write_bytes(self.ev(self.D1))
+        st = fs.load_state(self.cfg['state_file'])
+        fs.ship_events(self.cfg, FakeClient(), st)
+        with f.open('ab') as h:
+            h.write(self.ev(dict(self.D1, value=80)))
+        f.replace(self.spool / (fs.EVENTS_FILE + '.1'))  # probe rotation by rename
+        f.write_bytes(self.ev(self.D7))
+        c = FakeClient()
+        self.assertEqual(fs.ship_events(self.cfg, c, st), 2)
+        self.assertEqual(st.get('unshipped_files', 0), 0)
+        self.assertEqual(st['events']['ino'], f.stat().st_ino)
+
+    def test_events_lost_rotation_is_counted(self):
+        f = self.spool / fs.EVENTS_FILE
+        f.write_bytes(self.ev(self.D1))
+        st = fs.load_state(self.cfg['state_file'])
+        fs.ship_events(self.cfg, FakeClient(), st)
+        f.unlink()
+        f.write_bytes(self.ev(self.D7))
+        if f.stat().st_ino == st['events']['ino']:
+            self.skipTest('filesystem reused the inode')
+        self.assertEqual(fs.ship_events(self.cfg, FakeClient(), st), 1)
+        self.assertEqual(st['unshipped_files'], 1)
+
+    def test_event_time_is_integer_truncated(self):
+        row = fs.event_row(json.dumps(dict(self.D7, observed_ns=1794946521999999600)).encode())
+        self.assertEqual(row['observed_at'], '2026-11-17 20:15:21.999999')
+
+    def test_first_run_ships_existing_rotated_file(self):
+        (self.spool / (fs.EVENTS_FILE + '.1')).write_bytes(self.ev(self.D1, dict(self.D1, value=90)))
+        (self.spool / fs.EVENTS_FILE).write_bytes(self.ev(self.D7))
+        st = fs.load_state(self.cfg['state_file'])
+        self.assertEqual(fs.ship_events(self.cfg, FakeClient(), st), 3)
+        self.assertEqual(st.get('unshipped_files', 0), 0)
+        self.assertEqual(st['events']['ino'], (self.spool / fs.EVENTS_FILE).stat().st_ino)
+
+    def test_events_file_switched_under_name_is_not_read(self):
+        f = self.spool / fs.EVENTS_FILE
+        f.write_bytes(self.ev(self.D1))
+        st = fs.load_state(self.cfg['state_file'])
+        st['events'] = {'ino': f.stat().st_ino + 12345, 'offset': 0}
+        c = FakeClient()
+        # Verified-inode read: a different file behind the same name yields nothing.
+        self.assertEqual(fs._ship_events_file(self.cfg, c, st, f, st['events']['ino'], ''), 0)
+        self.assertEqual(c.calls, [])
+
+    def test_double_rotation_ships_surviving_rotated_file(self):
+        f, old = self.spool / fs.EVENTS_FILE, self.spool / (fs.EVENTS_FILE + '.1')
+        f.write_bytes(self.ev(self.D1))
+        st = fs.load_state(self.cfg['state_file'])
+        fs.ship_events(self.cfg, FakeClient(), st)
+        a_ino = st['events']['ino']
+        f.write_bytes(self.ev(self.D1, dict(self.D1, value=81)))  # A grows; then two rotations
+        keep = self.spool / 'keep-A'
+        f.replace(keep)                                        # A leaves (kept so the inode is not reused)
+        f.write_bytes(self.ev(dict(self.D1, value=82), dict(self.D1, value=83)))  # B
+        f.replace(old)                                         # B -> .1
+        f.write_bytes(self.ev(self.D7))                        # C
+        if a_ino in (old.stat().st_ino, f.stat().st_ino):
+            self.skipTest('filesystem reused the inode')
+        c = FakeClient()
+        self.assertEqual(fs.ship_events(self.cfg, c, st), 3)  # all of B + C
+        self.assertEqual(st['unshipped_files'], 1)            # the rest of A is counted
+
     def test_config_requires_endpoint_and_name(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d, 'c.json')
