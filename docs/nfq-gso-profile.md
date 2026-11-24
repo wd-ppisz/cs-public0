@@ -26,6 +26,8 @@ Missing evidence refuses startup. The monitor publishes:
 - `cs_public0_gso_known`
 - `cs_public0_gso_enabled`
 - `cs_public0_gso_last_publish_unix_seconds`
+- `cs_public0_gso_evidence_persisted` (1 when the acknowledgements came from the
+  persisted record described below instead of the journal)
 
 Alert when an expected active sensor lacks a fresh known/enabled observation.
 Unknown or stale data must not be interpreted as GSO disabled with certainty or
@@ -64,9 +66,31 @@ GSO was disabled or that forwarding failed. Keep the alert actionable as a
 monitoring-evidence problem. Do not automatically restart a healthy sensor,
 clear history, or turn UNKNOWN into a known/enabled result to silence it.
 Investigate journal retention and use a separately reviewed maintenance window
-if renewed initialization evidence is necessary. A durable attestation cache is
-not implemented by this observer; introducing one needs its own integrity and
-process/socket-reuse tests.
+if renewed initialization evidence is necessary.
+
+Persisted startup evidence narrows this window. The monitor runs the observer
+with `--evidence-dir /var/lib/cs-public0-nfq-evidence` (a systemd
+`StateDirectory`, mode 0700). After an observation in which both
+acknowledgements were found in the journal of the current invocation and every
+live check passed, it atomically writes `<unit>.json` (root, mode 0600, fsync)
+with the unit, invocation ID, PID, process start time (field 22 of
+`/proc/PID/stat`), engine SHA-256, queue, the exact acknowledgement lines and
+the requested and effective receive buffer. Without `--evidence-dir` the
+observer, and any library caller such as the automatic policy controller, only
+reads that default path and never writes.
+
+When journald no longer holds an acknowledgement (`journalctl --grep` finds no
+match), the record may replace only that log line, and only if the file and
+every parent directory are root-owned and not writable by group or others, the
+file is a single-link regular file opened without following symlinks, and the
+record matches the live unit, invocation, PID, start time, engine hash and queue
+exactly. The explicit `nfq.gso=yes` and `nfq.rcvbuf-size` arguments, NFQUEUE
+socket ownership and the effective socket buffer from `ss` are still verified
+live on every observation. Any other journal failure, a record from another
+epoch, unsafe permissions or a malformed record keep the result UNKNOWN; a
+reader never deletes or rewrites a record, and the monitor replaces a stale one
+only with fresh journal-backed evidence. A sensor whose journal lines were lost
+before the monitor first persisted them cannot be re-attested this way.
 
 Executable hashing uses 1 MiB reads instead of retaining the complete binary.
 The observer still hashes each observation and rechecks process and socket
