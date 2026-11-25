@@ -464,17 +464,26 @@ class FailWindow:
     does a gap longer than `max_gap` (the delta could not be placed in time).
     Inbound connections to the VM do not count: their SYN-ACK leaves the VM.
     SYNs from the last `grace` seconds are not judged yet (their replies may still
-    be on the way); replies are counted over the whole window."""
+    be on the way); replies are counted over the whole window.
+
+    D6 reuses the same per-tap deltas of `packets_out`/`bytes_out` (everything the
+    VM sends, private destinations included): the average packet and bit rate over
+    the last `seconds`, each delta spread evenly over the seconds of its sampling
+    interval. A window shortened by lost continuity only lowers the rate,
+    so it can miss, never invent, an event."""
 
     def __init__(self, seconds=60, grace=5, max_gap=30):
         self.seconds = seconds
         self.grace = grace
         self.max_gap = max_gap
-        self.prev = {}   # ifindex -> (sample time, (vm, syn_out, synack_in, rst_in))
-        self.rows = {}   # vm -> {second: [syn_out, synack_in, rst_in]}
+        # ifindex -> (sample time, (vm, syn_out, synack_in, rst_in, packets_out, bytes_out))
+        self.prev = {}
+        # vm -> {second: [syn_out, synack_in, rst_in, packets_out, bytes_out]}
+        self.rows = {}
 
     def update(self, now_s, taps):
-        """taps: {ifindex: (vm_uuid, syn_out, synack_in, rst_in)} of current guest taps."""
+        """taps: {ifindex: (vm_uuid, syn_out, synack_in, rst_in, packets_out, bytes_out)}
+        of current guest taps."""
         sec = int(now_s)
         for idx, cur in taps.items():
             seen = self.prev.get(idx)
@@ -490,10 +499,22 @@ class FailWindow:
                 self.rows.pop(cur[0], None)
                 continue
             delta = [c - o for c, o in zip(cur[1:], old[1:])]
-            if any(delta):
-                bucket = self.rows.setdefault(cur[0], {}).setdefault(sec, [0, 0, 0])
-                for i, d in enumerate(delta):
-                    bucket[i] += d
+            if not any(delta):
+                continue
+            rows = self.rows.setdefault(cur[0], {})
+            bucket = rows.setdefault(sec, [0] * len(delta))
+            for i, d in enumerate(delta[:3]):
+                bucket[i] += d
+            # D6 volume is a rate: spread it over the seconds it was sent in, so a
+            # long sampling interval never pushes older traffic into the window.
+            span = now_s - at
+            for s in range(int(at), sec + 1):
+                part = (min(s + 1, now_s) - max(s, at)) / span if span > 0 else 1.0
+                if part <= 0:
+                    continue
+                b = rows.setdefault(s, [0] * len(delta))
+                for i, d in enumerate(delta[3:], start=3):
+                    b[i] += d * part
         for idx in [i for i in self.prev if i not in taps]:
             # Tap gone (migration, shutdown): its replies may now arrive elsewhere,
             # so the VM's window here is incomplete and is dropped with the baseline.
@@ -509,8 +530,11 @@ class FailWindow:
     def evaluate(self, now_s, thresholds):
         limit = thresholds.get('D4_failed_conn_ratio')
         min_syn = max(int(thresholds.get('D4_min_syn', DEFAULTS['thresholds']['D4_min_syn'])), 1)
+        bps_limit = thresholds.get('D6_out_bps')
+        pps_limit = thresholds.get('D6_out_pps')
         judged = int(now_s - self.grace)          # SYNs at or after this second wait
         cutoff = judged - self.seconds
+        start = now_s - self.seconds              # D6: the window (start, now]
         events = []
         for vm, secs in list(self.rows.items()):
             for s in [s for s in secs if s < cutoff]:
@@ -518,6 +542,20 @@ class FailWindow:
             if not secs:
                 del self.rows[vm]
                 continue
+            if bps_limit is not None or pps_limit is not None:
+                # Bucket s holds [s, s+1); the one straddling `start` counts in part.
+                weight = {s: min(1.0, s + 1 - start) for s in secs if s + 1 > start}
+                packets = sum(secs[s][3] * w for s, w in weight.items())
+                bits = 8 * sum(secs[s][4] * w for s, w in weight.items())
+                pps, bps = packets / self.seconds, bits / self.seconds
+                over = [(m, v, lim) for m, v, lim in (('bps', bps, bps_limit), ('pps', pps, pps_limit))
+                        if lim is not None and v >= lim]
+                if over:
+                    measure, value, lim = over[0]
+                    events.append({'detector': 'D6_out_volume', 'vm_uuid': vm, 'measure': measure,
+                                   'value': round(value, 3), 'threshold': lim,
+                                   'window_s': self.seconds, 'out_bps': round(bps),
+                                   'out_pps': round(pps, 1)})
             if limit is None:
                 continue
             syn = sum(b[0] for s, b in secs.items() if s < judged)
@@ -556,7 +594,10 @@ DEFAULTS = {
     'thresholds': {'D1_new_conn_rate': 50, 'D2_distinct_dst': 500, 'D3_service_fanout': 100,
                    'service_ports': [22, 23, 25, 445, 3389, 5900],
                    # D4: >= 90% of at least 300 own SYNs in 60 s without a SYN-ACK.
-                   'D4_failed_conn_ratio': 0.9, 'D4_min_syn': 300},
+                   'D4_failed_conn_ratio': 0.9, 'D4_min_syn': 300,
+                   # D6: average over 60 s of everything the VM sends (private
+                   # destinations included): 2 Gbit/s or 100k packets/s.
+                   'D6_out_bps': 2_000_000_000, 'D6_out_pps': 100_000},
 }
 POSITIVE = ('record_budget_per_cycle', 'spool_max_files', 'spool_max_bytes', 'file_max_bytes',
             'events_max_bytes', 'event_cooldown_seconds', 'dns_budget_per_cycle', 'clock_max_error_ms')
@@ -859,7 +900,8 @@ class Probe:
         return n
 
     def guest_counters(self):
-        """{ifindex: (vm_uuid, syn_out, synack_in, rst_in)} for guest taps with a known VM."""
+        """{ifindex: (vm_uuid, syn_out, synack_in, rst_in, packets_out, bytes_out)} for
+        guest taps with a known VM."""
         names = {idx: name for name, idx in interfaces().items()}
         out = {}
         for key, raw in map_items(self.map_fd['flow_counters'], 4, COUNTERS.size):
@@ -880,7 +922,8 @@ class Probe:
                     or not {(idx, 'flow_guest_out', TCX_INGRESS), (idx, 'flow_guest_in', TCX_EGRESS)} <= self.attached_now):
                 continue
             c = decode_counters(raw)
-            out[idx] = (meta['vm_uuid'], c['syn_out'], c['synack_in'], c['rst_in'])
+            out[idx] = (meta['vm_uuid'], c['syn_out'], c['synack_in'], c['rst_in'],
+                        c['packets_out'], c['bytes_out'])
         return out
 
     def stats(self):

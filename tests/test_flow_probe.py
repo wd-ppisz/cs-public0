@@ -156,6 +156,8 @@ class FailRatio(unittest.TestCase):
             vals = [0] * (len(fp.COUNTER_FIELDS) + len(fp.SVC_NAMES))
             vals[fp.COUNTER_FIELDS.index('syn_out')] = syn
             vals[fp.COUNTER_FIELDS.index('synack_in')] = ack
+            vals[fp.COUNTER_FIELDS.index('packets_out')] = 11 * syn
+            vals[fp.COUNTER_FIELDS.index('bytes_out')] = 1500 * syn
             return fp.COUNTERS.pack(*vals)
         items = [(struct.pack('<I', 7), raw(5, 4)), (struct.pack('<I', 8), raw(9, 0)),
                  (struct.pack('<I', 9), raw(1, 1))]
@@ -168,7 +170,7 @@ class FailRatio(unittest.TestCase):
             got = p.guest_counters()
         finally:
             fp.interfaces, fp.map_items, fp.map_delete = orig
-        self.assertEqual(got, {7: (self.VM, 5, 4, 0)})
+        self.assertEqual(got, {7: (self.VM, 5, 4, 0, 55, 7500)})
         self.assertEqual(deleted, [9])
         p.repaired = {7}                                  # egress on 7 re-attached this cycle
         fp.interfaces, fp.map_items, fp.map_delete = (lambda: {'vnet1': 7, 'vnet2': 8}),            (lambda fd, ks, vs: items), (lambda fd, key: None)
@@ -197,6 +199,77 @@ class FailRatio(unittest.TestCase):
         self.assertEqual(fp.DEFAULTS['thresholds']['D4_failed_conn_ratio'], 0.9)
         import flow_ship
         self.assertEqual(flow_ship.DETECTOR_SID['D4_failed_conn_ratio'], 100324)
+
+
+class OutVolume(unittest.TestCase):
+    VM, OTHER = 'vm-a', 'vm-b'
+    TH = {'D6_out_bps': 2_000_000_000, 'D6_out_pps': 100_000}
+
+    @staticmethod
+    def tap(vm, packets, nbytes):
+        return (vm, 0, 0, 0, packets, nbytes)
+
+    def test_flood_fires_on_bits_and_on_packets_normal_does_not(self):
+        w = fp.FailWindow()
+        w.update(0, {7: self.tap(self.VM, 0, 0), 8: self.tap(self.OTHER, 0, 0),
+                     9: self.tap('vm-c', 0, 0)})
+        # 60 s: vm-a 18 GB (2.4 Gbit/s), vm-b 7.2 M small packets (120k pps),
+        # vm-c 900 Mbit/s and 30k pps (the fleet maximum of 7 days).
+        w.update(25, {7: self.tap(self.VM, 1_000_000, 9_000_000_000),
+                      8: self.tap(self.OTHER, 3_600_000, 230_400_000),
+                      9: self.tap('vm-c', 900_000, 3_375_000_000)})
+        w.update(50, {7: self.tap(self.VM, 2_000_000, 18_000_000_000),
+                      8: self.tap(self.OTHER, 7_200_000, 460_800_000),
+                      9: self.tap('vm-c', 1_800_000, 6_750_000_000)})
+        ev = {e['vm_uuid']: e for e in w.evaluate(55, self.TH)}
+        self.assertEqual(set(ev), {self.VM, self.OTHER})
+        a, b = ev[self.VM], ev[self.OTHER]
+        self.assertEqual((a['detector'], a['measure'], a['threshold']), ('D6_out_volume', 'bps', 2_000_000_000))
+        self.assertAlmostEqual(a['value'], 2.4e9)
+        self.assertEqual((b['measure'], b['value'], b['out_pps']), ('pps', 120_000, 120_000))
+
+    def test_disabled_thresholds_and_gap_are_silent(self):
+        w = fp.FailWindow(max_gap=30)
+        w.update(0, {7: self.tap(self.VM, 0, 0)})
+        w.update(10, {7: self.tap(self.VM, 10_000_000, 20_000_000_000)})
+        self.assertEqual(w.evaluate(10, {}), [])          # host config without D6 keys
+        w.update(50, {7: self.tap(self.VM, 20_000_000, 40_000_000_000)})  # 40 s gap
+        self.assertEqual(w.evaluate(50, self.TH), [])     # not placed in time: dropped
+        self.assertNotIn(self.VM, w.rows)
+
+    def test_rate_uses_only_last_window(self):
+        w = fp.FailWindow(seconds=60, grace=5)
+        w.update(0, {7: self.tap(self.VM, 0, 0)})
+        w.update(1, {7: self.tap(self.VM, 0, 16_000_000_000)})   # 128 Gbit at second 1
+        self.assertEqual(len(w.evaluate(2, self.TH)), 1)
+        self.assertEqual(w.evaluate(61, self.TH), [])     # second 1 left the 60 s window
+
+    def test_long_sampling_interval_does_not_inflate_rate(self):
+        w = fp.FailWindow(max_gap=30)
+        for t in (0, 30, 60, 89):                        # steady 90k pps, uneven samples
+            w.update(t, {7: self.tap(self.VM, 90_000 * t, 0)})
+        self.assertEqual(w.evaluate(89, self.TH), [])
+        w.update(90, {7: self.tap(self.VM, 90_000 * 89 + 1_000_000, 0)})  # burst
+        self.assertEqual([e['measure'] for e in w.evaluate(90, self.TH)], ['pps'])
+
+    def test_steady_rate_just_over_threshold_counts_the_whole_window(self):
+        w = fp.FailWindow(max_gap=30)
+        for t in (0, 30, 60):
+            w.update(t, {7: self.tap(self.VM, 101_000 * t, 0)})
+        ev = w.evaluate(60, {'D6_out_pps': 100_000})
+        self.assertEqual(len(ev), 1)
+        self.assertAlmostEqual(ev[0]['value'], 101_000)
+        w.update(60.5, {7: self.tap(self.VM, 101_000 * 60.5, 0)})
+        self.assertAlmostEqual(w.evaluate(60.5, {'D6_out_pps': 100_000})[0]['value'], 101_000)
+
+    def test_d4_and_d6_together_and_defaults(self):
+        w = fp.FailWindow(grace=5)
+        w.update(0, {7: (self.VM, 0, 0, 0, 0, 0)})
+        w.update(1, {7: (self.VM, 400, 0, 0, 8_000_000, 512_000_000)})
+        got = sorted(e['detector'] for e in w.evaluate(7, fp.DEFAULTS['thresholds']))
+        self.assertEqual(got, ['D4_failed_conn_ratio', 'D6_out_volume'])
+        import flow_ship
+        self.assertEqual(flow_ship.DETECTOR_SID['D6_out_volume'], 100326)
 
 
 class Libvirt(unittest.TestCase):
