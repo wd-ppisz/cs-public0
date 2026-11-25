@@ -214,7 +214,7 @@ class OutVolume(unittest.TestCase):
         w.update(0, {7: self.tap(self.VM, 0, 0), 8: self.tap(self.OTHER, 0, 0),
                      9: self.tap('vm-c', 0, 0)})
         # 60 s: vm-a 18 GB (2.4 Gbit/s), vm-b 7.2 M small packets (120k pps),
-        # vm-c 900 Mbit/s and 30k pps (the fleet maximum of 7 days).
+        # vm-c 900 Mbit/s and 30k pps (below both thresholds).
         w.update(25, {7: self.tap(self.VM, 1_000_000, 9_000_000_000),
                       8: self.tap(self.OTHER, 3_600_000, 230_400_000),
                       9: self.tap('vm-c', 900_000, 3_375_000_000)})
