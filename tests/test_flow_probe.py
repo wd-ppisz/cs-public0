@@ -74,6 +74,131 @@ class Decode(unittest.TestCase):
         self.assertEqual(c['svc_syn']['ssh'], 8)
 
 
+class FailRatio(unittest.TestCase):
+    VM, OTHER = 'vm-a', 'vm-b'
+    TH = {'D4_failed_conn_ratio': 0.9, 'D4_min_syn': 300}
+
+    def test_scan_without_replies_fires_and_normal_traffic_does_not(self):
+        w = fp.FailWindow()
+        w.update(1000, {7: (self.VM, 0, 0, 0), 8: (self.OTHER, 0, 0, 0)})
+        w.update(1010, {7: (self.VM, 400, 10, 5), 8: (self.OTHER, 400, 390, 0)})
+        ev = w.evaluate(1016, self.TH)
+        self.assertEqual([e['vm_uuid'] for e in ev], [self.VM])
+        e = ev[0]
+        self.assertEqual((e['detector'], e['syn_out'], e['synack_in'], e['rst_in']),
+                         ('D4_failed_conn_ratio', 400, 10, 5))
+        self.assertAlmostEqual(e['value'], 0.975)
+
+    def test_too_few_syns_and_disabled_threshold_are_silent(self):
+        w = fp.FailWindow()
+        w.update(0, {7: (self.VM, 0, 0, 0)})
+        w.update(5, {7: (self.VM, 299, 0, 0)})
+        self.assertEqual(w.evaluate(5, self.TH), [])
+        w.update(6, {7: (self.VM, 400, 0, 0)})
+        self.assertEqual(w.evaluate(6, {}), [])  # host config without D4 keys
+        small = fp.FailWindow()
+        small.update(0, {7: (self.VM, 0, 0, 0)})
+        small.update(1, {7: (self.VM, 10, 0, 0)})
+        self.assertEqual(small.evaluate(7, {'D4_failed_conn_ratio': 0.9}), [])  # missing minimum = default 300, not 1
+
+    def test_first_sample_ifindex_reuse_and_reset_are_baselines(self):
+        w = fp.FailWindow()
+        w.update(0, {7: (self.VM, 10_000, 0, 0)})        # first sight: no delta
+        self.assertEqual(w.evaluate(0, self.TH), [])
+        w.update(1, {7: (self.OTHER, 20_000, 0, 0)})     # ifindex now another VM
+        w.update(2, {7: (self.OTHER, 5, 0, 0)})          # counters went backwards
+        self.assertEqual(w.evaluate(2, self.TH), [])
+        w.update(3, {})                                  # tap gone: baseline dropped
+        w.update(4, {7: (self.OTHER, 1_000, 0, 0)})
+        self.assertEqual(w.evaluate(4, self.TH), [])
+
+    def test_syns_wait_for_replies_and_late_synacks_count(self):
+        w = fp.FailWindow(grace=5)
+        w.update(0, {7: (self.VM, 0, 0, 0)})
+        w.update(10, {7: (self.VM, 400, 0, 0)})          # burst of SYNs just now
+        self.assertEqual(w.evaluate(10, self.TH), [])     # not judged before replies
+        w.update(12, {7: (self.VM, 400, 400, 0)})        # replies arrived
+        self.assertEqual(w.evaluate(16, self.TH), [])
+
+    def test_long_gap_is_baseline_not_burst(self):
+        w = fp.FailWindow(max_gap=30)
+        w.update(0, {7: (self.VM, 0, 0, 0)})
+        w.update(180, {7: (self.VM, 360, 0, 0)})         # 2 SYN/s over 3 min
+        self.assertEqual(w.evaluate(200, self.TH), [])
+        self.assertEqual(w.rows, {})
+
+    def test_gap_drops_collected_window_of_the_vm(self):
+        w = fp.FailWindow(grace=5, max_gap=30)
+        w.update(0, {7: (self.VM, 0, 0, 0)})
+        w.update(1, {7: (self.VM, 400, 0, 0)})           # SYNs seen
+        w.update(34, {7: (self.VM, 400, 400, 0)})        # replies arrived during a pause
+        self.assertEqual(w.evaluate(34, self.TH), [])     # no false 100 % failure
+        self.assertNotIn(self.VM, w.rows)
+
+    def test_vanished_tap_drops_window_migration(self):
+        w = fp.FailWindow(grace=5)
+        w.update(0, {7: (self.VM, 0, 0, 0)})
+        w.update(1, {7: (self.VM, 400, 0, 0)})
+        w.update(2, {})                                  # VM migrated away
+        self.assertEqual(w.evaluate(7, self.TH), [])
+        self.assertNotIn(self.VM, w.rows)
+
+    def test_guest_counters_need_both_attachments_and_free_vanished_entries(self):
+        p = object.__new__(fp.Probe)
+        p.cfg = {'guest_prefix': 'vnet'}
+        p.map_fd = {'flow_counters': 3}
+        p.taps = {'vnet1': {'vm_uuid': self.VM, 'system_vm': False},
+                  'vnet2': {'vm_uuid': self.OTHER, 'system_vm': False}}
+        p.attached_now = {(7, 'flow_guest_out', fp.TCX_INGRESS), (7, 'flow_guest_in', fp.TCX_EGRESS),
+                          (8, 'flow_guest_out', fp.TCX_INGRESS)}  # egress on 8 failed
+        p.repaired = set()
+        def raw(syn, ack):
+            vals = [0] * (len(fp.COUNTER_FIELDS) + len(fp.SVC_NAMES))
+            vals[fp.COUNTER_FIELDS.index('syn_out')] = syn
+            vals[fp.COUNTER_FIELDS.index('synack_in')] = ack
+            return fp.COUNTERS.pack(*vals)
+        items = [(struct.pack('<I', 7), raw(5, 4)), (struct.pack('<I', 8), raw(9, 0)),
+                 (struct.pack('<I', 9), raw(1, 1))]
+        deleted = []
+        orig = fp.interfaces, fp.map_items, fp.map_delete
+        fp.interfaces = lambda: {'vnet1': 7, 'vnet2': 8}
+        fp.map_items = lambda fd, ks, vs: items
+        fp.map_delete = lambda fd, key: deleted.append(struct.unpack('<I', key)[0])
+        try:
+            got = p.guest_counters()
+        finally:
+            fp.interfaces, fp.map_items, fp.map_delete = orig
+        self.assertEqual(got, {7: (self.VM, 5, 4, 0)})
+        self.assertEqual(deleted, [9])
+        p.repaired = {7}                                  # egress on 7 re-attached this cycle
+        fp.interfaces, fp.map_items, fp.map_delete = (lambda: {'vnet1': 7, 'vnet2': 8}),            (lambda fd, ks, vs: items), (lambda fd, key: None)
+        try:
+            self.assertEqual(p.guest_counters(), {})
+        finally:
+            fp.interfaces, fp.map_items, fp.map_delete = orig
+
+    def test_invalidate_drops_baseline_and_window(self):
+        w = fp.FailWindow(grace=5)
+        w.update(0, {7: (self.VM, 0, 0, 0)})
+        w.update(1, {7: (self.VM, 400, 0, 0)})
+        w.invalidate({7})                                # attachment repaired, map read failed
+        w.update(10, {7: (self.VM, 800, 0, 0)})          # next sample: baseline only
+        self.assertEqual(w.evaluate(10, self.TH), [])
+
+    def test_window_expires(self):
+        w = fp.FailWindow(seconds=60)
+        w.update(0, {7: (self.VM, 0, 0, 0)})
+        w.update(1, {7: (self.VM, 400, 0, 0)})
+        self.assertEqual(len(w.evaluate(7, self.TH)), 1)
+        self.assertEqual(w.evaluate(100, self.TH), [])
+        self.assertEqual(w.rows, {})
+
+    def test_defaults_enable_d4_and_ship_maps_sid(self):
+        self.assertEqual(fp.DEFAULTS['thresholds']['D4_failed_conn_ratio'], 0.9)
+        import flow_ship
+        self.assertEqual(flow_ship.DETECTOR_SID['D4_failed_conn_ratio'], 100324)
+
+
 class Libvirt(unittest.TestCase):
     def test_domstatus(self):
         uuid, name, nics = fp.parse_domain_xml(DOMSTATUS)

@@ -52,7 +52,7 @@ dołączenie samo.
 | D1 | tempo nowych połączeń TCP z VM | rekordy w oknie 60 s |
 | D2 | liczba różnych adresów docelowych | rekordy w oknie 60 s |
 | D3 | fan-out na porty usług (22, 23, 25, 445, 3389, 5900) | rekordy w oknie 60 s |
-| D4 | odsetek nieudanych prób | liczniki `syn_out` vs `synack_in`/`rst_in` (następny etap) |
+| D4 | odsetek własnych prób TCP VM bez SYN-ACK | liczniki jądra per tap (`syn_out` — SYN bez ACK wysłany przez VM, `synack_in`/`rst_in` — odpowiedzi do VM), przyrost na cykl w oknie 60 s; zdarzenie, gdy co najmniej `D4_min_syn` SYN i odsetek bez SYN-ACK ≥ `D4_failed_conn_ratio` (domyślnie 300 i 0,9). Połączenia przychodzące się nie liczą (ich SYN-ACK wychodzi z VM); zmiana VM na tym samym ifindex albo cofnięcie licznika ustawia nową bazę |
 | D7 | DNS IOC per VM | pytania DNS gościa (UDP 53, pierwsze 128 B) porównane z kwalifikowanym katalogiem ThreatFox modułu DNS IOC (`dns_catalog_file`, ta sama klasa `DomainCatalog`); zapisywane wyłącznie trafienia, pozostałe nazwy odrzucane w pamięci; katalog nieaktualny = D7 wstrzymany (`dns_catalog_fresh=0`) |
 
 Progi domyślne są wyłącznie punktem startu; zdarzenie nie jest werdyktem.
@@ -133,5 +133,5 @@ własnych programów. Kod wyjścia 77 oznacza brak warunków wstępnych, nie zal
 ## Ograniczenia
 
 IPv4 i TCP SYN w pierwszej wersji; UDP/ICMP tylko jako liczniki. Okna detektorów
-są lokalne dla hosta (migracja VM zeruje okno). Brak zdarzenia przy
+są lokalne dla hosta (migracja VM zeruje okno; dla D4 zniknięcie tapu, przerwa > 30 s albo cofnięcie licznika usuwa okno VM zamiast oceniać je bez odpowiedzi). Przypisanie tap → VM jest odświeżane co 30 s: nowa VM, która w tym czasie dostanie nazwę `vnetN` po usuniętej, może zostać chwilowo przypisana do poprzedniej (dotyczy wszystkich detektorów i rekordów). Brak zdarzenia przy
 `continuity_known=0` nie dowodzi braku nadużycia.
