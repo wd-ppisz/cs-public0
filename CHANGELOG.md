@@ -9,6 +9,12 @@
   rekordów (zalew SYN nie zwiększa pamięci ani czasu oceny).
 - `flow_ship.py`: wysyłka spoolu sondy do ClickHouse po HTTPS z weryfikacją
   certyfikatu i deterministycznym tokenem deduplikacji partii.
+- `nfq_gso.py`: trwały dowód startowy GSO i bufora NFQUEUE. Monitor
+  (`--evidence-dir`) zapisuje go po potwierdzeniu z journala; po rotacji journala
+  dowód zastępuje wyłącznie wpis potwierdzenia dla identycznego invocation, PID,
+  czasu startu procesu, hasha silnika i kolejki. Argumenty i efektywny bufor
+  nadal są sprawdzane na żywo. Nowa metryka `cs_public0_gso_evidence_persisted`.
+  [Opis](docs/nfq-gso-profile.md).
 
 ## 1.1.0 — 2026-11-11
 

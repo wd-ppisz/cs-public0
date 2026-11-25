@@ -108,6 +108,10 @@ class Templates(unittest.TestCase):
         self.assertIn('--set nfq.rcvbuf-size=16777216', start)
         monitor = environment().get_template('cs-public0-monitor.service.j2').render(settings)
         self.assertIn('--rcvbuf-size 16777216 --metrics-file ', monitor)
+        # Only the monitor persists startup evidence, into its own state directory.
+        self.assertIn('--evidence-dir /var/lib/cs-public0-nfq-evidence', monitor)
+        self.assertIn('StateDirectory=cs-public0-nfq-evidence\n', monitor)
+        self.assertNotIn('--evidence-dir', service)
         passive = environment().get_template('cs-public0.service.j2').render(defaults())
         self.assertNotIn('--set nfq.rcvbuf-size=', passive)
         self.assertNotIn('--require', passive)

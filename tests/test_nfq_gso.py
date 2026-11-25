@@ -1,7 +1,15 @@
 import hashlib
 import importlib.util
+import io
+import json
+import os
 from pathlib import Path
+import shutil
+import stat
 import struct
+import sys
+import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -214,9 +222,29 @@ class GSOTests(unittest.TestCase):
                 self.assertFalse(value["known"])
                 self.assertIn("error", value)
 
+    def test_journal_query_failure_is_not_absence(self):
+        error = gso.subprocess.CalledProcessError(2, ["journalctl"])
+        with patch.object(gso, "command", side_effect=error), self.assertRaises(gso.subprocess.CalledProcessError):
+            gso.journal_acknowledged("cs-public0.service", "a" * 32, "x", "x")
+        with patch.object(gso, "command", side_effect=gso.subprocess.CalledProcessError(1, ["journalctl"])):
+            self.assertFalse(gso.journal_acknowledged("cs-public0.service", "a" * 32, "x", "x"))
+
+    def test_evidence_path_requires_absolute_normalized_directory_and_unit(self):
+        self.assertEqual(gso.evidence_path("/var/lib/cs-public0-nfq-evidence", "cs-public0.service"),
+                         "/var/lib/cs-public0-nfq-evidence/cs-public0.service.json")
+        for directory, unit in (("relative", "cs-public0.service"), ("/", "cs-public0.service"),
+                                ("/var/lib/../tmp", "cs-public0.service"), ("/var/lib/", "cs-public0.service"),
+                                ("/var/lib/x", "../x.service"), ("/var/lib/x", "cs-public0")):
+            with self.subTest(directory=directory, unit=unit), self.assertRaises(RuntimeError):
+                gso.evidence_path(directory, unit)
+
     def test_unknown_sample_is_exported_as_unknown(self):
         text = gso.metrics({"known": False, "enabled": False, "sample_unix_seconds": 10}, "host-a")
         self.assertIn('cs_public0_gso_known{host="host-a",profile="public0-ipv4-alert"} 0', text)
+        self.assertIn('cs_public0_gso_evidence_persisted{host="host-a",profile="public0-ipv4-alert"} 0', text)
+        persisted = gso.metrics({"known": True, "enabled": True, "sample_unix_seconds": 10,
+                                 "evidence_source": "persisted"}, "host-a")
+        self.assertIn('cs_public0_gso_evidence_persisted{host="host-a",profile="public0-ipv4-alert"} 1', persisted)
         with self.assertRaises(RuntimeError): gso.metrics({}, 'x"}\ninjected 1')
 
     def test_tcp_info_exact_kernel_offset_and_short_data(self):
@@ -234,6 +262,208 @@ class GSOTests(unittest.TestCase):
         self.assertEqual(value["tcp_info_known"], 0)
         self.assertIn("error", value)
         self.assertIn('scope="external_owned_upload"', forwarding.metrics(value, "host-a"))
+
+
+@unittest.skipUnless(sys.platform == "linux", "POSIX ownership, modes and O_NOFOLLOW")
+class PersistedEvidenceTests(unittest.TestCase):
+    UNIT = "cs-public0.service"
+    INVOCATION = "a" * 32
+    REQUESTED = 16777216
+    SHA = hashlib.sha256(b"engine").hexdigest()
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = os.path.join(temporary.name, "trust")
+        os.mkdir(self.root, 0o755)
+        os.chmod(self.root, 0o755)
+        self.directory = os.path.join(self.root, "evidence")
+        self.path = os.path.join(self.directory, self.UNIT + ".json")
+        root = self.root
+        # The temporary base is world-writable /tmp; the trust chain under test
+        # starts at our own 0755 directory, exactly like / and /var/lib in production.
+        def chain(directory):
+            result = [directory]
+            while result[-1] != root:
+                result.append(os.path.dirname(result[-1]))
+            return result
+        for patcher in (patch.object(gso, "trusted_chain", side_effect=chain),
+                        patch.object(gso, "EVIDENCE_OWNER_UID", os.getuid())):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def identity(self, **changes):
+        value = gso.evidence_identity(self.UNIT, self.INVOCATION, 123, 99, self.SHA, 32201, self.REQUESTED)
+        value.update(observed_unix_seconds=1000)
+        value.update(changes)
+        return value
+
+    def plant(self, record, mode=0o600):
+        os.makedirs(self.directory, 0o700, exist_ok=True)
+        with open(self.path, "w") as stream:
+            json.dump(record, stream)
+        os.chmod(self.path, mode)
+
+    def observe(self, journal=True, persist=False, live_rb=33554432, journal_exit=1,
+                cmdline=b"suricata\0--set\0nfq.gso=yes\0--set\0nfq.rcvbuf-size=16777216\0"):
+        state = {"MainPID": "123", "InvocationID": self.INVOCATION, "ActiveState": "active"}
+        class File:
+            def __init__(self, path): self.path = str(path)
+            def __truediv__(self, part): return File(self.path + "/" + str(part))
+            def read_bytes(self):
+                if self.path.endswith("/stat"): return b"123 (sensor) " + b" ".join([b"0"] * 19 + [b"99"])
+                if self.path.endswith("/cmdline"): return cmdline
+                raise AssertionError(self.path)
+            def open(self, mode): return io.BytesIO(b"engine")
+            def read_text(self): return "32201 456 0 2 65531 0 0 42 1\n"
+        lines = {"NFQUEUE GSO enabled": "Info: nfq: NFQUEUE GSO enabled\n",
+                 "NFQUEUE receive buffer verified":
+                     "Info: NFQUEUE receive buffer verified queue=32201 requested=16777216 effective=33554432\n"}
+        def command(argv):
+            if argv[0] == "ss":
+                return "UNCONN 0 0 12:456 * skmem:(r0,rb" + str(live_rb) + ",t0)\n"
+            self.assertEqual(argv[0], "journalctl")
+            self.assertIn("_SYSTEMD_INVOCATION_ID=" + self.INVOCATION, argv)
+            if not journal:
+                raise gso.subprocess.CalledProcessError(journal_exit, argv)
+            return lines[argv[-1].split("=", 1)[1]]
+        with patch.object(gso, "Path", File), patch.object(gso, "unit_state", return_value=state), \
+             patch.object(gso, "socket_identity", return_value="77"), patch.object(gso, "command", side_effect=command):
+            return gso.observe(self.UNIT, self.SHA, 32201, self.REQUESTED, evidence_dir=self.directory, persist=persist)
+
+    def test_journal_evidence_is_persisted_by_the_monitor_only(self):
+        value = self.observe(persist=False)
+        self.assertTrue(value["known"])
+        self.assertEqual(value["evidence_source"], "journal")
+        self.assertFalse(os.path.lexists(self.directory))
+        value = self.observe(persist=True)
+        self.assertEqual(value["evidence_source"], "journal")
+        self.assertNotIn("evidence_write_error", value)
+        info = os.lstat(self.path)
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.directory).st_mode), 0o700)
+        with open(self.path) as stream:
+            record = json.load(stream)
+        expected = self.identity(observed_unix_seconds=record["observed_unix_seconds"])
+        self.assertEqual(record, expected)
+        self.assertEqual(record["rcvbuf_acknowledgement"],
+                         "NFQUEUE receive buffer verified queue=32201 requested=16777216 effective=33554432")
+        self.assertEqual(record["gso_acknowledgement"], "NFQUEUE GSO enabled")
+        self.assertEqual(os.listdir(self.directory), [self.UNIT + ".json"])
+
+    def test_rotated_journal_accepts_matching_persisted_evidence(self):
+        self.plant(self.identity())
+        value = self.observe(journal=False)
+        self.assertTrue(value["known"])
+        self.assertTrue(value["enabled"])
+        self.assertTrue(value["rcvbuf_known"])
+        self.assertEqual(value["rcvbuf_effective_bytes"], 33554432)
+        self.assertEqual(value["evidence_source"], "persisted")
+        self.assertEqual(value["evidence_observed_unix_seconds"], 1000)
+        self.assertIn('cs_public0_gso_evidence_persisted{host="h",profile="public0-ipv4-alert"} 1',
+                      gso.metrics(value, "h"))
+        # A persisted-only observation never rewrites or refreshes the record.
+        before = os.lstat(self.path).st_mtime_ns
+        self.assertEqual(self.observe(journal=False, persist=True)["evidence_source"], "persisted")
+        self.assertEqual(os.lstat(self.path).st_mtime_ns, before)
+
+    def test_evidence_from_another_epoch_or_engine_is_refused(self):
+        for change in ({"invocation": "b" * 32}, {"pid": 124}, {"start_ticks": 100}, {"binary_sha256": "0" * 64},
+                       {"queue": 32202}, {"queue": "32201"}, {"pid": 123.0}, {"unit": "other.service"},
+                       {"rcvbuf_requested_bytes": 8388608}, {"rcvbuf_effective_bytes": 16777216},
+                       {"rcvbuf_acknowledgement": "NFQUEUE receive buffer verified queue=32201"},
+                       {"gso_acknowledgement": "NFQUEUE GSO disabled"}, {"schema": "v0"},
+                       {"observed_unix_seconds": True}, {"observed_unix_seconds": 0},
+                       {"observed_unix_seconds": int(time.time()) + 3600}, {"extra": 1}):
+            with self.subTest(change=change):
+                self.plant(self.identity(**change))
+                value = self.observe(journal=False)
+                self.assertFalse(value["known"])
+                self.assertFalse(value["enabled"])
+                self.assertEqual(value["error"], "GSO acknowledgement is absent")
+                self.assertIn("evidence_error", value)
+                self.assertEqual(value["evidence_source"], None)
+                # Refused evidence is neither deleted nor rewritten by a reader.
+                self.assertTrue(os.path.exists(self.path))
+
+    def test_missing_or_malformed_evidence_is_refused(self):
+        value = self.observe(journal=False)
+        self.assertFalse(value["known"])
+        self.assertEqual(value["error"], "GSO acknowledgement is absent")
+        os.makedirs(self.directory, 0o700)
+        for raw in ("", "[]", "{", "\"x\"", "{}", "x" * 5000):
+            with self.subTest(raw=raw[:8]):
+                with open(self.path, "w") as stream:
+                    stream.write(raw)
+                os.chmod(self.path, 0o600)
+                self.assertFalse(self.observe(journal=False)["known"])
+
+    def test_unsafe_ownership_modes_and_links_are_refused(self):
+        def fifo():
+            os.makedirs(self.directory, 0o700, exist_ok=True)
+            os.mkfifo(self.path, 0o600)
+        def symlink():
+            self.plant(self.identity())
+            os.rename(self.path, self.path + ".real")
+            os.symlink(self.path + ".real", self.path)
+        def hardlink():
+            self.plant(self.identity())
+            os.link(self.path, self.path + ".second")
+        faults = {"file-group-writable": lambda: self.plant(self.identity(), 0o620),
+                  "file-world-writable": lambda: self.plant(self.identity(), 0o606),
+                  "directory-writable": lambda: (self.plant(self.identity()), os.chmod(self.directory, 0o777)),
+                  "parent-writable": lambda: (self.plant(self.identity()), os.chmod(self.root, 0o775)),
+                  "symlink": symlink, "hardlink": hardlink, "fifo": fifo}
+        for name, plant in faults.items():
+            with self.subTest(fault=name):
+                plant()
+                try:
+                    value = self.observe(journal=False)
+                    self.assertFalse(value["known"], name)
+                    self.assertIn("evidence_error", value)
+                finally:
+                    os.chmod(self.root, 0o755)
+                    shutil.rmtree(self.directory, ignore_errors=True)
+        self.plant(self.identity())
+        with patch.object(gso, "EVIDENCE_OWNER_UID", os.getuid() + 1):
+            value = self.observe(journal=False)
+        self.assertFalse(value["known"])
+        self.assertEqual(value["evidence_error"], "unsafe evidence directory")
+
+    def test_live_receive_buffer_is_still_required_with_valid_evidence(self):
+        self.plant(self.identity())
+        value = self.observe(journal=False, live_rb=1536000)
+        self.assertFalse(value["known"])
+        self.assertFalse(value["rcvbuf_known"])
+        self.assertEqual(value["error"], "effective receive buffer differs from requirement")
+
+    def test_live_command_line_is_still_required_with_valid_evidence(self):
+        self.plant(self.identity())
+        for cmdline in (b"suricata\0--set\0nfq.rcvbuf-size=16777216\0",
+                        b"suricata\0--set\0nfq.gso=yes\0",
+                        b"suricata\0--set\0nfq.gso=yes\0--set\0nfq.rcvbuf-size=8388608\0"):
+            with self.subTest(cmdline=cmdline):
+                self.assertFalse(self.observe(journal=False, cmdline=cmdline)["known"])
+
+    def test_journal_failure_other_than_no_match_does_not_fall_back(self):
+        self.plant(self.identity())
+        value = self.observe(journal=False, journal_exit=2)
+        self.assertFalse(value["known"])
+        self.assertNotIn("evidence_error", value)
+
+    def test_monitor_replaces_stale_evidence_but_refuses_unsafe_target(self):
+        self.plant(self.identity(invocation="b" * 32))
+        value = self.observe(persist=True)
+        self.assertTrue(value["known"])
+        with open(self.path) as stream:
+            self.assertEqual(json.load(stream)["invocation"], self.INVOCATION)
+        os.chmod(self.path, 0o666)
+        value = self.observe(persist=True)
+        # A write refusal is reported, but never changes the live journal verdict.
+        self.assertTrue(value["known"])
+        self.assertEqual(value["evidence_write_error"], "unsafe evidence file")
+        self.assertEqual(stat.S_IMODE(os.lstat(self.path).st_mode), 0o666)
+        self.assertEqual(sorted(os.listdir(self.directory)), [self.UNIT + ".json"])
 
 
 if __name__ == "__main__":
