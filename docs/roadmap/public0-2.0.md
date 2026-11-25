@@ -84,6 +84,55 @@ and HA qualification. It is outside the first nftables implementation.
   IDs/map handles. Preserve foreign XDP/tc attachments, qdiscs and firewall rules.
   An existing foreign attachment requires explicit coexistence or refusal.
 
+## Coexistence with the flow probe
+
+The [flow probe](../flow-probe.md) is the one attachment the 2.0 layer must
+coexist with rather than refuse. Current flow hooks, all observe-only:
+
+| Program | Hook | Direction it sees |
+|---|---|---|
+| `flow_guest_out` | TCX ingress on each guest tap | VM-originated traffic, before SNAT |
+| `flow_guest_in` | TCX egress on each guest tap | replies to the VM (SYN-ACK/RST counters) |
+| `flow_uplink` | TCX egress on the public uplink | VM-originated traffic after SNAT |
+
+The flow programs use `BPF_PROG_ATTACH` without flags (appended to the TCX chain),
+return `TCX_NEXT`, never drop, redirect or modify packets, and keep their pins
+under `/sys/fs/bpf/cs-public0-flow`. Their detach path removes only their own
+program IDs.
+
+Rules both components follow:
+
+1. **Ownership.** Each component attaches, replaces and detaches only its own
+   exact program IDs, pins and maps. Install, upgrade, rollback and `unload` of one
+   never removes or reorders the other. 2.0 uses its own pin directory and its
+   own service units. A 2.0 install that finds flow programs records them as known
+   coexisting attachments, not as an unknown foreign program.
+2. **Hook separation.** The 2.0 guard acts on inbound traffic: NIC XDP ingress
+   and the bridge/nftables admission path before NFQUEUE. Flow observes guest-tap
+   ingress/egress and uplink egress. A 2.0 program on a guest tap or on uplink
+   egress, the same TCX hooks flow uses, is a design change that needs this section
+   updated first.
+3. **Verdict independence.** Flow is always `TCX_NEXT`, so the TCX order between
+   flow and any 2.0 tc program cannot change a verdict. A 2.0 program placed before
+   flow on a shared hook hides the packets it drops from flow. That is acceptable
+   only when the drop is counted by 2.0 with the protected destination.
+4. **Detector interaction.** Replies to VM-initiated connections must not be
+   charged to an inbound request budget. Otherwise a 2.0 drop can produce false D4
+   failure ratios in flow (an unanswered SYN looks like a failed connection). D4
+   qualification must exclude windows in which 2.0 ENFORCE dropped traffic for that
+   VM's public IP, using the 2.0 drop telemetry. The reverse holds as well: no
+   flow event (D1–D7) is input to a 2.0 enforcement decision without a separate
+   reviewed policy.
+5. **Shared cost and kernel.** The measured protection CPU budget includes the
+   flow programs on every tap and the uplink. Every BPF object is loaded on the
+   target kernel before LAB. Verifier behaviour differs between host and CI
+   kernels.
+6. **Acceptance fixture.** The 2.0 LAB runs with flow attached. It must show
+   that flow keeps `cs_public0_flow_attachments_missing = 0` and
+   `cs_public0_flow_continuity_known = 1` through 2.0 install, policy generation
+   updates, ENFORCE, expiry and rollback, and that 2.0 rollback leaves every flow
+   attachment in place.
+
 ## Control and failure behavior
 
 Policies have per-profile **OFF**, **OBSERVE** and **ENFORCE** modes. The initial
