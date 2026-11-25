@@ -29,6 +29,7 @@ import xml.etree.ElementTree as ET
 # --- bpf(2) -----------------------------------------------------------------
 SYS_BPF = 321  # x86_64
 CMD_MAP_LOOKUP = 1
+CMD_MAP_DELETE = 3
 CMD_MAP_GET_NEXT_KEY = 4
 CMD_OBJ_GET = 7
 CMD_PROG_ATTACH = 8
@@ -107,6 +108,16 @@ def tcx_query(ifindex, attach_type, cap=64):
     _, out = bpf(CMD_PROG_QUERY, attr)
     count = struct.unpack_from('<I', out, 24)[0]
     return list(ids[:min(count, cap)])
+
+
+def map_delete(fd, key_raw):
+    """Delete one map key; an already missing key is not an error."""
+    key = ctypes.create_string_buffer(key_raw, len(key_raw))
+    try:
+        bpf(CMD_MAP_DELETE, struct.pack('<I4xQQQ', fd, ctypes.addressof(key), 0, 0))
+    except OSError as e:
+        if e.errno != 2:
+            raise
 
 
 def map_pop(fd, size):
@@ -442,6 +453,87 @@ class Window:
         return events
 
 
+class FailWindow:
+    """D4: share of the VM's own TCP connection attempts left without a SYN-ACK.
+
+    The kernel keeps cumulative counters per guest tap: `syn_out` (SYN without ACK
+    sent by the VM, retransmissions included), `synack_in` and `rst_in` (replies
+    towards the VM). Each cycle adds the per-tap delta to per-second buckets of
+    the VM. A tap whose ifindex now belongs to another VM, or whose counters went
+    backwards (map entry recreated), only sets a new baseline, never a delta; so
+    does a gap longer than `max_gap` (the delta could not be placed in time).
+    Inbound connections to the VM do not count: their SYN-ACK leaves the VM.
+    SYNs from the last `grace` seconds are not judged yet (their replies may still
+    be on the way); replies are counted over the whole window."""
+
+    def __init__(self, seconds=60, grace=5, max_gap=30):
+        self.seconds = seconds
+        self.grace = grace
+        self.max_gap = max_gap
+        self.prev = {}   # ifindex -> (sample time, (vm, syn_out, synack_in, rst_in))
+        self.rows = {}   # vm -> {second: [syn_out, synack_in, rst_in]}
+
+    def update(self, now_s, taps):
+        """taps: {ifindex: (vm_uuid, syn_out, synack_in, rst_in)} of current guest taps."""
+        sec = int(now_s)
+        for idx, cur in taps.items():
+            seen = self.prev.get(idx)
+            self.prev[idx] = (now_s, cur)
+            if seen is None:
+                continue
+            at, old = seen
+            if (now_s - at > self.max_gap or old[0] != cur[0]
+                    or any(c < o for c, o in zip(cur[1:], old[1:]))):
+                # Continuity lost: the VM's collected window no longer has matching
+                # replies, so it is dropped rather than judged half-complete.
+                self.rows.pop(old[0], None)
+                self.rows.pop(cur[0], None)
+                continue
+            delta = [c - o for c, o in zip(cur[1:], old[1:])]
+            if any(delta):
+                bucket = self.rows.setdefault(cur[0], {}).setdefault(sec, [0, 0, 0])
+                for i, d in enumerate(delta):
+                    bucket[i] += d
+        for idx in [i for i in self.prev if i not in taps]:
+            # Tap gone (migration, shutdown): its replies may now arrive elsewhere,
+            # so the VM's window here is incomplete and is dropped with the baseline.
+            self.rows.pop(self.prev.pop(idx)[1][0], None)
+
+    def invalidate(self, ifindexes):
+        """Forget baselines (and the VM windows) of taps whose measurement had a gap."""
+        for idx in ifindexes:
+            seen = self.prev.pop(idx, None)
+            if seen is not None:
+                self.rows.pop(seen[1][0], None)
+
+    def evaluate(self, now_s, thresholds):
+        limit = thresholds.get('D4_failed_conn_ratio')
+        min_syn = max(int(thresholds.get('D4_min_syn', DEFAULTS['thresholds']['D4_min_syn'])), 1)
+        judged = int(now_s - self.grace)          # SYNs at or after this second wait
+        cutoff = judged - self.seconds
+        events = []
+        for vm, secs in list(self.rows.items()):
+            for s in [s for s in secs if s < cutoff]:
+                del secs[s]
+            if not secs:
+                del self.rows[vm]
+                continue
+            if limit is None:
+                continue
+            syn = sum(b[0] for s, b in secs.items() if s < judged)
+            synack = sum(b[1] for b in secs.values())
+            rst = sum(b[2] for b in secs.values())
+            if syn < min_syn:
+                continue
+            ratio = max(0, syn - synack) / syn
+            if ratio >= limit:
+                events.append({'detector': 'D4_failed_conn_ratio', 'vm_uuid': vm,
+                               'value': round(ratio, 3), 'threshold': limit,
+                               'window_s': self.seconds, 'syn_out': syn,
+                               'synack_in': synack, 'rst_in': rst})
+        return events
+
+
 DEFAULTS = {
     'schema': 'cs-public0-flow-v1',
     'pin_dir': '/sys/fs/bpf/cs-public0-flow',
@@ -462,7 +554,9 @@ DEFAULTS = {
     'dns_budget_per_cycle': 5000,
     'clock_max_error_ms': 500,
     'thresholds': {'D1_new_conn_rate': 50, 'D2_distinct_dst': 500, 'D3_service_fanout': 100,
-                   'service_ports': [22, 23, 25, 445, 3389, 5900]},
+                   'service_ports': [22, 23, 25, 445, 3389, 5900],
+                   # D4: >= 90% of at least 300 own SYNs in 60 s without a SYN-ACK.
+                   'D4_failed_conn_ratio': 0.9, 'D4_min_syn': 300},
 }
 POSITIVE = ('record_budget_per_cycle', 'spool_max_files', 'spool_max_bytes', 'file_max_bytes',
             'events_max_bytes', 'event_cooldown_seconds', 'dns_budget_per_cycle', 'clock_max_error_ms')
@@ -615,6 +709,9 @@ class Probe:
         # Sets only need to prove "threshold reached"; a margin keeps the exact value visible.
         cap = 2 * max(int(th.get('D2_distinct_dst', 500)), int(th.get('D3_service_fanout', 100)), 1)
         self.window = Window(cap=cap, service_ports=th.get('service_ports', ()))
+        self.fails = FailWindow()
+        self.attached_now = set()
+        self.repaired = set()
         self.cooldown = Cooldown(cfg['event_cooldown_seconds'])
         self.records_total = 0
         self.spool_dropped = 0
@@ -685,6 +782,10 @@ class Probe:
         want = self.wanted(ifaces)
         have = self.owned(ifaces)
         errors = missing = 0
+        now_attached = set(have & want)
+        # Interfaces that needed an attach this cycle: their counters may span a
+        # period without one of the programs, so D4 restarts from a new baseline.
+        self.repaired = {idx for idx, _, _ in want - have}
         for idx, prog, at in have - want:
             try:
                 tcx_detach(idx, self.prog_fd[prog], at)
@@ -697,14 +798,17 @@ class Probe:
             try:
                 tcx_attach(idx, self.prog_fd[prog], at)
                 attached += 1
+                now_attached.add((idx, prog, at))
             except OSError as e:
                 if e.errno == 19:  # interface vanished between listing and attach
                     continue
                 if e.errno == 17:  # attached concurrently
                     attached += 1
+                    now_attached.add((idx, prog, at))
                     continue
                 errors += 1
                 missing += 1
+        self.attached_now = now_attached
         return attached, missing, errors
 
     def detach_all(self):
@@ -753,6 +857,31 @@ class Probe:
                 self.spool_dropped += 1
                 out = None
         return n
+
+    def guest_counters(self):
+        """{ifindex: (vm_uuid, syn_out, synack_in, rst_in)} for guest taps with a known VM."""
+        names = {idx: name for name, idx in interfaces().items()}
+        out = {}
+        for key, raw in map_items(self.map_fd['flow_counters'], 4, COUNTERS.size):
+            idx = struct.unpack('<I', key)[0]
+            name = names.get(idx, '')
+            if not name:
+                # Counters of a vanished interface: free the entry so the bounded
+                # map never fills up (a full map stops counting for new taps).
+                # A tap created after the listing just restarts from zero.
+                map_delete(self.map_fd['flow_counters'], key)
+                continue
+            meta = self.taps.get(name, {})
+            if not name.startswith(self.cfg['guest_prefix']) or meta.get('system_vm') or not meta.get('vm_uuid'):
+                continue
+            # D4 needs both sides: without the egress program replies are not
+            # counted, so the tap is left out (its VM window is dropped).
+            if (idx in self.repaired
+                    or not {(idx, 'flow_guest_out', TCX_INGRESS), (idx, 'flow_guest_in', TCX_EGRESS)} <= self.attached_now):
+                continue
+            c = decode_counters(raw)
+            out[idx] = (meta['vm_uuid'], c['syn_out'], c['synack_in'], c['rst_in'])
+        return out
 
     def stats(self):
         out = []
@@ -821,6 +950,8 @@ class Probe:
         now = time.time()
         self.refresh_taps(now)
         attached, missing, errors = self.reconcile()
+        # Repaired attachments invalidate D4 state even if the map read below fails.
+        self.fails.invalidate(self.repaired)
         d = secure_dir(self.cfg['spool_dir'])
         path = d / time.strftime('records-%Y%m%dT%H.jsonl', time.gmtime(now))
         dropped_before = self.spool_dropped
@@ -843,7 +974,15 @@ class Probe:
         for e in events:
             e.update(ts=int(now), mode='observe', sensor=self.cfg['sensor_id'])
             self.events_total[e['detector']] = self.events_total.get(e['detector'], 0) + 1
-        for e in self.window.evaluate(now, self.cfg['thresholds']):
+        try:
+            taps = self.guest_counters()
+        except OSError:
+            taps = None  # unreadable counters: D4 not judged this cycle, baselines kept
+        found = self.window.evaluate(now, self.cfg['thresholds'])
+        if taps is not None:
+            self.fails.update(now, taps)
+            found += self.fails.evaluate(now, self.cfg['thresholds'])
+        for e in found:
             if self.cooldown.allow((e['vm_uuid'], e['detector']), now):
                 e.update(ts=int(now), mode='observe', sensor=self.cfg['sensor_id'])
                 events.append(e)

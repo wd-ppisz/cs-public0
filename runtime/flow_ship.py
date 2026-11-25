@@ -48,7 +48,7 @@ EVENTS_FILE = 'events.jsonl'
 EVENTS_TABLE = 'public0_events'
 # Wazuh SIDs from the event contract (behaviour detectors of the flow probe).
 DETECTOR_SID = {'D1_new_conn_rate': 100321, 'D2_distinct_dst': 100322, 'D3_service_fanout': 100323,
-                'D4': 100324, 'D5': 100325, 'D6': 100326, 'D7_dns_ioc': 100327}
+                'D4': 100324, 'D4_failed_conn_ratio': 100324, 'D5': 100325, 'D6': 100326, 'D7_dns_ioc': 100327}
 ZERO_IP = '0.0.0.0'
 
 
