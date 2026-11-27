@@ -8,7 +8,7 @@
   any_errors_fatal: true
   vars:
     cs_public0_ip_enable: false
-    cs_public0_ip_bundle: /usr/local/libexec/cs-public0-ip-intelligence-v5
+    cs_public0_ip_bundle: /usr/local/libexec/cs-public0-ip-intelligence-v6
     cs_public0_ip_config: /etc/cs-public0/ip-intelligence.json
   tasks:
     - name: Require one explicit host and exact installed configuration/source bytes
@@ -18,7 +18,11 @@
           - target == inventory_hostname
           - ansible_play_hosts_all | length == 1
           - cs_public0_ip_enable is boolean
-          - cs_public0_ip_bundle == '/usr/local/libexec/cs-public0-ip-intelligence-v5'
+          - cs_public0_ip_bundle == '/usr/local/libexec/cs-public0-ip-intelligence-v6'
+          - cs_public0_ip_predecessor is not defined or (
+              cs_public0_ip_predecessor.bundle is match('^/usr/local/libexec/cs-public0-ip-intelligence-v[0-9]+$')
+              and cs_public0_ip_predecessor.bundle != cs_public0_ip_bundle
+              and cs_public0_ip_predecessor.pins.keys() | sort == ['ip_intelligence.py', 'policy_inventory.py'])
           - cs_public0_ip_contract == 'ingress-syn-only-v2'
           - cs_public0_ip_configuration.schema == 'cs-public0-ip-intelligence-v1'
           - cs_public0_ip_configuration.bridge == 'public0'
@@ -48,7 +52,29 @@
             import base64, hashlib, json, os, pathlib, stat, subprocess, sys
             pins=json.loads(base64.b64decode(sys.argv[1])); bundle=pathlib.Path(sys.argv[2])
             config=pathlib.Path(sys.argv[3]); expected=sys.argv[4]
-            if not bundle.exists():
+            predecessor=json.loads(base64.b64decode(sys.argv[6])) if sys.argv[6] else None; owner=sys.argv[7]
+            def owned(path):
+                s=path.lstat()
+                return stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==0 and not s.st_mode & 0o022
+            if not bundle.exists() and predecessor:
+                # A compatible successor replaces only the code path. The running
+                # predecessor and its kernel table must be exactly the reviewed ones.
+                old=pathlib.Path(predecessor['bundle'])
+                if (old==bundle or old.parent!=bundle.parent or old.is_symlink() or not old.is_dir()
+                        or {p.name for p in old.iterdir()}!=set(predecessor['pins'])):
+                    raise SystemExit('predecessor bundle inventory differs')
+                for name,digest in predecessor['pins'].items():
+                    if not owned(old/name) or hashlib.sha256((old/name).read_bytes()).hexdigest()!=digest:raise SystemExit('predecessor version differs')
+                unit=pathlib.Path('/etc/systemd/system/cs-public0-ip-intelligence.service')
+                if not owned(unit) or unit.read_text().count(str(old/'ip_intelligence.py')+' ')!=1:
+                    raise SystemExit('predecessor is not the installed updater')
+                for name in ['cs-public0-ip-intelligence.timer','cs-public0-ip-intelligence.service']:
+                    if subprocess.check_output(['systemctl','show',name,'-p','DropInPaths','--value'],text=True).strip():raise SystemExit('updater unit override')
+                tables=json.loads(subprocess.check_output(['nft','-j','list','tables']))['nftables']
+                if any(x.get('table',{}).get('name')=='cs_public0_ioc' for x in tables):
+                    rows=json.loads(subprocess.check_output(['nft','-j','--terse','list','table','bridge','cs_public0_ioc']))['nftables']
+                    if [x['table'].get('comment') for x in rows if 'table' in x]!=[owner]:raise SystemExit('kernel IP table contract differs from successor')
+            elif not bundle.exists():
                 for unit in ['cs-public0-ip-intelligence.timer','cs-public0-ip-intelligence.service']:
                     active=subprocess.check_output(['systemctl','show',unit,'-p','ActiveState','--value'],text=True).strip()
                     enabled=subprocess.run(['systemctl','is-enabled',unit],capture_output=True,text=True).stdout.strip()
@@ -90,6 +116,9 @@
           - "{{ cs_public0_ip_config }}"
           - "{{ cs_public0_ip_config_sha256 }}"
           - "{{ cs_public0_ip_repair_config_sha256 | default('') }}"
+          - "{{ (cs_public0_ip_predecessor | to_json | b64encode) if cs_public0_ip_predecessor is defined else '' }}"
+          # Kernel contract shared with ip_intelligence.OWNER; a different owner needs a contained migration.
+          - cs-public0-ip-intelligence-v2-ingress-syn
       changed_when: false
 
     - name: Create separate root-owned code/config/state directories
@@ -100,7 +129,7 @@
         group: root
         mode: "{{ item.mode }}"
       loop:
-        - {path: /usr/local/libexec/cs-public0-ip-intelligence-v5, mode: '0755'}
+        - {path: "{{ cs_public0_ip_bundle }}", mode: '0755'}
         - {path: /etc/cs-public0, mode: '0755'}
         - {path: /var/lib/cs-public0-ip-intelligence, mode: '0700'}
 

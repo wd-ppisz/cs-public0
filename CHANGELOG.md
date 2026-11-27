@@ -9,6 +9,11 @@
   rekordów (zalew SYN nie zwiększa pamięci ani czasu oceny).
 - `flow_ship.py`: wysyłka spoolu sondy do ClickHouse po HTTPS z weryfikacją
   certyfikatu i deterministycznym tokenem deduplikacji partii.
+- Updater IP v6: dopuszczalny wiek publikacji 96 h dla Spamhaus, IPsum i FireHOL
+  oraz 72 h dla IPInsights, Feodo i OTX. Lista, której dostawca nie wydał przez
+  ponad dwa dni, nadal blokuje. ThreatFox zostaje przy 24 h, granicy katalogu
+  pasywnego DNS. Ważność zachowanych list wynika z zainstalowanej polityki.
+  Playbook instaluje zgodnego następcę obok poprzednika bez przerwy w DROP.
 
 ## 1.1.0 — 2026-11-11
 
