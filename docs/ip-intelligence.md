@@ -28,8 +28,8 @@ context; the IP observer does not claim DNS or TLS coverage from them.
 The withdrawn v3 updater matched source or destination addresses without proving
 who initiated the connection. IPInsights contained public resolver addresses,
 including `1.1.1.1` and `8.8.8.8`, so source-only blocking also dropped legitimate
-replies. Keep that deployment withdrawn. The immutable v5 bundle retains the v4
-`ingress-syn-only-v2`: `ip daddr @protected ip saddr @incoming tcp flags &
+replies. Keep that deployment withdrawn. The immutable v5 and v6 bundles retain
+the v4 `ingress-syn-only-v2`: `ip daddr @protected ip saddr @incoming tcp flags &
 (fin | syn | rst | ack) == syn`. Both bridge names must still be `public0`.
 
 Only Spamhaus and IPsum contribute to `incoming`. `outgoing` and `c2_ports`
@@ -63,6 +63,17 @@ cannot erase the provider retry interval or claim a completed deployment. The
 updater has a 3 GiB cgroup limit, sized for the full fresh-download/apply cycle,
 including child processes; the smaller isolated subset alone is not sizing proof.
 
+A publication is accepted until it reaches the source's maximum age, measured
+from `Last-Modified` or the GitHub commit time. Spamhaus, IPsum and FireHOL may
+be four days old, IPInsights, Feodo and OTX three days. Providers occasionally
+skip a release for more than two days (Spamhaus DROP, November 2026); such a
+list is still enforced. ThreatFox has no publication time: its API snapshot is
+valid for one day, the bound of the domain catalog (`dns_ioc.DomainCatalog`)
+shared by the passive DNS reader and the flow probe's D7 detector. Every run
+recomputes the expiry of retained receipts from the installed policy, so a
+changed age applies at once to the last good copy, exactly as a new download of
+the same publication would; a receipt is never extended beyond that.
+
 The first apply requires fresh IPInsights, IPsum, Spamhaus and ThreatFox data.
 Later retrieval errors retain each last good source only until its expiry;
 expired sources are excluded from the next candidate. The kernel elements
@@ -87,6 +98,17 @@ DNS parser attestation and its config pin. It does not fetch lists or restart
 packet capture. A partial committed migration leaves both consumer timers
 stopped for inspection. A successful migration resumes them and requires a
 natural updater cycle and effective kernel readback before acceptance.
+
+A compatible successor keeps the kernel owner, rule expressions, configuration
+and state schema; v6 only changes source ages. Install it into a new directory
+with `cs_public0_ip_predecessor: {bundle: <old directory>, pins: <old hashes>}`.
+The playbook then requires the exact predecessor bytes, the installed updater
+unit running that predecessor without drop-ins, and an existing kernel table
+with the same owner. The table, its elements, counters and the provider cache
+stay in place, so inbound DROP is not interrupted; the next timer run uses the
+new path. The predecessor directory is kept for rollback and for consumers that
+attest its parser, such as the DNS reader. A different kernel contract still
+requires the contained migration above.
 
 An update is one native nft transaction. It flushes only the four owned sets,
 repopulates them and preserves the chains and named counters. Check syntax

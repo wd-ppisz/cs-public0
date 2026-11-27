@@ -191,6 +191,60 @@ class IntelligenceTests(unittest.TestCase):
         self.assertEqual(ipi.policy({'ipsum3': feed}, [], NOW + 1)['incoming'], [])
         self.assertEqual(ipi.active_versions({'ipsum3': feed}, NOW + 1), {})
 
+    def test_age_policy_tolerates_skipped_provider_releases(self):
+        ages = {name: spec['age'] for name, spec in ipi.SOURCES.items()}
+        self.assertEqual({n: ages[n] for n in ('spamhaus', 'ipsum3', 'firehol1')},
+                         dict.fromkeys(('spamhaus', 'ipsum3', 'firehol1'), 4 * 86400))
+        self.assertEqual({n: ages[n] for n in ('ipinsights', 'feodo', 'otx')},
+                         dict.fromkeys(('ipinsights', 'feodo', 'otx'), 3 * 86400))
+
+    def test_threatfox_validity_fits_the_passive_dns_catalog(self):
+        from dns_ioc import DomainCatalog
+        fetched = NOW - 30
+        feed = dict(self.feed([], sha256='a' * 64), domains=['c2.example.com'], published_unix=fetched - 5,
+                    expires_unix=ipi.expiry('threatfox', fetched, fetched - 5))
+        self.assertTrue(DomainCatalog.from_updater_state({'feeds': {'threatfox': feed}}).fresh(NOW))
+        ipi.revalidate({'threatfox': feed})
+        self.assertTrue(DomainCatalog.from_updater_state({'feeds': {'threatfox': feed}}).fresh(NOW))
+
+    def test_two_day_old_spamhaus_publication_is_still_enforced(self):
+        published = NOW - 2 * 86400 - 3600  # No new release since the day before yesterday.
+        raw = b'{"cidr":"5.6.7.0/24","sblid":"x"}\n{"type":"metadata","timestamp":1}\n'
+        with patch.object(ipi, 'retrieve', return_value=(raw, published)), \
+                patch.object(ipi.time, 'time', return_value=NOW):
+            fetched = ipi.fetch_source('spamhaus', NOW, '/nonexistent')
+        self.assertEqual(fetched['expires_unix'], published + 4 * 86400)
+        self.assertEqual(ipi.policy({'spamhaus': fetched}, [], NOW)['incoming'], ['5.6.7.0/24'])
+        with patch.object(ipi, 'retrieve', return_value=(raw, NOW - 4 * 86400 - 1)), \
+                patch.object(ipi.time, 'time', return_value=NOW), \
+                self.assertRaisesRegex(ValueError, 'source publication stale'):
+            ipi.fetch_source('spamhaus', NOW, '/nonexistent')
+
+    def test_retained_receipt_follows_the_installed_age_policy(self):
+        published = NOW - 2 * 86400 - 3600
+        # Accepted earlier under a two-day policy, retained after the publication aged out.
+        feed = dict(self.feed(['5.6.7.0/24'], sha256='a' * 64), fetched_unix=NOW - 7200,
+                    published_unix=published, expires_unix=published + 2 * 86400)
+        feeds = {'spamhaus': feed, 'unknown': {'fetched_unix': 1, 'published_unix': 1, 'expires_unix': 2},
+                 'ipsum3': dict(self.feed(['1.2.3.4/32']), expires_unix=NOW + 60)}
+        self.assertEqual(ipi.policy(feeds, [], NOW)['incoming'], [])
+        ipi.revalidate(feeds)
+        self.assertEqual(feed['expires_unix'], published + 4 * 86400)
+        self.assertEqual(feeds['unknown']['expires_unix'], 2)
+        self.assertEqual(feeds['ipsum3']['expires_unix'], NOW + 60)  # No publication time: unchanged.
+        self.assertEqual(ipi.policy(feeds, [], NOW)['incoming'], ['5.6.7.0/24'])
+        self.assertEqual(ipi.active_versions(feeds, NOW), {'spamhaus': 'a' * 64})
+        # A receipt is never extended beyond the policy, and a shorter policy shortens it.
+        feed['expires_unix'] = published + 30 * 86400
+        with patch.dict(ipi.SOURCES['spamhaus'], age=86400):
+            ipi.revalidate(feeds)
+        self.assertEqual(feed['expires_unix'], published + 86400)
+        self.assertEqual(ipi.policy(feeds, [], NOW)['incoming'], [])
+
+    def test_successor_playbook_admits_only_the_same_kernel_owner(self):
+        text = (Path(__file__).resolve().parents[1] / 'ansible' / 'ip-intelligence.yml').read_text()
+        self.assertEqual(text.count('\n          - ' + ipi.OWNER + '\n'), 1)
+
     def test_growth_guard_recovers_after_empty_or_expired_snapshot(self):
         fetched = self.feed(['5.6.7.8/32'] * 201)
         for previous in (None, self.feed([]), dict(self.feed(['1.2.3.4/32']), expires_unix=NOW)):

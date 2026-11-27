@@ -33,18 +33,27 @@ SPECIAL = tuple(ipaddress.ip_network(x) for x in (
     '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16',
     '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24', '192.168.0.0/16',
     '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/3'))
+# Maximum publication age. Providers sometimes skip a release for more than two
+# days (Spamhaus DROP, 2026-11-25..27); a list of that age is still enforced.
+# LIST_AGE: blocking and network lists (Spamhaus, IPsum, FireHOL).
+LIST_AGE = 4 * 86400
+DETECTION_AGE = 3 * 86400
+# The passive DNS reader and the flow probe's D7 detector accept a ThreatFox
+# catalog for at most a day after the API snapshot (dns_ioc.DomainCatalog); its
+# validity follows that shared contract.
+THREATFOX_AGE = 86400
 SOURCES = {
     # INC-2026-11-09: this feed included public resolvers (1.1.1.1, 8.8.8.8).
     # Quarantine it from enforcement; valid syntax/freshness does not qualify an IP for DROP.
-    'ipinsights': {'url': 'https://www.ipinsights.io/downloads/blocklist.txt', 'format': 'addresses', 'mode': 'detect', 'interval': 3600, 'age': 86400},
-    'feodo': {'url': 'https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt', 'format': 'addresses', 'mode': 'detect', 'interval': 300, 'age': 86400},
-    'ipsum3': {'url': 'https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt', 'format': 'addresses', 'mode': 'inbound_drop', 'interval': 3600, 'age': 172800,
+    'ipinsights': {'url': 'https://www.ipinsights.io/downloads/blocklist.txt', 'format': 'addresses', 'mode': 'detect', 'interval': 3600, 'age': DETECTION_AGE},
+    'feodo': {'url': 'https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt', 'format': 'addresses', 'mode': 'detect', 'interval': 300, 'age': DETECTION_AGE},
+    'ipsum3': {'url': 'https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt', 'format': 'addresses', 'mode': 'inbound_drop', 'interval': 3600, 'age': LIST_AGE,
                'github': ('stamparm/ipsum', 'levels/3.txt')},
-    'firehol1': {'url': 'https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset', 'format': 'networks', 'mode': 'detect', 'interval': 3600, 'age': 172800,
+    'firehol1': {'url': 'https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset', 'format': 'networks', 'mode': 'detect', 'interval': 3600, 'age': LIST_AGE,
                  'github': ('firehol/blocklist-ipsets', 'firehol_level1.netset')},
-    'spamhaus': {'url': 'https://www.spamhaus.org/drop/drop_v4.json', 'format': 'spamhaus', 'mode': 'inbound_drop', 'interval': 3600, 'age': 172800},
-    'threatfox': {'url': 'https://threatfox-api.abuse.ch/api/v1/', 'format': 'threatfox', 'mode': 'detect', 'interval': 3600, 'age': 86400},
-    'otx': {'url': 'https://otx.alienvault.com/api/v1/pulses/subscribed?limit=50', 'format': 'otx', 'mode': 'detect', 'interval': 3600, 'age': 86400},
+    'spamhaus': {'url': 'https://www.spamhaus.org/drop/drop_v4.json', 'format': 'spamhaus', 'mode': 'inbound_drop', 'interval': 3600, 'age': LIST_AGE},
+    'threatfox': {'url': 'https://threatfox-api.abuse.ch/api/v1/', 'format': 'threatfox', 'mode': 'detect', 'interval': 3600, 'age': THREATFOX_AGE},
+    'otx': {'url': 'https://otx.alienvault.com/api/v1/pulses/subscribed?limit=50', 'format': 'otx', 'mode': 'detect', 'interval': 3600, 'age': DETECTION_AGE},
 }
 
 
@@ -225,7 +234,24 @@ def fetch_source(name, now, credentials):
     require(published is not None and 0 <= completed - published <= spec['age'], 'source publication stale, unknown or from future')
     parsed = parse(name, raw, completed)
     return {**parsed, 'fetched_unix': completed, 'published_unix': published,
-            'expires_unix': min(completed + spec['age'], published + spec['age']), 'sha256': sha(raw), 'url': url}
+            'expires_unix': expiry(name, completed, published), 'sha256': sha(raw), 'url': url}
+
+
+def expiry(name, fetched, published):
+    return min(fetched, published) + SOURCES[name]['age']
+
+
+def revalidate(feeds):
+    """Apply the installed age policy to retained receipts, e.g. after an upgrade.
+
+    The result equals what a fetch of the same publication would have recorded
+    under this policy. A retained receipt is never extended past it, and a
+    shortened policy shortens it immediately.
+    """
+    for name, feed in feeds.items():
+        if (name in SOURCES and isinstance(feed, dict) and type(feed.get('fetched_unix')) is int
+                and type(feed.get('published_unix')) is int):
+            feed['expires_unix'] = expiry(name, feed['fetched_unix'], feed['published_unix'])
 
 
 def protected_config(values):
@@ -495,6 +521,7 @@ def main():
         require(state.get('config_sha256', args.config_sha256) == args.config_sha256, 'state belongs to another installed policy')
         state['config_sha256'] = args.config_sha256
         state.setdefault('apply_success', False)
+        revalidate(state['feeds'])
         now = int(time.time())
         due = [n for n in config['sources'] if args.refresh or now - max(
             state['feeds'].get(n, {}).get('fetched_unix', 0),
