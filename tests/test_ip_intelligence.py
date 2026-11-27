@@ -220,6 +220,33 @@ class IntelligenceTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, 'source publication stale'):
             ipi.fetch_source('spamhaus', NOW, '/nonexistent')
 
+    def test_threatfox_response_above_the_generic_byte_bound_is_accepted(self):
+        import tempfile
+        seen = dt.datetime.fromtimestamp(NOW - 3600, dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        row = {'ioc': 'c2.example.com', 'ioc_type': 'domain', 'confidence_level': 100,
+               'first_seen': seen, 'reference': 'x' * 900}
+        raw = json.dumps({'query_status': 'ok', 'data': [row] * 18027}).encode()  # Rows on 2026-11-27.
+        self.assertGreater(len(raw), ipi.MAX_BYTES)
+        limits = {}
+
+        def bounded(url, *, key=None, data=None, limit=ipi.MAX_BYTES):
+            limits[url] = limit
+            body = raw if url == ipi.SOURCES['threatfox']['url'] else b'{"cidr":"5.6.7.0/24"}\n'
+            ipi.require(len(body) <= limit, 'feed response exceeds byte bound')
+            return body, NOW - 60
+
+        with tempfile.TemporaryDirectory() as credentials, \
+                patch.object(ipi, 'retrieve', side_effect=bounded), \
+                patch.object(ipi.time, 'time', return_value=NOW):
+            (Path(credentials) / 'abuse-ch').write_text('k' * 32 + '\n')
+            fetched = ipi.fetch_source('threatfox', NOW, credentials)
+            ipi.fetch_source('spamhaus', NOW, credentials)
+        self.assertEqual(fetched['domains'], ['c2.example.com'])
+        # Only ThreatFox gets the larger bound; every other source keeps the generic one.
+        self.assertEqual(limits, {ipi.SOURCES['threatfox']['url']: 64 * 1024 * 1024,
+                                  ipi.SOURCES['spamhaus']['url']: ipi.MAX_BYTES})
+        self.assertEqual([n for n, s in ipi.SOURCES.items() if 'max_bytes' in s], ['threatfox'])
+
     def test_retained_receipt_follows_the_installed_age_policy(self):
         published = NOW - 2 * 86400 - 3600
         # Accepted earlier under a two-day policy, retained after the publication aged out.

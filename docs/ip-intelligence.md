@@ -28,7 +28,7 @@ context; the IP observer does not claim DNS or TLS coverage from them.
 The withdrawn v3 updater matched source or destination addresses without proving
 who initiated the connection. IPInsights contained public resolver addresses,
 including `1.1.1.1` and `8.8.8.8`, so source-only blocking also dropped legitimate
-replies. Keep that deployment withdrawn. The immutable v5 and v6 bundles retain
+replies. Keep that deployment withdrawn. The immutable v5, v6 and v7 bundles retain
 the v4 `ingress-syn-only-v2`: `ip daddr @protected ip saddr @incoming tcp flags &
 (fin | syn | rst | ack) == syn`. Both bridge names must still be `public0`.
 
@@ -74,6 +74,14 @@ recomputes the expiry of retained receipts from the installed policy, so a
 changed age applies at once to the last good copy, exactly as a new download of
 the same publication would; a receipt is never extended beyond that.
 
+Each response is bounded at 16 MiB, except ThreatFox at 64 MiB. Its API returns
+seven days of indicators of every type (also URLs and file hashes) in one JSON
+document, which reached 16.1 MiB and 18,027 rows on 27 November 2026 and was
+then refused on every sensor. The seven-day window stays, because the passive
+DNS reader reports it as the maximum indicator age. At 64 MiB the response stays
+below the 100,000-row parser bound, and parsing it needs well under the 3 GiB
+unit limit (about 110 MiB for the 16 MiB response).
+
 The first apply requires fresh IPInsights, IPsum, Spamhaus and ThreatFox data.
 Later retrieval errors retain each last good source only until its expiry;
 expired sources are excluded from the next candidate. The kernel elements
@@ -100,7 +108,8 @@ stopped for inspection. A successful migration resumes them and requires a
 natural updater cycle and effective kernel readback before acceptance.
 
 A compatible successor keeps the kernel owner, rule expressions, configuration
-and state schema; v6 only changes source ages. Install it into a new directory
+and state schema; v6 only changes source ages and v7 only the ThreatFox response
+bound. Install it into a new directory
 with `cs_public0_ip_predecessor: {bundle: <old directory>, pins: <old hashes>}`.
 The playbook then requires the exact predecessor bytes, the installed updater
 unit running that predecessor without drop-ins, and, if the kernel table

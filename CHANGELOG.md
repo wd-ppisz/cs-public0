@@ -14,6 +14,9 @@
   ponad dwa dni, nadal blokuje. ThreatFox zostaje przy 24 h, granicy katalogu
   pasywnego DNS. Ważność zachowanych list wynika z zainstalowanej polityki.
   Playbook instaluje zgodnego następcę obok poprzednika bez przerwy w DROP.
+- Updater IP v7: odpowiedź API ThreatFox ma własny limit 64 MiB zamiast 16 MiB.
+  Siedmiodniowa odpowiedź `get_iocs` urosła do 16,1 MiB (27.11.2026) i była
+  odrzucana na wszystkich sensorach. Pozostałe źródła zachowują limit 16 MiB.
 
 ## 1.1.0 — 2026-11-11
 
