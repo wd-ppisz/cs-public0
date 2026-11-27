@@ -103,12 +103,16 @@ A compatible successor keeps the kernel owner, rule expressions, configuration
 and state schema; v6 only changes source ages. Install it into a new directory
 with `cs_public0_ip_predecessor: {bundle: <old directory>, pins: <old hashes>}`.
 The playbook then requires the exact predecessor bytes, the installed updater
-unit running that predecessor without drop-ins, and an existing kernel table
-with the same owner. The table, its elements, counters and the provider cache
-stay in place, so inbound DROP is not interrupted; the next timer run uses the
-new path. The predecessor directory is kept for rollback and for consumers that
-attest its parser, such as the DNS reader. A different kernel contract still
-requires the contained migration above.
+unit running that predecessor without drop-ins, and, if the kernel table
+exists, the same owner. The table, its elements, counters and the provider
+cache stay in place, so inbound DROP is not interrupted; the next timer run
+uses the new path. Without a table (a predecessor that never applied) the
+successor creates it on its first apply, as the predecessor would have. The predecessor directory is kept for rollback and for consumers that
+attest its parser, such as the DNS reader. A predecessor does not revalidate
+retained receipts: after a rollback to v5 they keep the expiry computed by v6
+until their next successful download. To restore shorter ages immediately,
+install a successor with those ages instead. A different kernel contract
+still requires the contained migration above.
 
 An update is one native nft transaction. It flushes only the four owned sets,
 repopulates them and preserves the chains and named counters. Check syntax
