@@ -23,6 +23,10 @@ import urllib.request
 import zlib
 
 MAX_BYTES = 16 * 1024 * 1024
+# The ThreatFox API returns seven days of indicators of every type in one JSON
+# document (16.1 MiB and 18,027 rows on 2026-11-27). Its own bound leaves room
+# for growth below the 100,000-row parser bound and the unit's memory limit.
+THREATFOX_MAX_BYTES = 64 * 1024 * 1024
 MAX_ENTRIES = 1000000
 # Leave time for the 300 s timer, a bounded updater invocation and nft apply.
 MIN_ENFORCEMENT_REMAINING = 1200
@@ -52,7 +56,8 @@ SOURCES = {
     'firehol1': {'url': 'https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset', 'format': 'networks', 'mode': 'detect', 'interval': 3600, 'age': LIST_AGE,
                  'github': ('firehol/blocklist-ipsets', 'firehol_level1.netset')},
     'spamhaus': {'url': 'https://www.spamhaus.org/drop/drop_v4.json', 'format': 'spamhaus', 'mode': 'inbound_drop', 'interval': 3600, 'age': LIST_AGE},
-    'threatfox': {'url': 'https://threatfox-api.abuse.ch/api/v1/', 'format': 'threatfox', 'mode': 'detect', 'interval': 3600, 'age': THREATFOX_AGE},
+    'threatfox': {'url': 'https://threatfox-api.abuse.ch/api/v1/', 'format': 'threatfox', 'mode': 'detect', 'interval': 3600, 'age': THREATFOX_AGE,
+                  'max_bytes': THREATFOX_MAX_BYTES},
     'otx': {'url': 'https://otx.alienvault.com/api/v1/pulses/subscribed?limit=50', 'format': 'otx', 'mode': 'detect', 'interval': 3600, 'age': DETECTION_AGE},
 }
 
@@ -226,7 +231,7 @@ def fetch_source(name, now, credentials):
         require(isinstance(meta, list) and len(meta) == 1 and re.fullmatch('[a-f0-9]{40}', meta[0]['sha']), 'source commit unknown')
         published = int(dt.datetime.fromisoformat(meta[0]['commit']['committer']['date'].replace('Z', '+00:00')).timestamp())
         url = 'https://raw.githubusercontent.com/' + repository + '/' + meta[0]['sha'] + '/' + filename
-    raw, modified = retrieve(url, key=key, data=data)
+    raw, modified = retrieve(url, key=key, data=data, limit=spec.get('max_bytes', MAX_BYTES))
     completed = int(time.time())
     published = published if published is not None else modified
     if name == 'threatfox' or name == 'otx':
