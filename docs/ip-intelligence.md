@@ -11,8 +11,7 @@ Other bridges and host-local traffic are outside this scope.
 | IPInsights | Detection only, low severity; never an input to automatic DROP |
 | IPsum level 3 | Drop only an initial inbound TCP SYN from a listed source to an explicitly protected network |
 | Spamhaus DROP | The same initial inbound TCP SYN policy; includes the former EDROP dataset |
-| Feodo recommended | Detection only; VM egress is never blocked by IP reputation |
-| ThreatFox | Detection only; retain source receipts and indicator context |
+| ThreatFox | Detection only; retain source receipts and indicator context. VM egress is never blocked by IP reputation |
 | FireHOL level 1 | Detection context; not a broad automatic DROP policy |
 | OTX subscribed pulses | Optional detection context with a separately configured API key |
 
@@ -23,12 +22,20 @@ excluded as a whole. ThreatFox indicators below confidence 75 and IP indicators
 last seen more than seven days ago are rejected. Its domains are retained as
 context; the IP observer does not claim DNS or TLS coverage from them.
 
+The Feodo Tracker list is retired in v8. Its recommended blocklist was last
+updated on 4 March 2026 and held one address in November 2026, so a fresh
+publication never arrived. ThreatFox `botnet_cc` IP indicators cover the same
+botnet C2 detection. An installed configuration may still name `feodo`, because
+its bytes and the updater state are pinned. The updater accepts the name there,
+never fetches or reports the source and drops its retained receipts. A retired
+source cannot be required.
+
 ## Direction contract after INC-2026-11-09
 
 The withdrawn v3 updater matched source or destination addresses without proving
 who initiated the connection. IPInsights contained public resolver addresses,
 including `1.1.1.1` and `8.8.8.8`, so source-only blocking also dropped legitimate
-replies. Keep that deployment withdrawn. The immutable v5, v6 and v7 bundles retain
+replies. Keep that deployment withdrawn. The immutable v5 to v8 bundles retain
 the v4 `ingress-syn-only-v2`: `ip daddr @protected ip saddr @incoming tcp flags &
 (fin | syn | rst | ack) == syn`. Both bridge names must still be `public0`.
 
@@ -50,8 +57,8 @@ time, content hash, indicator count and result are recorded independently.
 API keys are supplied through systemd credentials, never command-line arguments
 or source files. Use the existing abuse.ch key for ThreatFox.
 
-The scheduler runs every five minutes but respects provider intervals: Feodo
-five minutes, the other providers at least one hour. Failed attempts also count
+The scheduler runs every five minutes but respects provider intervals of at
+least one hour. Failed attempts also count
 towards that interval. Spamhaus explicitly requires at least an hour between
 automated downloads. A source growing by more than 50 percent, above a small
 initial threshold, requires investigation while its last good nonempty snapshot
@@ -65,7 +72,7 @@ including child processes; the smaller isolated subset alone is not sizing proof
 
 A publication is accepted until it reaches the source's maximum age, measured
 from `Last-Modified` or the GitHub commit time. Spamhaus, IPsum and FireHOL may
-be four days old, IPInsights, Feodo and OTX three days. Providers occasionally
+be four days old, IPInsights and OTX three days. Providers occasionally
 skip a release for more than two days (Spamhaus DROP, November 2026); such a
 list is still enforced. ThreatFox has no publication time: its API snapshot is
 valid for one day, the bound of the domain catalog (`dns_ioc.DomainCatalog`)
@@ -108,8 +115,9 @@ stopped for inspection. A successful migration resumes them and requires a
 natural updater cycle and effective kernel readback before acceptance.
 
 A compatible successor keeps the kernel owner, rule expressions, configuration
-and state schema; v6 only changes source ages and v7 only the ThreatFox response
-bound. Install it into a new directory
+and state schema; v6 only changes source ages, v7 only the ThreatFox response
+bound and v8 only retires Feodo (a rollback to v7 resumes its refused attempts,
+without effect on policy). Install it into a new directory
 with `cs_public0_ip_predecessor: {bundle: <old directory>, pins: <old hashes>}`.
 The playbook then requires the exact predecessor bytes, the installed updater
 unit running that predecessor without drop-ins, and, if the kernel table

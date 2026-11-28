@@ -113,8 +113,8 @@ class IntelligenceTests(unittest.TestCase):
         self.assertEqual(match['category'], 'reputation')
         self.assertEqual(match['enforcement'], 'none')
 
-    def test_outgoing_threatfox_and_feodo_are_observation_only(self):
-        feeds = {'feodo': self.feed(['1.2.3.4/32']),
+    def test_outgoing_threatfox_and_firehol_are_observation_only(self):
+        feeds = {'firehol1': self.feed(['1.2.3.4/32']),
                  'threatfox': dict(self.feed(['5.6.7.8/32']), endpoints=[('5.6.7.8/32', 443)])}
         self.assertEqual(ipi.policy(feeds, [], NOW), {'incoming': [], 'outgoing': [], 'c2_ports': []})
         self.assertIsNotNone(IOC(ipi.ioc_snapshot(feeds, [], NOW)).match('5.6.7.8', NOW))
@@ -195,8 +195,28 @@ class IntelligenceTests(unittest.TestCase):
         ages = {name: spec['age'] for name, spec in ipi.SOURCES.items()}
         self.assertEqual({n: ages[n] for n in ('spamhaus', 'ipsum3', 'firehol1')},
                          dict.fromkeys(('spamhaus', 'ipsum3', 'firehol1'), 4 * 86400))
-        self.assertEqual({n: ages[n] for n in ('ipinsights', 'feodo', 'otx')},
-                         dict.fromkeys(('ipinsights', 'feodo', 'otx'), 3 * 86400))
+        self.assertEqual({n: ages[n] for n in ('ipinsights', 'otx')},
+                         dict.fromkeys(('ipinsights', 'otx'), 3 * 86400))
+
+    def test_retired_feodo_is_accepted_in_the_installed_configuration_but_never_fetched(self):
+        installed = {'sources': ['feodo', 'firehol1', 'ipinsights', 'ipsum3', 'otx', 'spamhaus', 'threatfox'],
+                     'required_sources': ['ipinsights', 'ipsum3', 'spamhaus', 'threatfox']}
+        self.assertNotIn('feodo', ipi.SOURCES)
+        self.assertEqual(ipi.active_sources(installed),
+                         ['firehol1', 'ipinsights', 'ipsum3', 'otx', 'spamhaus', 'threatfox'])
+        self.assertEqual(ipi.active_sources({'sources': ['ipsum3']}), ['ipsum3'])
+        for config in ({'sources': ['ipsum3', 'unknown']}, {'sources': ['ipsum3', 'feodo']},
+                       {'sources': ['feodo'], 'required_sources': ['feodo']}):
+            with self.assertRaises(ValueError, msg=config):
+                ipi.active_sources(config)
+        state = {'feeds': {'feodo': self.feed(['1.2.3.4/32']), 'ipsum3': self.feed(['5.6.7.8/32'])},
+                 'status': {'feodo': {'result': 'UNAVAILABLE_LAST_GOOD_RETAINED', 'attempted_unix': NOW},
+                            'ipsum3': {'result': 'OK', 'attempted_unix': NOW}}}
+        ipi.drop_retired(state)
+        self.assertEqual((set(state['feeds']), set(state['status'])), ({'ipsum3'}, {'ipsum3'}))
+        self.assertNotIn('source="feodo"', ipi.metrics(state, NOW))
+        with self.assertRaisesRegex(ValueError, 'source not allowed'):
+            ipi.retrieve('https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt')
 
     def test_threatfox_validity_fits_the_passive_dns_catalog(self):
         from dns_ioc import DomainCatalog

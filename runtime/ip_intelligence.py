@@ -50,7 +50,6 @@ SOURCES = {
     # INC-2026-11-09: this feed included public resolvers (1.1.1.1, 8.8.8.8).
     # Quarantine it from enforcement; valid syntax/freshness does not qualify an IP for DROP.
     'ipinsights': {'url': 'https://www.ipinsights.io/downloads/blocklist.txt', 'format': 'addresses', 'mode': 'detect', 'interval': 3600, 'age': DETECTION_AGE},
-    'feodo': {'url': 'https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt', 'format': 'addresses', 'mode': 'detect', 'interval': 300, 'age': DETECTION_AGE},
     'ipsum3': {'url': 'https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt', 'format': 'addresses', 'mode': 'inbound_drop', 'interval': 3600, 'age': LIST_AGE,
                'github': ('stamparm/ipsum', 'levels/3.txt')},
     'firehol1': {'url': 'https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset', 'format': 'networks', 'mode': 'detect', 'interval': 3600, 'age': LIST_AGE,
@@ -60,6 +59,12 @@ SOURCES = {
                   'max_bytes': THREATFOX_MAX_BYTES},
     'otx': {'url': 'https://otx.alienvault.com/api/v1/pulses/subscribed?limit=50', 'format': 'otx', 'mode': 'detect', 'interval': 3600, 'age': DETECTION_AGE},
 }
+# Feodo Tracker stopped publishing: its recommended list was last updated on
+# 2026-03-04 and holds one address. ThreatFox botnet_cc ip:port indicators
+# already cover the same detection. Installed configurations still name the
+# source, and their bytes and state are pinned, so the name stays accepted
+# there. The updater never fetches it, never reports it and drops its receipts.
+RETIRED_SOURCES = frozenset({'feodo'})
 
 
 def require(value, message):
@@ -499,6 +504,21 @@ def refresh_required(state, now):
             or state.get('kernel_expires_unix', 0) - now < 600)
 
 
+def active_sources(config):
+    """Configured sources to fetch; a retired name is accepted and skipped."""
+    names = config['sources']
+    require(names == sorted(set(names)) and set(names) <= SOURCES.keys() | RETIRED_SOURCES, 'unknown source')
+    require(set(config.get('required_sources', ())) <= SOURCES.keys(), 'unknown or retired required source')
+    return [n for n in names if n in SOURCES]
+
+
+def drop_retired(state):
+    """Forget receipts and retry state of retired sources."""
+    for name in RETIRED_SOURCES:
+        state['feeds'].pop(name, None)
+        state['status'].pop(name, None)
+
+
 def main():
     import fcntl
     parser = argparse.ArgumentParser(description=__doc__)
@@ -514,7 +534,7 @@ def main():
     config = json.loads(raw)
     require(config['schema'] == 'cs-public0-ip-intelligence-v1' and config['bridge'] == 'public0', 'installed contract differs')
     require(config['mode'] in {'observe', 'apply'}, 'unknown mode')
-    require(config['sources'] == sorted(set(config['sources'])) and set(config['sources']) <= SOURCES.keys(), 'unknown source')
+    active = active_sources(config)
     protected = protected_config(config['protected_networks'])
     root = Path(config['state_directory'])
     require(str(root) == '/var/lib/cs-public0-ip-intelligence', 'fixed private state directory required')
@@ -526,9 +546,10 @@ def main():
         require(state.get('config_sha256', args.config_sha256) == args.config_sha256, 'state belongs to another installed policy')
         state['config_sha256'] = args.config_sha256
         state.setdefault('apply_success', False)
+        drop_retired(state)
         revalidate(state['feeds'])
         now = int(time.time())
-        due = [n for n in config['sources'] if args.refresh or now - max(
+        due = [n for n in active if args.refresh or now - max(
             state['feeds'].get(n, {}).get('fetched_unix', 0),
             state['status'].get(n, {}).get('attempted_unix', 0)) >= SOURCES[n]['interval']]
         credentials = os.environ.get('CREDENTIALS_DIRECTORY', '/run/credentials/cs-public0-ip-intelligence.service')
