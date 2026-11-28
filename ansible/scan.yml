@@ -1,0 +1,232 @@
+---
+# Inbound scan detector (ADR-067) on one explicitly selected host, OBSERVE only.
+# Reads the sensor's EVE flows, keeps an own nft table with counters and timeout
+# sets (no verdicts) and writes one event per decision. Never drops, rejects or
+# redirects a packet; the configuration contract refuses any mode but observe/off.
+# Disabled by default: cs_public0_scan_enable=true installs AND starts the unit;
+# false stops it and withdraws the own table (rollback).
+- name: Install the scan detector on one explicit host
+  hosts: "{{ target | default('cs_public0_no_target') }}"
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    cs_public0_scan_enable: false
+    cs_public0_scan_bundle: /usr/local/libexec/cs-public0-scan-v1
+    cs_public0_scan_config_file: /etc/cs-public0/scan.json
+    cs_public0_scan_cpu_quota: 25%
+    cs_public0_scan_memory_max: 256M
+  tasks:
+    - name: Require one explicit target and exact reviewed source pins
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - target == inventory_hostname
+          - ansible_play_hosts_all | length == 1
+          - cs_public0_scan_enable is boolean
+          - cs_public0_scan_source is defined
+          # scan_detector imports the shared IOC reader from egress_model.
+          - cs_public0_scan_pins.keys() | list | sort == ['egress_model.py', 'scan_detector.py']
+          - cs_public0_scan_pins.values() | select('match', '^[a-f0-9]{64}$') | list | length == 2
+          - cs_public0_scan_bundle is match('^/usr/local/libexec/cs-public0-scan-v[0-9]+$')
+          - cs_public0_scan_configuration.schema == 'cs-public0-scan-v1'
+          - cs_public0_scan_configuration.mode in ['observe', 'off']
+          - cs_public0_scan_configuration.bridge == 'public0'
+          - cs_public0_scan_configuration.sensor_id == inventory_hostname.split('.')[0]
+          - cs_public0_scan_configuration.eve_file == '/var/log/wd-public0-inline/eve.json'
+          - cs_public0_scan_configuration.ioc_file == '/var/lib/cs-public0-ip-intelligence/ioc.json'
+          - cs_public0_scan_configuration.state_directory == '/var/lib/cs-public0-scan'
+          - cs_public0_scan_configuration.decision_log == '/var/lib/cs-public0-scan/events.jsonl'
+          - cs_public0_scan_configuration.metrics_file is match('^/var/lib/[a-zA-Z0-9_/-]+/cs_public0_scan[.]prom$')
+
+    - name: Check exact local sources against the accepted pins
+      ansible.builtin.stat:
+        path: "{{ cs_public0_scan_source }}/{{ item.key }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      loop: "{{ cs_public0_scan_pins | dict2items }}"
+      register: cs_public0_scan_sources
+
+    - name: Require regular source files matching accepted pins
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+          - not (item.stat.islnk | default(false))
+          - item.stat.checksum == item.item.value
+      loop: "{{ cs_public0_scan_sources.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    - name: Refuse hosts without bridge nf_tables, foreign tables and foreign bundle files
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import json, pathlib, subprocess, sys
+            p = json.load(sys.stdin)
+            if subprocess.run(['nft', '--check', 'add', 'table', 'bridge', 'cs_public0_scan_probe'],
+                              capture_output=True).returncode:
+                raise SystemExit('nf_tables bridge family is required')
+            rows = json.loads(subprocess.check_output(['nft', '-j', 'list', 'tables']))['nftables']
+            if any(x.get('table', {}).get('family') == 'bridge' and x['table'].get('name') == 'cs_public0_scan'
+                   for x in rows):
+                own = json.loads(subprocess.check_output(['nft', '-j', '--terse', 'list', 'table', 'bridge',
+                                                          'cs_public0_scan']))['nftables']
+                if [x['table'].get('comment') for x in own if 'table' in x] != ['cs-public0-scan-v1-observe']:
+                    raise SystemExit('cs_public0_scan exists with a foreign owner')
+            if not pathlib.Path(p['eve']).is_file():
+                raise SystemExit('the sensor EVE file is missing')
+            bundle = pathlib.Path(p['bundle'])
+            if bundle.exists() and {x.name for x in bundle.iterdir()} - set(p['pins']):
+                raise SystemExit('foreign files in the scan bundle')
+        stdin: "{{ {'bundle': cs_public0_scan_bundle, 'pins': cs_public0_scan_pins, 'eve': cs_public0_scan_configuration.eve_file} | to_json }}"
+      changed_when: false
+
+    - name: Create dedicated directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: "{{ cs_public0_scan_bundle }}", mode: '0755'}
+        - {path: /etc/cs-public0, mode: '0755'}
+        - {path: "{{ cs_public0_scan_configuration.state_directory }}", mode: '0700'}
+
+    - name: Install exact pinned runtime files
+      ansible.builtin.copy:
+        src: "{{ cs_public0_scan_source }}/{{ item.key }}"
+        dest: "{{ cs_public0_scan_bundle }}/{{ item.key }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ cs_public0_scan_pins | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      notify: Restart scan unit
+
+    # copy's own `checksum` is SHA-1; the pins are SHA-256, so verify them on the host.
+    - name: Read installed file digests
+      ansible.builtin.stat:
+        path: "{{ cs_public0_scan_bundle }}/{{ item.key }}"
+        checksum_algorithm: sha256
+      loop: "{{ cs_public0_scan_pins | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      register: cs_public0_scan_installed
+
+    - name: Require installed files to match the pins
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+          - item.stat.checksum == item.item.value
+      loop: "{{ cs_public0_scan_installed.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    - name: Stage the candidate configuration
+      ansible.builtin.copy:
+        content: "{{ cs_public0_scan_configuration | to_nice_json }}\n"
+        dest: "{{ cs_public0_scan_config_file }}.candidate"
+        owner: root
+        group: root
+        mode: '0600'
+      changed_when: false
+
+    - name: Validate the candidate with the installed code (contract, whitelist, mode)
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, -I, -B, "{{ cs_public0_scan_bundle }}/scan_detector.py", check,
+               --config, "{{ cs_public0_scan_config_file }}.candidate"]
+      changed_when: false
+
+    - name: Install the validated configuration
+      ansible.builtin.copy:
+        src: "{{ cs_public0_scan_config_file }}.candidate"
+        dest: "{{ cs_public0_scan_config_file }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+      notify: Restart scan unit
+
+    - name: Remove the staged candidate
+      ansible.builtin.file:
+        path: "{{ cs_public0_scan_config_file }}.candidate"
+        state: absent
+      changed_when: false
+
+    - name: Install the systemd unit
+      ansible.builtin.template:
+        src: ../config/cs-public0-scan.service.j2
+        dest: /etc/systemd/system/cs-public0-scan.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart scan unit
+
+    - name: Apply the requested unit state
+      ansible.builtin.systemd_service:
+        name: cs-public0-scan.service
+        daemon_reload: true
+        enabled: "{{ cs_public0_scan_enable }}"
+        state: "{{ 'started' if cs_public0_scan_enable else 'stopped' }}"
+
+    - name: Withdraw the own table when disabled (rollback)
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, -I, -B, "{{ cs_public0_scan_bundle }}/scan_detector.py", withdraw,
+               --config, "{{ cs_public0_scan_config_file }}"]
+      register: cs_public0_scan_withdraw
+      changed_when: "'deleted' in cs_public0_scan_withdraw.stdout"
+      when: not cs_public0_scan_enable
+
+    - name: Flush handlers before acceptance
+      ansible.builtin.meta: flush_handlers
+
+    - name: Require positive evidence from the enabled detector
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -I
+          - -B
+          - -c
+          - |
+            import json, pathlib, subprocess, sys, time
+            p = json.load(sys.stdin)
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                active = subprocess.run(['systemctl', 'is-active', '--quiet', 'cs-public0-scan.service']).returncode == 0
+                try:
+                    text = pathlib.Path(p['metrics']).read_text(encoding='utf-8')
+                except OSError:
+                    text = ''
+                vals = dict(l.split(' ', 1) for l in text.splitlines() if l and not l.startswith('#') and ' ' in l)
+                ok = all(vals.get('cs_public0_scan_' + k, '').strip() == '1'
+                         for k in ('up', 'eve_available', 'kernel_table_present'))
+                if active and ok:
+                    rows = json.loads(subprocess.check_output(['nft', '-j', 'list', 'table', 'bridge', 'cs_public0_scan']))
+                    verdicts = [e for r in rows['nftables'] if 'rule' in r for e in r['rule']['expr']
+                                if set(e) & {'drop', 'reject', 'queue', 'accept', 'jump', 'goto'}]
+                    if verdicts:
+                        raise SystemExit('a verdict appeared in the observe table')
+                    print(json.dumps({k: vals[k].strip() for k in vals if k.startswith('cs_public0_scan_flows_total')}))
+                    break
+                time.sleep(3)
+            else:
+                raise SystemExit('detector did not report up, EVE and kernel table within 60 s')
+        stdin: "{{ {'metrics': cs_public0_scan_configuration.metrics_file} | to_json }}"
+      changed_when: false
+      when: cs_public0_scan_enable
+
+  handlers:
+    - name: Restart scan unit
+      ansible.builtin.systemd_service:
+        name: cs-public0-scan.service
+        daemon_reload: true
+        state: restarted
+      when: cs_public0_scan_enable

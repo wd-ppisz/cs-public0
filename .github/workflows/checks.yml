@@ -19,6 +19,7 @@ jobs:
         run: |
           ansible-playbook -i ../examples/apache-cloudstack-kvm/inventory.ini site.yml --syntax-check
           ansible-playbook -i ../examples/apache-cloudstack-kvm/inventory.ini rule-controller.yml --syntax-check
+          ansible-playbook -i ../examples/apache-cloudstack-kvm/inventory.ini scan.yml --syntax-check
       - name: Dependency audit
         run: |
           pip install pip-audit
@@ -114,6 +115,16 @@ jobs:
           result=$?
           if [ "$result" -eq 77 ]; then
             echo '::error::Dataplane prerequisites unavailable; smoke was not validated.'
+            exit 1
+          fi
+          exit "$result"
+      - name: Scan detector table in an empty network namespace
+        run: |
+          set +e
+          sudo unshare --net python3 -B tests/integration/scan.py
+          result=$?
+          if [ "$result" -eq 77 ]; then
+            echo '::error::Scan detector prerequisites unavailable; table smoke was not validated.'
             exit 1
           fi
           exit "$result"

@@ -79,3 +79,24 @@ groups:
         annotations:
           summary: 'Required NFQUEUE receive buffer is not verified on {{ $labels.host }}'
           description: 'Verify current socket identity, effective SO_RCVBUF and engine acknowledgement. A configured number alone is insufficient.'
+      - alert: CsPublic0ScanDetectorDown
+        expr: cs_public0_scan_up == 0 or time() - cs_public0_scan_last_write_timestamp_seconds > 120
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Scan detector is not running on {{ $labels.instance }}'
+          description: 'The observe-only scan detector stopped or stopped publishing metrics. Kernel elements expire by their TTL.'
+      - alert: CsPublic0ScanInputOrTableMissing
+        expr: cs_public0_scan_eve_available == 0 or cs_public0_scan_kernel_table_present == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Scan detector lost its EVE input or kernel table on {{ $labels.instance }}'
+          description: 'Check the Suricata EVE path and the own bridge table cs_public0_scan.'
+      - alert: CsPublic0ScanSafetyFuse
+        expr: increase(cs_public0_scan_rate_limited_total[10m]) > 0 or increase(cs_public0_scan_set_full_total[10m]) > 0 or increase(cs_public0_scan_kernel_errors_total[10m]) > 0
+        for: 0s
+        labels: {severity: warning}
+        annotations:
+          summary: 'Scan detector safety fuse on {{ $labels.instance }}'
+          description: 'Decisions were rate limited, the set was full or a kernel update failed. A burst of decisions suggests spoofed sources, not scanners.'
