@@ -17,6 +17,12 @@
 - Updater IP v7: odpowiedź API ThreatFox ma własny limit 64 MiB zamiast 16 MiB.
   Siedmiodniowa odpowiedź `get_iocs` urosła do 16,1 MiB (27.11.2026) i była
   odrzucana na wszystkich sensorach. Pozostałe źródła zachowują limit 16 MiB.
+- Updater IP v8: usunięte źródło Feodo Tracker. Lista od 4.03.2026 nie była
+  aktualizowana (jeden adres), więc nigdy nie przeszła granicy wieku. Wykrywanie
+  C2 botnetów zapewniają wskaźniki `botnet_cc` z ThreatFox. Zainstalowana
+  konfiguracja może nadal wymieniać `feodo`: updater akceptuje tę nazwę, nie
+  pobiera źródła, nie publikuje jego metryk i usuwa jego stan. Zgodny następca
+  v7 bez zmiany konfiguracji i bez przerwy w DROP.
 
 ## 1.1.0 — 2026-11-11
 
