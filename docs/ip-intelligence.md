@@ -8,7 +8,7 @@ Other bridges and host-local traffic are outside this scope.
 
 | Source | Installed policy |
 | --- | --- |
-| IPInsights | Detection only, low severity; never an input to automatic DROP |
+| IPInsights | Detection only, low severity; never the only input to an automatic DROP (see the scan detector below) |
 | IPsum level 3 | Drop only an initial inbound TCP SYN from a listed source to an explicitly protected network |
 | Spamhaus DROP | The same initial inbound TCP SYN policy; includes the former EDROP dataset |
 | ThreatFox | Detection only; retain source receipts and indicator context. VM egress is never blocked by IP reputation |
@@ -46,6 +46,16 @@ this reputation layer. A missing conntrack entry is not evidence of initiation:
 the policy requires the initial SYN in the current packet. UDP/ICMP initiator
 tracking and broad source blocking are intentionally outside this contract.
 No conntrack module or Suricata restart is introduced by this change.
+
+### Scan detector (ADR-067)
+
+The separate scan detector may use any IOC list of this updater, IPInsights
+included, as a *necessary* condition next to observed scanning behaviour (many
+distinct failed target/port pairs from one source). A list entry alone never
+qualifies an address. Version 1 of the detector is observe-only: its own table
+`bridge cs_public0_scan` (priority -245, after this table) counts initial SYNs
+and has no verdicts. This contract and the `incoming` set are unchanged. See
+[scan-detector.md](scan-detector.md).
 
 ## Retrieval and expiry
 

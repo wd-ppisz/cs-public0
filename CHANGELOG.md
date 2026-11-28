@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Detektor skanów przychodzących (ADR-067), wersja 1 wyłącznie OBSERVE: liczy różne
+  nieudane pary (cel, port) od źródła w oknie 600 s z EVE `flow`. Decyzja to element
+  z TTL (15 min / 60 min / 6 h) we własnej tabeli `bridge cs_public0_scan` (priorytet −245)
+  i jedno zdarzenie dla SIEM. Reguły tylko liczą SYN, które odrzuciłby ENFORCE; kontrakt
+  konfiguracji odrzuca tryb `enforce`. Werdykt wybrany: zachowanie ∧ reputacja (lista IOC
+  updatera IP jako warunek konieczny). Whitelista z datą ważności, limit decyzji,
+  ograniczony stan. [Opis](docs/scan-detector.md).
 - Kandydat sondy flow (etap E0, nieaktywny domyślnie): obiekt eBPF TCX tylko do
   odczytu na tapach gości i uplinku, rekordy SYN z ISN do korelacji SNAT,
   detektory zachowania w trybie observe. [Opis](docs/flow-probe.md).

@@ -1,0 +1,29 @@
+[Unit]
+Description=cs-public0 inbound scan detector (ADR-067, observe only)
+Documentation=https://github.com/wd-ppisz/cs-public0/blob/main/docs/scan-detector.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{ cs_public0_scan_bundle }}
+# prepare creates or verifies the own nft table (counters only, no verdicts).
+ExecStartPre=/usr/bin/python3 -I -B {{ cs_public0_scan_bundle }}/scan_detector.py prepare --config {{ cs_public0_scan_config_file }}
+ExecStart=/usr/bin/python3 -I -B {{ cs_public0_scan_bundle }}/scan_detector.py run --config {{ cs_public0_scan_config_file }}
+# Stopping keeps the table: elements expire by their own TTL. Removal is the
+# explicit `withdraw` command (playbook with cs_public0_scan_enable=false).
+Restart=on-failure
+RestartSec=10
+CPUQuota={{ cs_public0_scan_cpu_quota }}
+MemoryMax={{ cs_public0_scan_memory_max }}
+TasksMax=16
+UMask=0022
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths={{ cs_public0_scan_configuration.state_directory }} {{ cs_public0_scan_configuration.metrics_file | dirname }}
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
